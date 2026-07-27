@@ -67,6 +67,19 @@ const META_KEYS_NOT_RESTORED = new Set(['schema_version']);
 
 const MANIFEST = 'manifest.json';
 
+/**
+ * `projects.path` is an absolute filesystem path. Writing it verbatim would
+ * make the dump machine-specific: laptop A commits `/home/a/dev/twin`, laptop B
+ * imports, re-exports as `/home/b/dev/twin`, and `projects.ndjson` flips on
+ * every hand-off — noise in git, and a merge conflict on the one row that must
+ * never conflict.
+ *
+ * So the row that describes *this* checkout is dumped as a sentinel and
+ * expanded back to the local path on import. The dump stays byte-identical
+ * across machines.
+ */
+const SELF_PATH = '.';
+
 export interface BrainManifest {
   format: 'myjarbis-brain-ndjson';
   formatVersion: 1;
@@ -88,6 +101,9 @@ export interface ImportResult {
   counts: Record<string, number>;
   schemaVersion: number;
   exportedAt: string;
+  /** Set when the dump's project path was rewritten to this checkout — see
+   *  the rebase step in importBrain. */
+  rebasedFrom?: string;
 }
 
 export interface BrainStatusResult {
@@ -201,9 +217,13 @@ export function exportBrain(
   for (const t of TABLES) {
     if (!tableExists(ctx, t.name)) continue;
     const cols = columnsOf(ctx, t.name);
-    const rows = ctx.db.db
+    let rows = ctx.db.db
       .prepare(`SELECT * FROM ${t.name} ORDER BY ${t.orderBy}`)
       .all() as Array<Record<string, unknown>>;
+
+    if (t.name === 'projects') {
+      rows = rows.map((r) => (r.path === ctx.projectPath ? { ...r, path: SELF_PATH } : r));
+    }
 
     const body = rows.map((r) => serializeRow(r, cols)).join('\n');
     // Trailing newline: makes the last row a normal line for git and for
@@ -305,6 +325,7 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
   }
 
   const counts: Record<string, number> = {};
+  let rebasedFrom: string | undefined;
 
   ctx.db.tx(() => {
     // Foreign keys are ON: children first on the way out, parents first on the
@@ -331,6 +352,8 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
       let inserted = 0;
       for (const row of rows) {
         if (t.name === 'meta' && META_KEYS_NOT_RESTORED.has(String(row.key))) continue;
+        // Expand the portable sentinel back to where this checkout actually is.
+        if (t.name === 'projects' && row.path === SELF_PATH) row.path = ctx.projectPath;
         const keys = Object.keys(row);
         if (keys.length === 0) continue;
         const sql = `INSERT INTO ${t.name}(${keys.join(', ')}) VALUES (${keys
@@ -347,6 +370,26 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
     // insert, so the counters are already correct — but a table emptied by
     // this import would keep a stale high-water mark, which is harmless and
     // deliberately left alone (ids must never be reused).
+
+    // `projects.path` is an absolute path baked into the dump by whichever
+    // machine exported it. Everything resolves the project by cwd
+    // (findByPath), so a clone under a different path — a second laptop, a
+    // different $HOME, a worktree — would import a full brain and then fail
+    // with PROJECT_NOT_FOUND. Rebase it onto this checkout.
+    //
+    // Only when the dump holds exactly one project, which is the design (one
+    // DB per project). With more than one we cannot tell which row is "here",
+    // so we leave them alone rather than corrupt the wrong one.
+    const projectRows = ctx.db.db.prepare('SELECT id, path FROM projects').all() as Array<{
+      id: number;
+      path: string;
+    }>;
+    if (projectRows.length === 1 && projectRows[0].path !== ctx.projectPath) {
+      rebasedFrom = projectRows[0].path;
+      ctx.db.db
+        .prepare('UPDATE projects SET path = ? WHERE id = ?')
+        .run(ctx.projectPath, projectRows[0].id);
+    }
   });
 
   // FTS5 mirrors are rebuilt by the schema triggers during the inserts above.
@@ -372,6 +415,7 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
     counts,
     schemaVersion: manifest.schemaVersion,
     exportedAt: manifest.exportedAt,
+    rebasedFrom,
   };
 }
 

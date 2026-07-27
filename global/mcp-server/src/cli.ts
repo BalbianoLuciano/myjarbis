@@ -1900,6 +1900,7 @@ function runBrain(argv: string[]): void {
     ptyKV('Dir', res.dir);
     ptyKV('From', `${res.exportedAt} (schema v${res.schemaVersion})`);
     ptyKV('Rows', Object.entries(res.counts).map(([t, n]) => `${t}=${n}`).join('  '));
+    if (res.rebasedFrom) ptyKV('Rebased', `${res.rebasedFrom} → ${ctx.projectPath}`);
     console.log('');
   } finally {
     ctx.close();
