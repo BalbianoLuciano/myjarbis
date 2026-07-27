@@ -21,8 +21,11 @@ export const searchInputSchema = {
     query: {
       type: 'string' as const,
       description:
-        'Search text. Treated as a phrase by default (FTS5-quoted). To use ' +
-        'FTS5 operators, prefix with "raw:" (TODO v0.3).',
+        'Search text. Multiple words are AND-ed (all must appear in the row, ' +
+        'in any order or position). Wrap part of the query in double quotes to ' +
+        'require an exact phrase. Prefix the whole query with "raw:" to pass ' +
+        'FTS5 syntax through verbatim (NEAR, OR, column filters). Accents are ' +
+        'folded, so "sangria" and "sangría" are equivalent.',
     },
     scope: {
       type: 'string' as const,

@@ -865,15 +865,53 @@ export class MyJarbisDB {
 }
 
 /**
- * FTS5 has reserved characters; the simplest sanitization is to wrap the
- * user query in double quotes and escape internal quotes. This treats the
- * input as a phrase. For advanced queries the caller can pass FTS5 syntax
- * directly by setting opts.raw (not implemented here for v0.2).
+ * Turn a user query into a safe FTS5 expression.
+ *
+ * Multi-word input is AND-ed term by term, NOT wrapped as a single phrase.
+ * Wrapping the whole thing (what this did before) meant `sangria copiar pegar`
+ * only matched if those three words appeared contiguously — so a document
+ * saying "plano para copiar y pegar, sin markdown y SIN SANGRÍA" returned zero
+ * hits despite containing every term. Zero hits reads as "not in the brain",
+ * which is the opposite of the truth: a false negative is worse than no search
+ * at all.
+ *
+ * Rules:
+ *   - `raw:` prefix  → the rest is passed to FTS5 verbatim (operators, NEAR,
+ *                      column filters). Escape hatch for deliberate queries.
+ *   - `"..."` inside → preserved as an explicit phrase.
+ *   - everything else → split on whitespace, each term quoted (which neutralises
+ *                       FTS5 reserved characters and keeps bare AND/OR/NOT as
+ *                       literals), joined with AND.
+ *
+ * Quoting each term also fixes hyphenated words: `split-brain` becomes the
+ * phrase "split brain", which is exactly how the tokenizer stored it. Left
+ * bare, the `-` would parse as the NOT operator and silently invert the query.
+ *
+ * Note on accents: the default unicode61 tokenizer already folds them, so
+ * `sangria` and `sangría` are equivalent. No tokenizer change is needed.
  */
 function sanitizeFtsQuery(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return '""';
-  // Escape internal double quotes by doubling them (FTS5 convention).
-  const escaped = trimmed.replace(/"/g, '""');
-  return `"${escaped}"`;
+
+  if (/^raw:/i.test(trimmed)) {
+    const raw = trimmed.slice(4).trim();
+    return raw || '""';
+  }
+
+  // Pull out "quoted phrases" first, then whatever bare words are left.
+  const terms: string[] = [];
+  const rest = trimmed.replace(/"([^"]*)"/g, (_m, phrase: string) => {
+    const p = String(phrase).trim();
+    if (p) terms.push(`"${p}"`);
+    return ' ';
+  });
+
+  for (const word of rest.split(/\s+/)) {
+    const w = word.trim().replace(/"/g, '');
+    if (w) terms.push(`"${w}"`);
+  }
+
+  if (terms.length === 0) return '""';
+  return terms.join(' AND ');
 }
