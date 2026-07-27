@@ -32,6 +32,7 @@ import {
 } from './personas.js';
 import { computeCost, formatTable } from './tools/cost.js';
 import { generateModuleDiagram, isDiagramAuto } from './diagram/generate.js';
+import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
 import { openInVscode } from './diagram/open.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -1310,6 +1311,23 @@ function runHookSessionStop(): void {
       generateModuleDiagram(ctx);
     }
 
+    // Refresh the NDJSON dump before the open-session check below returns
+    // early: even an unclosed session should leave a dump that matches the
+    // DB, otherwise the next `git commit` ships a stale brain.
+    if (readSettingsJson(ctx.projectPath).brain?.auto_export_on_session_end) {
+      try {
+        const res = exportBrain(ctx);
+        if (res.changed) {
+          console.error(`[MyJarbis hook] brain dump updated (${res.filesWritten.length} file(s)).`);
+        }
+      } catch (err) {
+        // Never let a dump failure block the user from closing Claude.
+        console.error(
+          `[MyJarbis hook] brain export failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     // If there's an open session, remind the agent to close it.
     const modules = ctx.db.modules.listByProject(project.id);
     for (const m of modules) {
@@ -1671,6 +1689,15 @@ interface ProjectSettings {
      *  if none has landed in the last N+ minutes (bucketed per hour). */
     save_reminder_minutes?: number;
   };
+  /** NDJSON brain dump (see tools/brain.ts). Off unless opted in, because
+   *  it only makes sense for projects that version the dump instead of
+   *  the binary memory.db. */
+  brain?: {
+    /** Refresh `.myjarbis/brain/*.ndjson` when the Stop hook fires, so the
+     *  dump on disk always reflects the DB and `git status` shows real work
+     *  to commit without anyone remembering to export by hand. */
+    auto_export_on_session_end?: boolean;
+  };
   /** Session-related knobs. */
   session?: {
     /** Days after which a previous next_session is considered stale and
@@ -1819,13 +1846,74 @@ function runDiagram(argv: string[]): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Subcommand: brain (export / import / status)
+// ─────────────────────────────────────────────────────────────────────
+
+function runBrain(argv: string[]): void {
+  const { positional, flags } = parseFlags(argv);
+  const sub = positional[0];
+  if (!sub || !['export', 'import', 'status'].includes(sub)) {
+    fail('Usage: myjarbis brain <export|import|status> [--dir=<path>] [--yes] [--json]');
+  }
+
+  const dir = flags.dir as string | undefined;
+  const json = wantsJson(flags);
+  const ctx = ServerContext.initialize();
+
+  try {
+    if (sub === 'export') {
+      const res = exportBrain(ctx, { dir });
+      if (json) return printJson(res);
+      ptySection('MyJarbis · brain export');
+      ptyKV('Dir', res.dir);
+      ptyKV('Rows', Object.entries(res.counts).map(([t, n]) => `${t}=${n}`).join('  '));
+      ptyKV('Size', `${(res.bytes / 1024).toFixed(1)} KB`);
+      ptyKV('Status', res.changed ? `updated (${res.filesWritten.join(', ')})` : 'unchanged');
+      console.log('');
+      return;
+    }
+
+    if (sub === 'status') {
+      const res = brainStatus(ctx, { dir });
+      if (json) return printJson(res);
+      ptySection('MyJarbis · brain status');
+      ptyKV('Dir', res.dir);
+      ptyKV('Dump', res.dumpExists ? 'present' : 'missing');
+      ptyKV('Status', res.inSync ? 'in sync' : 'DRIFT');
+      for (const d of res.drift) ptyDim(d);
+      console.log('');
+      if (!res.inSync) process.exit(3);
+      return;
+    }
+
+    // import — destructive: it replaces every row of every tracked table.
+    // Requiring --yes keeps a mistyped command from wiping a brain that was
+    // never exported, while staying non-interactive for git hooks.
+    if (flags.yes !== true) {
+      fail(
+        "brain import REPLACES the contents of memory.db with the dump. Re-run with --yes if that is what you want.",
+      );
+    }
+    const res = importBrain(ctx, { dir });
+    if (json) return printJson(res);
+    ptySection('MyJarbis · brain import');
+    ptyKV('Dir', res.dir);
+    ptyKV('From', `${res.exportedAt} (schema v${res.schemaVersion})`);
+    ptyKV('Rows', Object.entries(res.counts).map(([t, n]) => `${t}=${n}`).join('  '));
+    console.log('');
+  } finally {
+    ctx.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ─────────────────────────────────────────────────────────────────────
 
 export function main(argv: string[]): void {
   const [cmd, ...rest] = argv;
   if (!cmd) {
-    fail('Usage: cli.js <import|module|skill|stats|cost|hook|init-project|timeline> [args...]');
+    fail('Usage: cli.js <import|brain|module|skill|stats|cost|hook|init-project|timeline> [args...]');
   }
   try {
     switch (cmd) {
@@ -1847,6 +1935,8 @@ export function main(argv: string[]): void {
         return runTimeline(rest);
       case 'diagram':
         return runDiagram(rest);
+      case 'brain':
+        return runBrain(rest);
       case 'hook':
         return runHook(rest);
       case 'init-project':

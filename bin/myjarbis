@@ -30,6 +30,7 @@ show_help() {
     echo -e "  ${BOLD}context${NC}    Refresh project context"
     echo -e "  ${BOLD}update${NC}     Update MyJarbis global installation"
     echo -e "  ${BOLD}import${NC}     Import a .md or .json into the project DB"
+    echo -e "  ${BOLD}brain${NC}      Export/import the DB as tracked NDJSON (export|import|status)"
     echo -e "  ${BOLD}module${NC}     Manage modules (add/list)"
     echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable)"
     echo -e "  ${BOLD}stats${NC}      Show row counts per table"
@@ -180,7 +181,7 @@ case "${1:-help}" in
         exit 1
         ;;
 
-    import|module|skill|stats|cost|config|status|timeline|hook)
+    import|brain|module|skill|stats|cost|config|status|timeline|diagram|hook)
         # v0.2 subcommands delegated to the node CLI helper
         CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
         if [ ! -f "$CLI_JS" ]; then
