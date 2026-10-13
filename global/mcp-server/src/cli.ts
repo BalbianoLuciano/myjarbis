@@ -619,7 +619,9 @@ function runSkill(argv: string[]): void {
       case 'edit': {
         const { positional, flags } = parseFlags(rest);
         const name = positional[0];
-        if (!name) fail('Usage: myjarbis skill edit <name> [--module=NAME]');
+        if (!name) {
+          fail('Usage: myjarbis skill edit <name> [--module=NAME] [--content-from=FILE]');
+        }
         const project = ctx.requireProject();
         const moduleName = flags.module as string | undefined;
         const moduleId = moduleName ? ctx.requireModule(moduleName).id : null;
@@ -627,16 +629,34 @@ function runSkill(argv: string[]): void {
         const skill = ctx.db.skills.findByName(project.id, moduleId, name);
         if (!skill) fail(`Skill "${name}" not found${moduleName ? ` in module "${moduleName}"` : ' (project-level)'}`);
 
-        const editor = process.env.EDITOR || process.env.VISUAL || 'nano';
-        const tmp = path.join(os.tmpdir(), `myjarbis-skill-${name}-${Date.now()}.md`);
-        fs.writeFileSync(tmp, skill.content, 'utf-8');
-        try {
-          execSync(`${editor} "${tmp}"`, { stdio: 'inherit' });
-        } catch {
-          fail(`Editor "${editor}" failed`);
+        // Non-interactive path. Without it `skill edit` always spawns $EDITOR,
+        // which makes it unusable from a script or a provisioning run: the
+        // editor inherits a non-tty stdin and dies with "Standard input is
+        // not a terminal".
+        const contentFrom = flags['content-from'] as string | undefined;
+        let newContent: string;
+
+        if (contentFrom) {
+          if (!fs.existsSync(contentFrom)) fail(`File not found: ${contentFrom}`);
+          newContent = fs.readFileSync(contentFrom, 'utf-8');
+        } else {
+          if (!process.stdin.isTTY) {
+            fail(
+              'skill edit needs a terminal to open $EDITOR. ' +
+                'Pass --content-from=FILE to edit without one.',
+            );
+          }
+          const editor = process.env.EDITOR || process.env.VISUAL || 'nano';
+          const tmp = path.join(os.tmpdir(), `myjarbis-skill-${name}-${Date.now()}.md`);
+          fs.writeFileSync(tmp, skill.content, 'utf-8');
+          try {
+            execSync(`${editor} "${tmp}"`, { stdio: 'inherit' });
+          } catch {
+            fail(`Editor "${editor}" failed`);
+          }
+          newContent = fs.readFileSync(tmp, 'utf-8');
+          fs.unlinkSync(tmp);
         }
-        const newContent = fs.readFileSync(tmp, 'utf-8');
-        fs.unlinkSync(tmp);
 
         if (newContent === skill.content) {
           console.error('No changes — skill not updated.');
