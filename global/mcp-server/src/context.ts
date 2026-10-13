@@ -1,5 +1,5 @@
 /**
- * MyJarbis v0.2 — ServerContext
+ * MyJarbis v0.3 — ServerContext
  *
  * One MCP server process serves ONE project (the cwd it was launched from).
  * The ServerContext owns:

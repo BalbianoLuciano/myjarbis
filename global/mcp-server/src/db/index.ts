@@ -1,5 +1,5 @@
 /**
- * MyJarbis v0.2 — better-sqlite3 wrapper
+ * MyJarbis v0.3 — better-sqlite3 wrapper
  *
  * Owns the connection to .myjarbis/memory.db and exposes prepared
  * statements grouped by domain. Statements are compiled lazily on
@@ -97,12 +97,25 @@ export function sha256(input: string): string {
   return crypto.createHash('sha256').update(input, 'utf-8').digest('hex');
 }
 
-/** Two scopes are the same tenant view. Used to allow a harmless re-bind
- *  (same project twice) while rejecting a tenant switch. */
-function sameScope(a: Scope, b: Scope): boolean {
-  if (a.kind !== b.kind) return false;
-  if (a.kind === 'project' && b.kind === 'project') return a.id === b.id;
-  return true;
+/**
+ * Which scope transitions a live connection may make.
+ *
+ * The rule is "never end up able to see more than you could before":
+ *   all     → project    allowed — strictly narrowing, cannot leak anything
+ *   project → same       allowed — idempotent, so callers need not track it
+ *   project → other      REFUSED — a tenant switch, the exact failure mode
+ *   project → all        REFUSED — widening; open a new connection, with a
+ *                                  reason, so the widening is visible
+ *   all     → all        allowed
+ *
+ * Narrowing has to be allowed or a tool that legitimately opens a brain
+ * across projects (merge, org sync, a fixture) can never then work inside
+ * one of them, which would push callers toward juggling two connections
+ * over the same file — strictly worse.
+ */
+function isAllowedScopeChange(from: Scope, to: Scope): boolean {
+  if (from.kind === 'all') return true;
+  return to.kind === 'project' && to.id === from.id;
 }
 
 /**
@@ -276,11 +289,15 @@ export class MyJarbisDB {
    * is the failure mode this whole mechanism exists to prevent.
    */
   bindScope(scope: Scope): void {
-    if (this._scope && !sameScope(this._scope, scope)) {
+    const from = this._scope;
+    if (from && !isAllowedScopeChange(from, scope)) {
       throw new MyJarbisError(
         ErrorType.OUT_OF_SCOPE,
-        'Refusing to rebind an already-scoped connection. Open a new one.',
-        { from: this._scope, to: scope },
+        from.kind === 'project' && scope.kind === 'project'
+          ? 'Refusing to switch this connection to another project. Open a new one.'
+          : 'Refusing to widen an already-pinned connection to every project. ' +
+            'Open a new one with { kind: "all", reason }.',
+        { from, to: scope },
       );
     }
     this._scope = scope;

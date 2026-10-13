@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 /**
- * MyJarbis MCP Server (v0.2)
+ * MyJarbis MCP Server (v0.3)
  *
  * Per-project orchestrator backed by SQLite + FTS5.
  *
@@ -439,7 +439,7 @@ function buildToolRegistry(): RegisteredTool[] {
 // ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  console.error('[MyJarbis] Starting MCP server (v0.2)...');
+  console.error('[MyJarbis] Starting MCP server (v0.3)...');
 
   const ctx = ServerContext.initialize();
   console.error(
@@ -450,7 +450,7 @@ async function main(): Promise<void> {
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'myjarbis-mcp-server', version: '0.2.0' },
+    { name: 'myjarbis-mcp-server', version: '0.3.0' },
     { capabilities: { tools: {} } },
   );
 

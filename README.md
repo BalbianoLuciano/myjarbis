@@ -178,6 +178,130 @@ With an active module set, opening `claude` auto-resumes it and prints
 the curated "Resume here" — `/jarbis` then only acknowledges and
 continues (no tool calls, no menu render).
 
+> `search` is an **MCP tool**, not a CLI verb — the agent calls it; there
+> is no `myjarbis search`. Use `myjarbis status` and `myjarbis timeline`
+> from the shell.
+
+---
+
+## Org packs — load how your team works, don't teach it
+
+`myjarbis init` seeds ten generic skills. Everything specific to *your
+organization* — review rules, release checklist, how tickets get closed —
+used to be taught to each project by hand, which means it reliably wasn't.
+
+An **org pack** is a directory you keep in your own (private) repo:
+
+```
+<pack>/
+├── pack.yml            slug, name, compatible_with
+├── skills/*.md         skills to add
+├── overrides/*.md      skills that REPLACE a baseline of the same name
+├── context-kinds.yml   extra taxonomy labels
+├── workflows/*.yml     workflows at org scope
+└── providers.yml       tracker / forge / ci templates — never credentials
+```
+
+```bash
+myjarbis org add acme ~/work/acme-pack     # register + apply here
+myjarbis init --org=acme                   # new project, pack included
+myjarbis org sync acme                     # re-apply to EVERY project of the org
+myjarbis org diff acme                     # what sync would change (dry run)
+```
+
+Applying is idempotent (`created | updated | unchanged` per item) and ends
+by writing skills to `.claude/skills/` — the database alone configures
+nothing the agent can see.
+
+**MyJarbis ships no pack.** `examples/pack/` holds a fictional one so the
+contract is readable. Your rules, client names and tool wrappers stay out
+of this repo.
+
+---
+
+## Workflows as data, not prose
+
+Process written as prose gets duplicated and then contradicted. Workflows
+are rows, resolved **org → project → user** into one ordered list:
+
+```bash
+myjarbis workflow show ticket-close
+```
+
+```
+ 10 run-tests              from=org      gate=none       ci.run        → (unset)
+ 20 open-merge-request     from=org      gate=none       forge.mr      → generic-forge
+ 30 get-approval           from=user     gate=approve
+ 40 comment-on-ticket      from=org      gate=none       tracker.comment → generic-tracker
+```
+
+A step names an **abstract capability** (`tracker.comment`), never a
+product. Which tool that means comes from the project's provider row — so
+one org workflow serves a client on one tracker and a client on another,
+and MyJarbis never learns a vendor's name.
+
+`gate=approve` means *stop and ask*. Conditions are decidable
+(`branch ~= release/*`, `framework in [laravel, express]`), not free text
+for the agent to interpret differently each session.
+
+```bash
+myjarbis provider set tracker acme-tracker --config='{"base_url":"https://..."}'
+```
+
+> Never put a credential in `--config`. It's rejected on write *and* on
+> export, because the brain dump is meant to be committed. Store the
+> location instead: `{"token_file": "~/.config/acme/token"}`.
+
+---
+
+## Notes that have identity
+
+Three habits formed in v0.2 because nothing better existed. v0.3 gives
+each one a column:
+
+| The habit | What replaces it |
+|---|---|
+| A new note titled *"CORRECTS note 80"* | `topic_key` — saving again **updates** that note |
+| *"Do not repeat: comments 4-29337–41"* in prose | `find_by_ref` — a boolean, not a paragraph |
+| A new *"RESUME HERE"* note every session | `project_state` — one row, with an expiring lock |
+
+```bash
+myjarbis state get          # the living state
+myjarbis kinds list         # the allowed context kinds
+```
+
+`kind` is a catalogue now, not free text — three projects once invented
+three vocabularies for the same seven ideas. An unknown kind is rejected
+*with the nearest match*; a pack can add its own.
+
+---
+
+## One brain or many
+
+Pre-v0.3 there was one `memory.db` per project. That still works and is
+still the default (`isolation = silo`). v0.3 adds a **shared brain** at
+`~/.myjarbis/memory.db` so a cross-cutting change is one action.
+
+The isolation that the filesystem used to provide is now enforced in code,
+and it is not optional:
+
+- scope is bound to the **connection**, not passed per query
+- a read with no scope **fails** rather than returning every project
+- passing another project's id is **refused**, not honoured
+- crossing projects needs an explicit scope **and a stated reason**
+
+`tests/v03-isolation.sh` asserts all four. Migration is opt-in and backs
+up first:
+
+```bash
+myjarbis migrate --dry-run              # report, touch nothing
+myjarbis migrate                        # upgrade this project's brain
+myjarbis merge --from <proj>/.myjarbis/memory.db --as acme-portal
+```
+
+Opening a brain never migrates it — merely *looking* for a project would
+otherwise rewrite the schema of files you never named.
+
 ---
 
 ## Living diagrams
@@ -354,7 +478,12 @@ into one call.
 <summary><b>The 10 baseline skills</b></summary>
 
 Materialized to `.claude/skills/myjarbis-<name>/SKILL.md` and loaded at
-session start:
+session start.
+
+> Claude Code identifies a skill by its **directory name**, not by the
+> `name:` in its frontmatter. So these appear as `myjarbis-<name>` — the
+> prefix is what makes them safe to clean up without touching skills you
+> wrote yourself.
 
 | Skill                  | What it teaches the agent                                    |
 |------------------------|--------------------------------------------------------------|

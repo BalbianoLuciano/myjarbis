@@ -1,5 +1,5 @@
 /**
- * MyJarbis v0.2 — SQLite + FTS5 schema
+ * MyJarbis v0.3 — SQLite + FTS5 schema
  *
  * Hierarchy:
  *   project

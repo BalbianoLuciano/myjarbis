@@ -1,6 +1,6 @@
 {
   "name": "myjarbis",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "description": "AI Development Assistant System with persistent memory for Claude Code",
   "keywords": [
     "ai",
@@ -26,7 +26,7 @@
     "install-global": "./install.sh",
     "build:mcp": "cd global/mcp-server && npm run build",
     "dev:mcp": "cd global/mcp-server && npm run dev",
-    "test:structure": "ls -R global/ && echo '✓ Structure OK'"
+    "test:structure": "ls -R global/ && echo '\u2713 Structure OK'"
   },
   "engines": {
     "node": ">=18.0.0"
