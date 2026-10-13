@@ -689,15 +689,6 @@ export class MyJarbisDB {
       ).all(projectId) as ProjectContextRow[];
     },
 
-    /** Rows of a given kind, used by the session hook to always load the
-     *  same two kinds without having to ask what the project called them. */
-    listByKind: (projectId: number, kind: ContextKind): ProjectContextRow[] => {
-      this.assertInScope(projectId, 'project_context listing');
-      return this.prep(
-        'SELECT * FROM project_context WHERE project_id = ? AND kind = ? ORDER BY title',
-      ).all(projectId, kind) as ProjectContextRow[];
-    },
-
     findByTopic: (projectId: number, topicKey: string): ProjectContextRow | null => {
       this.assertInScope(projectId, 'project_context lookup');
       return (
