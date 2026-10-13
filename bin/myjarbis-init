@@ -14,7 +14,7 @@ NC='\033[0m'
 # Paths
 INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$HOME/.myjarbis-global}"
 TEMPLATES_DIR="$INSTALL_DIR/templates"
-REGISTRY_FILE="$INSTALL_DIR/projects-registry.json"
+REGISTRY_FILE="${MYJARBIS_REGISTRY:-$INSTALL_DIR/projects-registry.json}"
 CURRENT_DIR="$(pwd)"
 PROJECT_NAME="$(basename "$CURRENT_DIR")"
 

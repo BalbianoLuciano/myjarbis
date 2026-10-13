@@ -22,7 +22,17 @@ export interface RegistryEntry {
   initialized?: string;
 }
 
+/**
+ * `MYJARBIS_REGISTRY` overrides the location outright. The registry
+ * otherwise lives next to the install, which is also where the build lives
+ * — so a test that needs its own registry would have to relocate the build
+ * too, and would end up sharing one registry across runs. Cross-project
+ * commands (`org sync`, `migrate --all`) then operate on leftovers from
+ * previous runs, which is exactly the sort of non-hermetic test that stops
+ * meaning anything.
+ */
 export function registryPath(): string {
+  if (process.env.MYJARBIS_REGISTRY) return path.resolve(process.env.MYJARBIS_REGISTRY);
   const installDir =
     process.env.MYJARBIS_INSTALL_DIR || path.join(os.homedir(), '.myjarbis-global');
   return path.join(installDir, 'projects-registry.json');

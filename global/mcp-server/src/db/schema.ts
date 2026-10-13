@@ -64,6 +64,19 @@ export const MIGRATIONS: Record<number, string[]> = {
     `ALTER TABLE observations ADD COLUMN supersedes INTEGER REFERENCES observations(id)`,
     `ALTER TABLE observations ADD COLUMN updated_at TEXT`,
 
+    // Rebuild the FTS index BEFORE the backfill below, and this is not
+    // optional. The backfill is an UPDATE, which fires observations_au,
+    // which issues a 'delete' op against the contentless FTS index for the
+    // old row. For any row that is not actually in the index, that op
+    // returns SQLITE_CORRUPT_VTAB — "database disk image is malformed" —
+    // and the whole migration dies on a database that is in fact fine.
+    //
+    // Reproduced against a v3 file whose index was incomplete. Rebuilding
+    // first makes the backfill safe and repairs a stale index as a side
+    // effect, which is worth having on its own: a stale contentless index
+    // returns hits that resolve to the wrong rows.
+    `INSERT INTO observations_fts(observations_fts) VALUES('rebuild')`,
+
     // Backfill the denormalised project_id for rows written before v4.
     `UPDATE observations
         SET project_id = (
