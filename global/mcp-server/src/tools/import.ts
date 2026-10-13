@@ -17,6 +17,7 @@ import * as path from 'path';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 import { ContextKind } from '../db/schema.js';
+import { resolveContextKind } from './kinds.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Shared helpers
@@ -145,7 +146,10 @@ export function importMd(ctx: ServerContext, rawArgs: unknown): ImportResult {
   const sourcePath = relativeFromProject(ctx, abs);
   const baseName = path.basename(abs, path.extname(abs));
   const title = args.title ?? extractTitle(content, baseName);
-  const kind = args.kind as ContextKind;
+  // Validated against the context_kinds catalogue, which also folds known
+  // aliases ("dominio" -> "domain"). Free text here is how three projects
+  // ended up with three vocabularies for the same seven ideas.
+  const kind = resolveContextKind(ctx, args.kind);
 
   const target = parseTarget(args.target);
 
@@ -285,7 +289,10 @@ export function importJson(ctx: ServerContext, rawArgs: unknown): ImportJsonResu
   const items = resolveMapping(data, args.mapping);
   const sourcePathBase = relativeFromProject(ctx, abs);
   const target = parseTarget(args.target);
-  const kind = args.kind as ContextKind;
+  // Validated against the context_kinds catalogue, which also folds known
+  // aliases ("dominio" -> "domain"). Free text here is how three projects
+  // ended up with three vocabularies for the same seven ideas.
+  const kind = resolveContextKind(ctx, args.kind);
 
   let mod: ReturnType<typeof ctx.requireModule> | undefined;
   if (target.kind === 'module') {
