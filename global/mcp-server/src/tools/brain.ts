@@ -38,6 +38,7 @@ import * as path from 'path';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 import { SCHEMA_VERSION } from '../db/schema.js';
+import { findSecrets, SECRET_GUIDANCE } from '../org/secrets.js';
 
 /** Directory name under `.myjarbis/` holding the dump. */
 export const BRAIN_DIRNAME = 'brain';
@@ -49,16 +50,70 @@ export const BRAIN_DIRNAME = 'brain';
  * `meta` is listed first because it carries schema_version, which the import
  * guard reads before touching anything else.
  */
-const TABLES: ReadonlyArray<{ name: string; orderBy: string }> = [
+interface DumpTable {
+  name: string;
+  orderBy: string;
+  /**
+   * WHERE clause restricting the table to ONE project, with `?` bound to its
+   * id. Required now that several projects can share a file: without it
+   * `SELECT *` would dump every tenant's rows into one project's dump
+   * directory, which then gets committed to that project's repository.
+   * Tables with no clause are not project-owned.
+   */
+  scope?: string;
+}
+
+const TABLES: ReadonlyArray<DumpTable> = [
   { name: 'meta', orderBy: 'key' },
-  { name: 'projects', orderBy: 'id' },
-  { name: 'modules', orderBy: 'id' },
-  { name: 'project_context', orderBy: 'id' },
-  { name: 'module_context', orderBy: 'id' },
-  { name: 'skills', orderBy: 'id' },
-  { name: 'sessions', orderBy: 'id' },
-  { name: 'observations', orderBy: 'id' },
+  { name: 'orgs', orderBy: 'id', scope: 'id IN (SELECT org_id FROM projects WHERE id = ?)' },
+  {
+    name: 'context_kinds',
+    orderBy: 'slug',
+    scope: 'org_id IS NULL OR org_id IN (SELECT org_id FROM projects WHERE id = ?)',
+  },
+  { name: 'projects', orderBy: 'id', scope: 'id = ?' },
+  { name: 'modules', orderBy: 'id', scope: 'project_id = ?' },
+  { name: 'project_context', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'module_context',
+    orderBy: 'id',
+    scope: 'module_id IN (SELECT id FROM modules WHERE project_id = ?)',
+  },
+  { name: 'skills', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'sessions',
+    orderBy: 'id',
+    scope: 'module_id IN (SELECT id FROM modules WHERE project_id = ?)',
+  },
+  { name: 'observations', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'refs',
+    orderBy: 'id',
+    scope: 'observation_id IN (SELECT id FROM observations WHERE project_id = ?)',
+  },
+  { name: 'project_state', orderBy: 'project_id', scope: 'project_id = ?' },
+  { name: 'providers', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'workflows',
+    orderBy: 'id',
+    scope:
+      "(scope IN ('project','user') AND scope_id = ?) OR " +
+      "(scope = 'org' AND scope_id IN (SELECT org_id FROM projects WHERE id = ?))",
+  },
+  {
+    name: 'workflow_steps',
+    orderBy: 'id',
+    scope:
+      'workflow_id IN (SELECT id FROM workflows WHERE ' +
+      "(scope IN ('project','user') AND scope_id = ?) OR " +
+      "(scope = 'org' AND scope_id IN (SELECT org_id FROM projects WHERE id = ?)))",
+  },
 ];
+
+/** How many times `?` appears in a table's scope clause. */
+function scopeArity(t: DumpTable): number {
+  return t.scope ? (t.scope.match(/\?/g) ?? []).length : 0;
+}
 
 /** meta keys that describe the *local install*, not the brain. Restoring these
  *  from a dump would let an old dump silently downgrade the schema marker of a
@@ -180,11 +235,22 @@ function parseNdjson(file: string): Array<Record<string, unknown>> {
   return out;
 }
 
+/**
+ * Row counts for THIS project only, using the same scope clauses the export
+ * uses. Counting whole tables would report drift forever in a shared brain:
+ * the dump holds one project and the table holds several, so every table
+ * would disagree and `brain status` would be permanently red.
+ */
 function countsOf(ctx: ServerContext): Record<string, number> {
+  const project = ctx.requireProject();
   const counts: Record<string, number> = {};
   for (const t of TABLES) {
     if (!tableExists(ctx, t.name)) continue;
-    const row = ctx.db.db.prepare(`SELECT COUNT(*) AS n FROM ${t.name}`).get() as { n: number };
+    const where = t.scope ? ` WHERE ${t.scope}` : '';
+    const params = Array.from({ length: scopeArity(t) }, () => project.id);
+    const row = ctx.db.db
+      .prepare(`SELECT COUNT(*) AS n FROM ${t.name}${where}`)
+      .get(...params) as { n: number };
     counts[t.name] = row.n;
   }
   return counts;
@@ -214,15 +280,50 @@ export function exportBrain(
   const filesWritten: string[] = [];
   let bytes = 0;
 
+  // A dump belongs to ONE project: it is written inside that project's tree
+  // and committed to its repository. Exporting without a resolved project
+  // would, in a shared brain, write every tenant's rows into it.
+  const project = ctx.requireProject();
+
   for (const t of TABLES) {
     if (!tableExists(ctx, t.name)) continue;
     const cols = columnsOf(ctx, t.name);
+    const where = t.scope ? ` WHERE ${t.scope}` : '';
+    const params = Array.from({ length: scopeArity(t) }, () => project.id);
     let rows = ctx.db.db
-      .prepare(`SELECT * FROM ${t.name} ORDER BY ${t.orderBy}`)
-      .all() as Array<Record<string, unknown>>;
+      .prepare(`SELECT * FROM ${t.name}${where} ORDER BY ${t.orderBy}`)
+      .all(...params) as Array<Record<string, unknown>>;
 
     if (t.name === 'projects') {
       rows = rows.map((r) => (r.path === ctx.projectPath ? { ...r, path: SELF_PATH } : r));
+    }
+
+    // Last line of defence before a credential reaches a git repository.
+    // The write-time guard already rejects them, but a row could predate the
+    // guard or have been inserted by hand, and this is the step that makes
+    // it public.
+    if (t.name === 'providers') {
+      for (const r of rows) {
+        if (!r.config) continue;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(String(r.config));
+        } catch {
+          continue;
+        }
+        const findings = findSecrets(parsed);
+        if (findings.length > 0) {
+          throw new MyJarbisError(
+            ErrorType.SECRET_IN_CONFIG,
+            `Refusing to export: providers row ${r.id} (role "${r.role}") carries ` +
+              `something that looks like a credential, and this dump is meant to be ` +
+              `committed.\n` +
+              findings.map((f) => `  · ${f.path} — ${f.reason}`).join('\n') +
+              `\n\n${SECRET_GUIDANCE}`,
+            { providerId: r.id, findings },
+          );
+        }
+      }
     }
 
     const body = rows.map((r) => serializeRow(r, cols)).join('\n');
@@ -300,6 +401,29 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
       ErrorType.INVALID_INPUT,
       `Dump is schema v${manifest.schemaVersion} but this myjarbis speaks v${SCHEMA_VERSION}. Run 'myjarbis update' before importing.`,
       { dumpSchemaVersion: manifest.schemaVersion, localSchemaVersion: SCHEMA_VERSION },
+    );
+  }
+
+  // `brain import` REPLACES the brain with the dump, which is the right
+  // semantics for one project per file — the arrangement the dump format was
+  // designed for. It is the wrong semantics for a brain holding several
+  // projects: the delete would wipe the other tenants, and the dump's rows
+  // carry explicit ids from another machine that would collide with theirs.
+  //
+  // Rather than invent a half-correct id-remapping import, refuse and point
+  // at the command that does exactly that, carefully.
+  const tenantCount = (
+    ctx.db.db.prepare('SELECT COUNT(*) AS n FROM projects').get() as { n: number }
+  ).n;
+  if (tenantCount > 1) {
+    throw new MyJarbisError(
+      ErrorType.INVALID_INPUT,
+      `${ctx.db.dbPath} holds ${tenantCount} projects, and \`brain import\` replaces ` +
+        `a whole brain — it would delete the others. To bring a dump into a shared ` +
+        `brain, import it into an empty database first and then:\n` +
+        `  myjarbis merge --from <that>.db --into ${ctx.db.dbPath} --as <name>\n` +
+        `which remaps ids and rewrites foreign keys instead of overwriting.`,
+      { dbPath: ctx.db.dbPath, projects: tenantCount },
     );
   }
 
