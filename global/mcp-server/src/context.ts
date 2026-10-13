@@ -16,10 +16,19 @@ import { MyJarbisDB } from './db/index.js';
 import { ProjectRow, ModuleRow } from './db/schema.js';
 import { migrateProject } from './db/migrate.js';
 import { MyJarbisError, ErrorType } from './types.js';
+import { resolveProject, Resolution } from './resolve.js';
 
 export class ServerContext {
+  /** The directory the process was launched from. */
+  readonly cwd: string;
+
+  /** Root of the resolved project, or cwd when nothing resolved. */
   readonly projectPath: string;
+
   readonly db: MyJarbisDB;
+
+  /** Which resolution rule matched. Surfaced by `myjarbis status`. */
+  readonly resolvedVia: Resolution['via'] | null;
 
   /** Cached project row; refreshed on demand if it appears mid-session. */
   private _project: ProjectRow | null = null;
@@ -28,23 +37,36 @@ export class ServerContext {
   activeSessionId: number | null = null;
   activeModuleId: number | null = null;
 
-  private constructor(projectPath: string, db: MyJarbisDB) {
+  private constructor(
+    cwd: string,
+    projectPath: string,
+    db: MyJarbisDB,
+    project: ProjectRow | null,
+    resolvedVia: Resolution['via'] | null,
+  ) {
+    this.cwd = cwd;
     this.projectPath = projectPath;
     this.db = db;
+    this._project = project;
+    this.resolvedVia = resolvedVia;
   }
 
   /**
-   * Bootstraps the context for the current MCP server process:
-   *   - cwd → projectPath
-   *   - migrate v0.1 layout if present (idempotent)
-   *   - open .myjarbis/memory.db (creates it if needed)
-   *   - resolve the project row, if any
+   * Bootstraps the context for the current process.
+   *
+   * Nothing here creates a brain. `initialize` used to call
+   * `MyJarbisDB.open(cwd)`, which materialises `.myjarbis/memory.db`
+   * wherever it is called — so running any command outside a project left
+   * a stray empty brain behind, and running one in a subdirectory of a real
+   * project registered a second project pointing at the subdirectory.
+   *
+   * Creation is now `myjarbis init`'s job alone (see initializeForSeed).
    */
-  static initialize(): ServerContext {
+  static initialize(opts: { projectName?: string } = {}): ServerContext {
     const cwd = process.cwd();
 
-    // Migrate v0.1 layout if applicable. Idempotent + safe when there's
-    // nothing to migrate.
+    // Migrate a v0.1 layout if one is sitting here. Idempotent, and a no-op
+    // when there is nothing to migrate.
     const migration = migrateProject(cwd);
     if (migration.migrated) {
       console.error(
@@ -52,16 +74,38 @@ export class ServerContext {
       );
     }
 
-    const db = MyJarbisDB.open(cwd);
-    const ctx = new ServerContext(cwd, db);
-    ctx._project = db.projects.findByPath(cwd);
-    return ctx;
+    const resolution = resolveProject({ cwd, projectName: opts.projectName });
+    if (resolution) {
+      return new ServerContext(
+        cwd,
+        resolution.project.path,
+        resolution.db,
+        resolution.project,
+        resolution.via,
+      );
+    }
+
+    // Nothing resolved. Hand back a context with an in-memory brain so that
+    // `requireProject()` can produce the real error message, instead of
+    // crashing on a null db or writing a file nobody asked for.
+    const scratch = MyJarbisDB.openAtPath(':memory:');
+    scratch.bindScope({ kind: 'all', reason: 'unresolved project: empty scratch brain' });
+    return new ServerContext(cwd, cwd, scratch, null, null);
+  }
+
+  /**
+   * Open (creating if needed) the brain for a project being initialised.
+   * The one path allowed to bring a DB into existence.
+   */
+  static initializeForSeed(projectPath: string): ServerContext {
+    const db = MyJarbisDB.open(projectPath);
+    const project = db.projects.findByPath(projectPath);
+    if (project) db.bindScope({ kind: 'project', id: project.id });
+    return new ServerContext(projectPath, projectPath, db, project, 'path');
   }
 
   /** Read-only access; refreshes from DB if not cached. */
   get project(): ProjectRow | null {
-    if (this._project) return this._project;
-    this._project = this.db.projects.findByPath(this.projectPath);
     return this._project;
   }
 
@@ -74,8 +118,10 @@ export class ServerContext {
     if (!p) {
       throw new MyJarbisError(
         ErrorType.PROJECT_NOT_FOUND,
-        `No MyJarbis project at ${this.projectPath}. Run 'myjarbis init' to register it.`,
-        { cwd: this.projectPath },
+        `No MyJarbis project resolved from ${this.cwd}. Tried: explicit --project, ` +
+          `the git remote, and every parent directory. Run 'myjarbis init' in the ` +
+          `project root to register it.`,
+        { cwd: this.cwd },
       );
     }
     return p;
@@ -126,7 +172,11 @@ export class ServerContext {
 
   /** Force re-load of project row from DB. */
   refreshProject(): void {
-    this._project = this.db.projects.findByPath(this.projectPath);
+    const byPath = this.db.projects.findByPath(this.projectPath);
+    if (byPath) {
+      this._project = byPath;
+      if (!this.db.boundScope) this.db.bindScope({ kind: 'project', id: byPath.id });
+    }
   }
 
   close(): void {
