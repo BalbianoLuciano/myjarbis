@@ -1379,8 +1379,20 @@ export class MyJarbisDB {
       return { acquired: true };
     },
 
-    unlock: (projectId: number, sessionTag: string): void => {
+    /**
+     * Release the lock. Only the holder can, unless `force` — a session that
+     * deliberately overrode someone else's lock has to be able to clear it,
+     * or the overridden holder's lock lingers forever and every later writer
+     * is told a dead session is busy.
+     */
+    unlock: (projectId: number, sessionTag: string, force = false): void => {
       this.assertInScope(projectId, 'project_state');
+      if (force) {
+        this.prep(
+          `UPDATE project_state SET locked_by = NULL, locked_at = NULL WHERE project_id = ?`,
+        ).run(projectId);
+        return;
+      }
       this.prep(
         `UPDATE project_state SET locked_by = NULL, locked_at = NULL
           WHERE project_id = ? AND locked_by = ?`,
