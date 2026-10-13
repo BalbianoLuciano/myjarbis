@@ -133,24 +133,29 @@ if [ -d ".myjarbis" ]; then
     fi
 
     if [ -f ".myjarbis/memory.db" ]; then
-        pass "memory.db (v0.2 schema)"
+        pass "memory.db present"
     else
         warn "memory.db missing — run myjarbis init to seed"
     fi
 
     CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
     if [ -f ".myjarbis/memory.db" ] && [ -f "$CLI_JS" ]; then
-        SCHEMA_OK=$(node --input-type=module -e "
+        # Ask the code what version it expects instead of hardcoding one here.
+        # A literal in this script goes stale on every schema bump and then
+        # reports a healthy DB as broken.
+        SCHEMA_PAIR=$(node --input-type=module -e "
             import { MyJarbisDB } from '$INSTALL_DIR/mcp-server/build/db/index.js';
+            import { SCHEMA_VERSION } from '$INSTALL_DIR/mcp-server/build/db/schema.js';
             const db = MyJarbisDB.open('$CURRENT_DIR');
-            const v = db.meta.get('schema_version');
-            console.log(v);
+            console.log(\`\${db.meta.get('schema_version')} \${SCHEMA_VERSION}\`);
             db.close();
-        " 2>/dev/null || echo "?")
-        if [ "$SCHEMA_OK" = "2" ]; then
-            pass "schema version 2"
+        " 2>/dev/null || echo "? ?")
+        SCHEMA_HAVE=${SCHEMA_PAIR%% *}
+        SCHEMA_WANT=${SCHEMA_PAIR##* }
+        if [ "$SCHEMA_HAVE" = "$SCHEMA_WANT" ]; then
+            pass "schema version $SCHEMA_HAVE"
         else
-            warn "schema version $SCHEMA_OK (expected 2)"
+            warn "schema version $SCHEMA_HAVE (expected $SCHEMA_WANT) — run myjarbis migrate"
         fi
     fi
 
