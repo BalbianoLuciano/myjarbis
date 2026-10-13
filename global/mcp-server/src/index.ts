@@ -75,6 +75,40 @@ import {
   materializeSkills,
   materializeSkillsInputSchema,
 } from './tools/skills.js';
+import {
+  suggestTopicKey,
+  suggestTopicKeyInputSchema,
+} from './tools/observations.js';
+import {
+  addRef,
+  addRefInputSchema,
+  findByRef,
+  findByRefInputSchema,
+  updateObservation,
+  updateObservationInputSchema,
+} from './tools/refs.js';
+import {
+  getProjectState,
+  getProjectStateInputSchema,
+  setProjectState,
+  setProjectStateInputSchema,
+} from './tools/state.js';
+import {
+  getWorkflow,
+  getWorkflowInputSchema,
+  listWorkflowsTool,
+  listWorkflowsInputSchema,
+  setWorkflowStep,
+  setWorkflowStepInputSchema,
+  listProviders,
+  listProvidersInputSchema,
+  setProvider,
+  setProviderInputSchema,
+} from './tools/workflows.js';
+import {
+  listContextKinds,
+  listContextKindsInputSchema,
+} from './tools/kinds.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool registry
@@ -249,6 +283,121 @@ function buildToolRegistry(): RegisteredTool[] {
         'the SessionStart hook and on /module switch.',
       inputSchema: materializeSkillsInputSchema,
       handler: (ctx, args) => materializeSkills(ctx, args),
+      deferred: true,
+    },
+
+    // ───────────────────────────────────────────────────────────────
+    // v0.3 — topic identity, refs, living state, workflows, taxonomy
+    // ───────────────────────────────────────────────────────────────
+    {
+      name: 'suggest_topic_key',
+      description:
+        'Before saving a note that has a CURRENT VALUE rather than a history, ' +
+        'call this to see which topic keys already cover the subject. Reusing ' +
+        'one makes save_observation update that note instead of adding a rival ' +
+        'to it. Returns the closest existing keys plus a proposal.',
+      inputSchema: suggestTopicKeyInputSchema,
+      handler: (ctx, args) => suggestTopicKey(ctx, args),
+    },
+    {
+      name: 'update_observation',
+      description:
+        'Corrects a note in place, by id or by topic_key. Use this instead of ' +
+        'saving a new note whose title announces the correction ("CORRECTS note ' +
+        '80", "DEFINITIVE — supersedes 80 and 81"); those leave competing ' +
+        'versions behind for the next session to reconcile.',
+      inputSchema: updateObservationInputSchema,
+      handler: (ctx, args) => updateObservation(ctx, args),
+    },
+    {
+      name: 'find_by_ref',
+      description:
+        'Answers "did I already do this?" with a boolean. Call BEFORE any ' +
+        'outward-facing action you might be repeating — posting a comment, ' +
+        'logging time, opening a merge request — using the id of the thing in ' +
+        'the external system.',
+      inputSchema: findByRefInputSchema,
+      handler: (ctx, args) => findByRef(ctx, args),
+    },
+    {
+      name: 'add_ref',
+      description:
+        'Links a note to a commit, merge request, ticket, comment or worklog, ' +
+        'so find_by_ref can answer for it later. Store the link, never a copy ' +
+        'of the content: the source system stays the source of truth.',
+      inputSchema: addRefInputSchema,
+      handler: (ctx, args) => addRef(ctx, args),
+    },
+    {
+      name: 'get_project_state',
+      description:
+        'The living "resume here" for this project — one row, not a pile of ' +
+        'notes. Also reports whether another session is holding the write lock, ' +
+        'which is the signal to ask what it has already done.',
+      inputSchema: getProjectStateInputSchema,
+      handler: (ctx) => getProjectState(ctx),
+    },
+    {
+      name: 'set_project_state',
+      description:
+        'Replaces the living state with the current picture. Write the whole ' +
+        'picture, not a delta. Use this rather than saving another note titled ' +
+        '"RESUME HERE".',
+      inputSchema: setProjectStateInputSchema,
+      handler: (ctx, args) => setProjectState(ctx, args),
+    },
+    {
+      name: 'get_workflow',
+      description:
+        'The process for a kind of work, resolved from org + project + user ' +
+        'layers into ONE ordered list, with each step evaluated against the ' +
+        'current branch and configured tools. Call this instead of inferring ' +
+        'the process from prose. gate="approve" means stop and ask first.',
+      inputSchema: getWorkflowInputSchema,
+      handler: (ctx, args) => getWorkflow(ctx, args),
+    },
+    {
+      name: 'list_workflows',
+      description: 'Workflow slugs reachable from this project, with their layers.',
+      inputSchema: listWorkflowsInputSchema,
+      handler: (ctx) => listWorkflowsTool(ctx),
+    },
+    {
+      name: 'set_workflow_step',
+      description:
+        'Adds, overrides or disables one step of a workflow at project or user ' +
+        'scope. Use when the user states a process rule, instead of writing the ' +
+        'rule into a note that will be contradicted by a later note.',
+      inputSchema: setWorkflowStepInputSchema,
+      handler: (ctx, args) => setWorkflowStep(ctx, args),
+      deferred: true,
+    },
+    {
+      name: 'list_context_kinds',
+      description:
+        'The allowed `kind` values for context rows, with descriptions. The ' +
+        'vocabulary is a catalogue, not free text — an unknown kind is rejected.',
+      inputSchema: listContextKindsInputSchema,
+      handler: (ctx) => listContextKinds(ctx),
+      deferred: true,
+    },
+    {
+      name: 'list_providers',
+      description:
+        'Which concrete tools fill this project\'s tracker / forge / ci roles, ' +
+        'and which roles are unconfigured.',
+      inputSchema: listProvidersInputSchema,
+      handler: (ctx) => listProviders(ctx),
+      deferred: true,
+    },
+    {
+      name: 'set_provider',
+      description:
+        'Points a role (tracker | forge | ci) at a concrete tool, so abstract ' +
+        'workflow capabilities resolve. Never put a credential in config — it ' +
+        'is rejected, because this travels in the brain dump.',
+      inputSchema: setProviderInputSchema,
+      handler: (ctx, args) => setProvider(ctx, args),
       deferred: true,
     },
 
