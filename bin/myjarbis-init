@@ -380,10 +380,17 @@ note "persona:  $PERSONA_CHOICE"
 
 CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
 if [ -f "$CLI_JS" ]; then
-    if node "$CLI_JS" init-project \
-        --name="$PROJECT_NAME" --framework="$FRAMEWORK" \
-        --language="$LANG_CHOICE" --persona="$PERSONA_CHOICE" >/dev/null; then
+    INIT_ARGS=(init-project
+        --name="$PROJECT_NAME" --framework="$FRAMEWORK"
+        --language="$LANG_CHOICE" --persona="$PERSONA_CHOICE")
+    if [ -n "$ORG_SLUG" ]; then
+        INIT_ARGS+=(--org="$ORG_SLUG")
+    fi
+    if node "$CLI_JS" "${INIT_ARGS[@]}" >/dev/null; then
         note "memory.db + 10 baseline skills + interaction-style"
+        if [ -n "$ORG_SLUG" ]; then
+            note "org pack: $ORG_SLUG"
+        fi
         ok
     else
         warn "init-project failed (DB will be created on first session)"

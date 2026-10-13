@@ -16,6 +16,7 @@
 
 import * as path from 'path';
 import { ServerContext } from './context.js';
+import { MyJarbisDB } from './db/index.js';
 import { MyJarbisError } from './types.js';
 import { importMd, importJson } from './tools/import.js';
 import { listModules, createModule } from './tools/discovery.js';
@@ -33,6 +34,20 @@ import {
 import { computeCost, formatTable } from './tools/cost.js';
 import { generateModuleDiagram, isDiagramAuto } from './diagram/generate.js';
 import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
+import { readPack, applyPack, PackApplyReport } from './org/pack.js';
+import { syncOrg } from './org/sync.js';
+import { readRegistry } from './org/registry.js';
+import { listContextKinds, migrateKinds } from './tools/kinds.js';
+import {
+  listWorkflowsTool,
+  getWorkflow,
+  listProviders,
+  setProvider,
+} from './tools/workflows.js';
+import { getProjectState, setProjectState } from './tools/state.js';
+import { upgradeBrain } from './db/upgrade.js';
+import { mergeBrain } from './db/merge.js';
+import { globalDbPath, siloDbPath } from './resolve.js';
 import { openInVscode } from './diagram/open.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -857,11 +872,47 @@ function runCost(argv: string[]): void {
 // to .claude/skills/. Idempotent.
 // ─────────────────────────────────────────────────────────────────────
 
+
+/**
+ * Find the pack directory recorded for an org slug.
+ *
+ * `init --org=x` is normally run in a project that has never seen the pack,
+ * so the path has to come from somewhere else: the brain being seeded, then
+ * the shared brain, then any registered project. Returns null when the slug
+ * is unknown, and the caller warns rather than failing — a project created
+ * without its org layer is recoverable, a failed init is not.
+ */
+function resolvePackPath(ctx: ServerContext, slug: string): string | null {
+  const local = ctx.db.orgs.findBySlug(slug);
+  if (local?.pack_path && fs.existsSync(local.pack_path)) return local.pack_path;
+
+  const candidates = [globalDbPath(), ...readRegistry().map((e) => siloDbPath(e.path))];
+  for (const dbPath of candidates) {
+    if (!fs.existsSync(dbPath)) continue;
+    const db = MyJarbisDB.openExisting(dbPath);
+    if (!db) continue;
+    try {
+      if (db.schemaVersion < 4) continue;
+      const org = db.orgs.findBySlug(slug);
+      if (org?.pack_path && fs.existsSync(org.pack_path)) return org.pack_path;
+    } finally {
+      db.close();
+    }
+  }
+  return null;
+}
+
 function runInitProject(argv: string[]): void {
   const { flags } = parseFlags(argv);
   const name = flags.name as string | undefined;
   const framework = flags.framework as string | undefined;
-  if (!name) fail('Usage: cli.js init-project --name=<project> [--framework=<fw>] [--shared=true|false] [--language=EN|ES|PT] [--persona=concise|pair|mentor|reviewer]');
+  if (!name) {
+    fail(
+      'Usage: cli.js init-project --name=<project> [--framework=<fw>] ' +
+        '[--shared=true|false] [--language=EN|ES|PT] ' +
+        '[--persona=concise|pair|mentor|reviewer] [--org=<slug>] [--pack-path=<dir>]',
+    );
+  }
 
   // Validate language + persona early (before any DB write)
   const language = parseLanguage(flags.language as string | undefined);
@@ -920,8 +971,9 @@ function runInitProject(argv: string[]): void {
 
   // 3. Compose interaction-style with the chosen language + persona
   //    (overwrites the placeholder default seeded by seedNewProject).
-  const ctx = ServerContext.initialize();
+  const ctx = ServerContext.initializeForSeed(projectPath);
   let materialized;
+  let packReport: PackApplyReport | undefined;
   try {
     addSkill(ctx, {
       name: 'interaction-style',
@@ -930,9 +982,29 @@ function runInitProject(argv: string[]): void {
       trigger_pattern: 'always loaded; modulates tone, language, brevity',
     });
 
+    // 3b. Apply the org pack, if one was named. This is the whole point of
+    //     --org: the organization's skills, taxonomy, workflows and provider
+    //     defaults arrive with the project instead of being taught to it
+    //     afterwards, which is how two of three real projects ended up
+    //     without that layer at all.
+    const orgSlug = flags.org as string | undefined;
+    if (orgSlug) {
+      const packPath = (flags['pack-path'] as string | undefined) ?? resolvePackPath(ctx, orgSlug);
+      if (!packPath) {
+        console.error(
+          `[MyJarbis] WARNING: --org=${orgSlug} given but no pack is registered ` +
+            `under that slug and --pack-path was not passed. Project created ` +
+            `WITHOUT the org layer; run \`myjarbis org add ${orgSlug} <path>\` to add it.`,
+        );
+      } else {
+        packReport = applyPack(ctx, readPack(packPath), { skipMaterialize: true });
+      }
+    }
+
     // 4. Materialize project-level skills (no active session yet) so
     //    .claude/skills/myjarbis-interaction-style/SKILL.md reflects the
-    //    composed content immediately.
+    //    composed content immediately. Runs after the pack so overrides
+    //    reach disk, not just the database.
     materialized = materializeSkills(ctx, {});
   } finally {
     ctx.close();
@@ -963,7 +1035,20 @@ function runInitProject(argv: string[]): void {
       written: materialized.written.length,
       unchanged: materialized.unchanged.length,
       removed: materialized.removed.length,
+      // What matters is how many the agent can actually see on disk.
+      on_disk: materialized.written.length + materialized.unchanged.length,
     },
+    org: packReport
+      ? {
+          slug: packReport.org.slug,
+          rev: packReport.org.rev,
+          skills: packReport.skills.length,
+          context_kinds: packReport.contextKinds.length,
+          workflows: packReport.workflows.length,
+          providers: packReport.providers.length,
+          warnings: packReport.warnings,
+        }
+      : null,
     shared: settings.shared,
   });
 }
@@ -1928,6 +2013,258 @@ function runBrain(argv: string[]): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// v0.3 subcommands
+// ─────────────────────────────────────────────────────────────────────
+
+/** myjarbis org <add|list|sync|diff> */
+function runOrg(argv: string[]): void {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+
+  switch (sub) {
+    case 'add': {
+      const { positional } = parseFlags(rest);
+      const [slug, packPath] = positional;
+      if (!slug || !packPath) {
+        fail('Usage: myjarbis org add <slug> <path-to-pack>');
+      }
+      const pack = readPack(packPath);
+      if (pack.slug !== slug) {
+        fail(
+          `Pack at ${packPath} declares slug "${pack.slug}", not "${slug}". ` +
+            'Use the slug from pack.yml so the two cannot drift apart.',
+        );
+      }
+      const ctx = ServerContext.initialize();
+      try {
+        printJson(applyPack(ctx, pack));
+      } finally {
+        ctx.close();
+      }
+      return;
+    }
+
+    case 'list': {
+      const ctx = ServerContext.initialize();
+      try {
+        printJson({
+          orgs: ctx.db.orgs.list().map((o) => ({
+            slug: o.slug,
+            name: o.name,
+            packPath: o.pack_path,
+            packRev: o.pack_rev,
+            projects: ctx.db.orgs.projectsOf(o.id).map((p) => p.name),
+          })),
+        });
+      } finally {
+        ctx.close();
+      }
+      return;
+    }
+
+    case 'sync':
+    case 'diff': {
+      const { positional, flags } = parseFlags(rest);
+      const slug = positional[0];
+      let packPath = positional[1] ?? (flags.pack as string | undefined);
+      if (!slug && !packPath) {
+        fail('Usage: myjarbis org sync <slug> [path-to-pack]   (diff = dry run)');
+      }
+      if (!packPath) {
+        // Fall back to the pack path recorded when the org was added.
+        const ctx = ServerContext.initialize();
+        try {
+          const org = ctx.db.orgs.findBySlug(slug);
+          if (!org?.pack_path) {
+            fail(
+              `Org "${slug}" has no recorded pack path. Pass it explicitly: ` +
+                `myjarbis org ${sub} ${slug} <path-to-pack>`,
+            );
+          }
+          packPath = org!.pack_path!;
+        } finally {
+          ctx.close();
+        }
+      }
+      printJson(syncOrg(packPath!, { dryRun: sub === 'diff' }));
+      return;
+    }
+
+    default:
+      fail('Usage: myjarbis org <add|list|sync|diff>');
+  }
+}
+
+/** myjarbis kinds [list|migrate] */
+function runKinds(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listContextKinds(ctx));
+      return;
+    }
+    if (sub === 'migrate') {
+      printJson(migrateKinds(ctx, { dry_run: truthy(flags['dry-run']) }));
+      return;
+    }
+    fail('Usage: myjarbis kinds <list|migrate> [--dry-run]');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis workflow <list|show> [slug] */
+function runWorkflow(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listWorkflowsTool(ctx));
+      return;
+    }
+    if (sub === 'show') {
+      const slug = positional[0];
+      if (!slug) fail('Usage: myjarbis workflow show <slug> [--no-evaluate]');
+      printJson(getWorkflow(ctx, { slug, evaluate: !truthy(flags['no-evaluate']) }));
+      return;
+    }
+    fail('Usage: myjarbis workflow <list|show>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis provider <list|set> */
+function runProvider(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listProviders(ctx));
+      return;
+    }
+    if (sub === 'set') {
+      const [role, kind] = positional;
+      if (!role || !kind) {
+        fail('Usage: myjarbis provider set <tracker|forge|ci> <kind> [--config=JSON]');
+      }
+      printJson(setProvider(ctx, { role, kind, config: flags.config as string | undefined }));
+      return;
+    }
+    fail('Usage: myjarbis provider <list|set>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis state <get|set> */
+function runState(argv: string[]): void {
+  const sub = argv[0] ?? 'get';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'get') {
+      printJson(getProjectState(ctx));
+      return;
+    }
+    if (sub === 'set') {
+      // Accept the body inline, from a file, or on stdin — the last being how
+      // a hook or an editor hands over multi-line text.
+      let content = positional.join(' ');
+      const fromFile = flags['from-file'] as string | undefined;
+      if (fromFile) content = fs.readFileSync(fromFile, 'utf-8');
+      else if (!content && !process.stdin.isTTY) content = fs.readFileSync(0, 'utf-8');
+      if (!content.trim()) {
+        fail('Usage: myjarbis state set "<text>" | --from-file=FILE | (text on stdin)');
+      }
+      printJson(
+        setProjectState(ctx, {
+          content: content.trim(),
+          session_tag: flags.tag as string | undefined,
+          force: truthy(flags.force),
+        }),
+      );
+      return;
+    }
+    fail('Usage: myjarbis state <get|set>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis migrate [--dry-run] [--db=PATH] [--all] */
+function runMigrate(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const dryRun = truthy(flags['dry-run']);
+
+  // An explicit path wins. Otherwise migrate the brain this directory
+  // resolves to, and never more than one unless --all says so: upgrading a
+  // file the user did not name is exactly what openExisting stopped doing.
+  const targets: string[] = [];
+  const explicit = flags.db as string | undefined;
+
+  if (explicit) {
+    targets.push(path.resolve(explicit));
+  } else if (truthy(flags.all)) {
+    if (fs.existsSync(globalDbPath())) targets.push(globalDbPath());
+    for (const entry of readRegistry()) {
+      const p = siloDbPath(entry.path);
+      if (fs.existsSync(p)) targets.push(p);
+    }
+    if (targets.length === 0) fail('No brains found to migrate.');
+  } else {
+    const ctx = ServerContext.initialize();
+    const p = ctx.db.dbPath;
+    ctx.close();
+    if (p === ':memory:') {
+      fail(
+        'No project resolved here, so there is nothing to migrate. Pass --db=PATH ' +
+          'for a specific brain, or --all for every registered one.',
+      );
+    }
+    targets.push(p);
+  }
+
+  const reports = targets.map((t) => upgradeBrain(t, { dryRun }));
+  printJson({
+    dryRun,
+    migrated: reports.filter((r) => !r.alreadyCurrent).length,
+    alreadyCurrent: reports.filter((r) => r.alreadyCurrent).length,
+    reports,
+  });
+}
+
+/** myjarbis merge --from=PATH [--into=PATH] [--as=NAME] [--dry-run] */
+function runMerge(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const from = flags.from as string | undefined;
+  if (!from) {
+    fail(
+      'Usage: myjarbis merge --from=<project>/.myjarbis/memory.db [--into=PATH] ' +
+        '[--as=NAME] [--source-project=NAME] [--dry-run]',
+    );
+  }
+  printJson(
+    mergeBrain({
+      from: path.resolve(from!),
+      into: flags.into ? path.resolve(flags.into as string) : globalDbPath(),
+      asName: flags.as as string | undefined,
+      sourceProject: flags['source-project'] as string | undefined,
+      dryRun: truthy(flags['dry-run']),
+    }),
+  );
+}
+
+/** parseFlags yields `true` for a bare flag and a string for --k=v. */
+function truthy(v: string | boolean | undefined): boolean {
+  return v === true || v === 'true' || v === '1';
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ─────────────────────────────────────────────────────────────────────
 
@@ -1962,6 +2299,20 @@ export function main(argv: string[]): void {
         return runHook(rest);
       case 'init-project':
         return runInitProject(rest);
+      case 'org':
+        return runOrg(rest);
+      case 'kinds':
+        return runKinds(rest);
+      case 'workflow':
+        return runWorkflow(rest);
+      case 'provider':
+        return runProvider(rest);
+      case 'state':
+        return runState(rest);
+      case 'migrate':
+        return runMigrate(rest);
+      case 'merge':
+        return runMerge(rest);
       default:
         fail(`Unknown subcommand: ${cmd}`);
     }
