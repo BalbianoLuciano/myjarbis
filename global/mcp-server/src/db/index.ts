@@ -1044,19 +1044,29 @@ export class MyJarbisDB {
       this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
       return (
         (this.prep(
-          'SELECT * FROM sessions WHERE module_id = ? ORDER BY started_at DESC LIMIT 1',
+          'SELECT * FROM sessions WHERE module_id = ? ORDER BY started_at DESC, id DESC LIMIT 1',
         ).get(moduleId) as SessionRow | undefined) ?? null
       );
     },
 
-    /** Latest CLOSED session (has next_session) for the "resume here" lookup. */
+    /**
+     * Latest CLOSED session (has next_session) for the "resume here" lookup.
+     *
+     * Tie-broken by id, which matters more than it looks: `ended_at` has
+     * one-second granularity, so two sessions closed in the same second
+     * compare equal and SQLite is free to return either. Automatic closing
+     * makes that collision ordinary rather than rare — a stale session gets
+     * closed in the same second the new one opens — and the wrong pick
+     * means the agent resumes from the session BEFORE the one it should.
+     * Ids are monotonic, so they are the real recency order.
+     */
     findLastClosedByModule: (moduleId: number): SessionRow | null => {
       this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
       return (
         (this.prep(
           `SELECT * FROM sessions
             WHERE module_id = ? AND ended_at IS NOT NULL AND next_session IS NOT NULL
-            ORDER BY ended_at DESC LIMIT 1`,
+            ORDER BY ended_at DESC, id DESC LIMIT 1`,
         ).get(moduleId) as SessionRow | undefined) ?? null
       );
     },
@@ -1066,7 +1076,7 @@ export class MyJarbisDB {
       this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
       return (
         (this.prep(
-          'SELECT * FROM sessions WHERE module_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+          'SELECT * FROM sessions WHERE module_id = ? AND ended_at IS NULL ORDER BY started_at DESC, id DESC LIMIT 1',
         ).get(moduleId) as SessionRow | undefined) ?? null
       );
     },
@@ -1243,7 +1253,7 @@ export class MyJarbisDB {
         `SELECT o.* FROM observations o
            JOIN sessions s ON s.id = o.session_id
           WHERE s.module_id = ?
-          ORDER BY o.created_at DESC
+          ORDER BY o.created_at DESC, o.id DESC
           LIMIT ?`,
       ).all(moduleId, limit) as ObservationRow[];
     },
@@ -1252,7 +1262,7 @@ export class MyJarbisDB {
       this.assertInScope(projectId, 'observation listing');
       return this.prep(
         `SELECT * FROM observations WHERE project_id = ?
-          ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?`,
+          ORDER BY COALESCE(updated_at, created_at) DESC, id DESC LIMIT ?`,
       ).all(projectId, limit) as ObservationRow[];
     },
   };

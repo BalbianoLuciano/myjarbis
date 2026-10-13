@@ -2,10 +2,15 @@
 #
 # MyJarbis Stop hook.
 #
-# Fires when the user closes Claude Code. We:
-#   1. Detect any open session (no ended_at) and remind the agent to
-#      call /complete or end_session before exit, so the next session
-#      can resume from a coherent next_session.
+# Fires after EVERY agent turn — not when Claude Code closes. That was
+# documented wrongly here for a while, which is part of why the "remind the
+# agent to close the session" approach never worked: by the time it mattered
+# the reminder had already scrolled past dozens of times.
+#
+# The actual close now happens in the SessionEnd hook (session-end.sh). This
+# one only:
+#   1. Nudges the agent to write a REAL summary, since otherwise the session
+#      gets closed with a generated one.
 #   2. Optionally clean up module-level skill folders if
 #      settings.skills.cleanup_module_skills_on_session_end is true.
 

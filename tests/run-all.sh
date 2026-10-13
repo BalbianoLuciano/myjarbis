@@ -21,6 +21,7 @@ SUITES=(
   v03-isolation
   v03-migrate-merge
   v03-org-pack
+  v03-auto-close
 )
 
 PASS=0; FAIL=0; FAILED_NAMES=()

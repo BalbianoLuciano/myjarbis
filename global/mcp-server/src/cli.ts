@@ -34,6 +34,7 @@ import {
 import { computeCost, formatTable } from './tools/cost.js';
 import { generateModuleDiagram, isDiagramAuto } from './diagram/generate.js';
 import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
+import { autoCloseAll } from './tools/autoClose.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
 import { readRegistry } from './org/registry.js';
@@ -1096,6 +1097,8 @@ function runHook(argv: string[]): void {
       return runHookPostCompaction();
     case 'session-stop':
       return runHookSessionStop();
+    case 'session-end':
+      return runHookSessionEnd();
     case 'user-prompt-submit':
       return runHookUserPromptSubmit(rest);
     case 'git-post-commit':
@@ -1403,6 +1406,73 @@ function runHookPostCompaction(): void {
   }
 }
 
+/**
+ * SessionEnd hook — close any open session, by default, without being asked.
+ *
+ * This is the SessionEnd event, NOT Stop. Stop fires after every single
+ * agent turn, so closing there would end the session after the first
+ * response. SessionEnd fires when the session actually ends.
+ *
+ * MyJarbis is installed on top of Claude Code so that this bookkeeping does
+ * not depend on the agent having remembered. Opt out with
+ * settings.session.auto_close_on_exit = false; it is on by default, because
+ * the failure it prevents (a session with no summary, so `resume` returns
+ * nothing and module listings lose their ordering signal) is silent.
+ */
+function runHookSessionEnd(): void {
+  const init = safeContext();
+  if (!init) return;
+  const { ctx } = init;
+  try {
+    const project = ctx.project;
+    if (!project) return;
+
+    const settings = readSettingsJson(ctx.projectPath);
+    const enabled = settings.session?.auto_close_on_exit !== false;
+
+    if (enabled) {
+      const closed = autoCloseAll(ctx);
+      for (const c of closed) {
+        console.error(
+          `[MyJarbis hook] auto-closed session #${c.sessionId} in "${c.module}" ` +
+            `(${c.observations} observation(s), ${c.durationMinutes}m, ` +
+            `resume point from ${c.nextSessionSource}).`,
+        );
+      }
+      if (closed.length === 0) {
+        console.error('[MyJarbis hook] no open session to close.');
+      }
+    }
+
+    // The dump has to be refreshed AFTER the close, or it ships a brain
+    // whose newest session still looks open.
+    if (settings.brain?.auto_export_on_session_end) {
+      try {
+        const res = exportBrain(ctx);
+        if (res.changed) {
+          console.error(`[MyJarbis hook] brain dump updated (${res.filesWritten.length} file(s)).`);
+        }
+      } catch (err) {
+        console.error(
+          `[MyJarbis hook] brain export failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    if (settings.skills?.cleanup_module_skills_on_session_end) {
+      const m = materializeSkills(ctx, {});
+      console.error(`[MyJarbis hook] cleanup removed ${m.removed.length} module skill(s).`);
+    }
+  } catch (err) {
+    // A hook must never be the reason a user cannot close their editor.
+    console.error(
+      `[MyJarbis hook] session-end failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    ctx.close();
+  }
+}
+
 function runHookSessionStop(): void {
   const init = safeContext();
   if (!init) return;
@@ -1440,10 +1510,13 @@ function runHookSessionStop(): void {
       if (open) {
         const obs = ctx.db.observations.listBySession(open.id).length;
         console.log(
-          `═══ MyJarbis · session ending ═══\n` +
-          `Open session #${open.id} in module "${m.name}" (${obs} observations).\n` +
-          `Run \`/complete\` or call \`end_session(summary, next_session)\` before exiting\n` +
-          `so the next session can resume coherently.`,
+          `═══ MyJarbis · open session ═══\n` +
+          `Session #${open.id} in module "${m.name}" (${obs} observation(s)).\n` +
+          `It WILL be closed automatically on exit with a generated summary, so ` +
+          `nothing is lost either way.\n` +
+          `Calling \`end_session(summary, next_session)\` yourself is still better: ` +
+          `the generated one records what happened, it cannot say what you meant ` +
+          `to do next.`,
         );
         return;
       }
@@ -1810,6 +1883,20 @@ interface ProjectSettings {
      *  Default 7. Disable by setting a very large number; 0/negative are
      *  ignored (fall back to default). */
     stale_after_days?: number;
+    /**
+     * Close an open session automatically when the session ends, writing a
+     * generated summary and resume point.
+     *
+     * Default TRUE — the only setting here that defaults on. The failure it
+     * prevents is silent: a session that never closes leaves `resume` with
+     * nothing to return and strips `hasNextSession` / `lastSessionEndedAt`
+     * from every module, which is the signal used to pick up where you left
+     * off and to choose a module. Real projects had summary NULL on 2 of 2
+     * and 2 of 10 sessions, and nobody noticed until the data was counted.
+     *
+     * Set to false to go back to being reminded instead.
+     */
+    auto_close_on_exit?: boolean;
   };
   /** Living draw.io diagram. `auto` (default false — opt-in) regenerates the
    *  active module's diagram on save_observation/update_progress and on session
