@@ -37,6 +37,8 @@ import { seedNewProject } from '$SEED_HELPER';
 import { MyJarbisDB } from '$MYJARBIS_INSTALL_DIR/mcp-server/build/db/index.js';
 const r = seedNewProject('$WORK', { name: 'skills-test', framework: 'generic' });
 const db = MyJarbisDB.open('$WORK');
+// Writes need a bound tenant scope; there is no implicit 'current project'.
+db.bindScope({ kind: 'project', id: r.projectId });
 db.modules.create(r.projectId, 'MM', 'Media Manager');
 db.modules.create(r.projectId, 'PageBuilder', 'Page Builder');
 db.close();

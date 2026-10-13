@@ -30,7 +30,20 @@ import {
   ObservationRow,
   ContextKind,
   ObservationKind,
+  OrgRow,
+  Isolation,
+  ContextKindRow,
+  RefRow,
+  RefKind,
+  ProjectStateRow,
+  WorkflowRow,
+  WorkflowScope,
+  WorkflowStepRow,
+  StepGate,
+  ProviderRow,
+  ProviderRole,
 } from './schema.js';
+import { MyJarbisError, ErrorType } from '../types.js';
 
 // ───────────────────────────────────────────────────────────────────
 // Helpers
@@ -51,16 +64,26 @@ function applySchemaAndMigrations(db: Database.Database): void {
   const currentVersion = row ? parseInt(row.value, 10) : 0;
 
   for (let v = currentVersion + 1; v <= SCHEMA_VERSION; v++) {
-    const sql = MIGRATIONS[v];
-    if (!sql) continue;
-    try {
-      db.exec(sql);
-    } catch (err) {
-      // Tolerate "duplicate column" when migration was partially applied
-      // before — e.g., an older code path already ALTER'd. Other errors
-      // still surface.
-      if (err instanceof Error && /duplicate column/i.test(err.message)) continue;
-      throw err;
+    const statements = MIGRATIONS[v];
+    if (!statements) continue;
+
+    // One statement at a time. Passing the whole step to `exec` meant a
+    // single already-applied ALTER aborted every statement after it, while
+    // the version still got bumped — leaving a DB that claims to be
+    // migrated but is missing columns. Per-statement application lets us
+    // skip exactly what is already satisfied.
+    for (const sql of statements) {
+      try {
+        db.exec(sql);
+      } catch (err) {
+        if (
+          err instanceof Error &&
+          /duplicate column|already exists/i.test(err.message)
+        ) {
+          continue;
+        }
+        throw err;
+      }
     }
   }
 
@@ -73,6 +96,33 @@ function applySchemaAndMigrations(db: Database.Database): void {
 export function sha256(input: string): string {
   return crypto.createHash('sha256').update(input, 'utf-8').digest('hex');
 }
+
+/** Two scopes are the same tenant view. Used to allow a harmless re-bind
+ *  (same project twice) while rejecting a tenant switch. */
+function sameScope(a: Scope, b: Scope): boolean {
+  if (a.kind !== b.kind) return false;
+  if (a.kind === 'project' && b.kind === 'project') return a.id === b.id;
+  return true;
+}
+
+/**
+ * Which tenant's rows a connection is allowed to touch.
+ *
+ * Before v0.3 isolation was a property of the filesystem: one DB file per
+ * project, so a query simply could not reach another project's rows. The
+ * shared DB removes that guarantee, and "pass project_id to every query"
+ * does not replace it — one forgotten parameter silently widens a read
+ * across every client in the file. That is the classic way multi-tenant
+ * tools leak.
+ *
+ * So scope is bound to the connection, not passed per call: read methods
+ * take their filter from here and offer no parameter to override it. The
+ * 'all' variant carries a `reason` so that widening a read is a deliberate,
+ * nameable act that shows up in logs rather than an empty argument.
+ */
+export type Scope =
+  | { kind: 'project'; id: number }
+  | { kind: 'all'; reason: string };
 
 export type SearchScope =
   | 'module'        // active module context + project core (default)
@@ -123,6 +173,9 @@ export class MyJarbisDB {
   /** Lazy statement cache keyed by the SQL text. */
   private stmtCache = new Map<string, Database.Statement>();
 
+  /** Null until bindScope() runs. Scoped reads throw while it is null. */
+  private _scope: Scope | null = null;
+
   private constructor(db: Database.Database, dbPath: string) {
     this.db = db;
     this.dbPath = dbPath;
@@ -131,6 +184,10 @@ export class MyJarbisDB {
   /**
    * Open or create memory.db at <projectPath>/.myjarbis/memory.db.
    * Applies the schema (idempotent) and bumps meta.schema_version.
+   *
+   * Only `myjarbis init` should ever create a DB. Everything else goes
+   * through openExisting(), because a command run in an unrelated
+   * directory used to leave a stray empty brain behind.
    */
   static open(projectPath: string): MyJarbisDB {
     const myjarbisDir = path.join(projectPath, '.myjarbis');
@@ -141,6 +198,27 @@ export class MyJarbisDB {
 
     const db = new Database(dbPath);
     applySchemaAndMigrations(db);
+    return new MyJarbisDB(db, dbPath);
+  }
+
+  /**
+   * Open an existing DB without creating anything AND without migrating it.
+   *
+   * Both halves matter. Returning null for a missing file lets the caller
+   * fall through the resolution chain instead of materialising an empty
+   * brain in whatever directory the user is standing in. And not migrating
+   * means merely *looking* for a project never rewrites someone's schema:
+   * resolution touches every candidate brain, including the shared one, so
+   * an implicit migration here would upgrade a file the user never named,
+   * with no backup and no way to say no. Schema changes belong to
+   * `myjarbis migrate`, which backs up first.
+   *
+   * A DB below SCHEMA_VERSION opens fine and keeps working with the
+   * features it has; `schemaVersion` tells callers to suggest migrating.
+   */
+  static openExisting(dbPath: string): MyJarbisDB | null {
+    if (!fs.existsSync(dbPath)) return null;
+    const db = new Database(dbPath);
     return new MyJarbisDB(db, dbPath);
   }
 
@@ -155,6 +233,113 @@ export class MyJarbisDB {
 
   close(): void {
     this.db.close();
+  }
+
+  /** Apply pending migrations to an already-open connection. Only
+   *  `myjarbis migrate` and `init` call this; see openExisting(). */
+  migrateInPlace(): void {
+    applySchemaAndMigrations(this.db);
+    this.stmtCache.clear();
+    this._schemaVersion = undefined;
+  }
+
+  private _schemaVersion?: number;
+
+  /** The schema version recorded in the file. 0 for a DB with no meta row. */
+  get schemaVersion(): number {
+    if (this._schemaVersion === undefined) {
+      try {
+        const row = this.db
+          .prepare(`SELECT value FROM meta WHERE key = 'schema_version'`)
+          .get() as { value: string } | undefined;
+        this._schemaVersion = row ? parseInt(row.value, 10) : 0;
+      } catch {
+        this._schemaVersion = 0;
+      }
+    }
+    return this._schemaVersion;
+  }
+
+  /** True when this file is behind the code and should be migrated. */
+  get needsMigration(): boolean {
+    return this.schemaVersion < SCHEMA_VERSION;
+  }
+
+  // ─────────────────────────────────────────────────────────────────
+  // Scope
+  // ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Bind the tenant scope for this connection. Called once, by whoever
+   * resolved which project we are in. Rebinding to a different project is
+   * rejected: a long-lived connection quietly changing tenants mid-process
+   * is the failure mode this whole mechanism exists to prevent.
+   */
+  bindScope(scope: Scope): void {
+    if (this._scope && !sameScope(this._scope, scope)) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        'Refusing to rebind an already-scoped connection. Open a new one.',
+        { from: this._scope, to: scope },
+      );
+    }
+    this._scope = scope;
+  }
+
+  get boundScope(): Scope | null {
+    return this._scope;
+  }
+
+  /** The bound scope, or a hard failure. Every scoped read goes through here. */
+  private get scope(): Scope {
+    if (!this._scope) {
+      throw new MyJarbisError(
+        ErrorType.SCOPE_NOT_RESOLVED,
+        'No scope bound to this connection. A read cannot default to every ' +
+          'project: resolve the project first, or bind { kind: "all", reason } ' +
+          'to cross projects on purpose.',
+        { dbPath: this.dbPath },
+      );
+    }
+    return this._scope;
+  }
+
+  /** The project id this connection is pinned to, or null under 'all'. */
+  get scopedProjectId(): number | null {
+    const s = this.scope;
+    return s.kind === 'project' ? s.id : null;
+  }
+
+  /**
+   * SQL fragment restricting `<alias>.project_id` to the bound scope,
+   * plus the parameters it needs. Under 'all' it contributes nothing,
+   * which is the only way a cross-project read can happen.
+   */
+  private scopeFilter(column: string): { sql: string; params: number[] } {
+    const s = this.scope;
+    if (s.kind === 'all') return { sql: '', params: [] };
+    return { sql: ` AND ${column} = ?`, params: [s.id] };
+  }
+
+  /** Throw unless `projectId` is inside the bound scope. */
+  private assertInScope(projectId: number | null, what: string): void {
+    const s = this.scope;
+    if (s.kind === 'all') return;
+    if (projectId !== s.id) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        `${what} belongs to project ${projectId}, but this connection is scoped to project ${s.id}.`,
+        { requested: projectId, scopedTo: s.id },
+      );
+    }
+  }
+
+  /** Resolve the owning project of a module, for scope checks. */
+  private projectIdOfModule(moduleId: number): number | null {
+    const row = this.prep('SELECT project_id FROM modules WHERE id = ?').get(moduleId) as
+      | { project_id: number }
+      | undefined;
+    return row?.project_id ?? null;
   }
 
   private prep(sql: string): Database.Statement {
@@ -193,18 +378,46 @@ export class MyJarbisDB {
   // ─────────────────────────────────────────────────────────────────
   // projects
   // ─────────────────────────────────────────────────────────────────
+  // The `projects` accessors are the one family that runs BEFORE a scope
+  // exists — they are how the scope gets resolved in the first place. They
+  // are therefore deliberately unscoped, and deliberately limited to
+  // lookups by an identifier the caller already holds (path, remote, name,
+  // id). The only listing that can enumerate tenants is `listAll`, which
+  // demands a reason.
   projects = {
-    create: (name: string, projectPath: string, framework?: string): ProjectRow => {
+    create: (params: {
+      name: string;
+      path: string;
+      framework?: string;
+      orgId?: number | null;
+      gitRemote?: string | null;
+      isolation?: Isolation;
+    }): ProjectRow => {
       const info = this.prep(
-        'INSERT INTO projects(name, path, framework) VALUES (?, ?, ?)',
-      ).run(name, projectPath, framework ?? null);
+        `INSERT INTO projects(name, path, framework, org_id, git_remote, isolation)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        params.name,
+        params.path,
+        params.framework ?? null,
+        params.orgId ?? null,
+        params.gitRemote ?? null,
+        params.isolation ?? 'silo',
+      );
       return this.projects.findById(Number(info.lastInsertRowid))!;
     },
 
-    upsertByPath: (name: string, projectPath: string, framework?: string): ProjectRow => {
-      const existing = this.projects.findByPath(projectPath);
+    upsertByPath: (params: {
+      name: string;
+      path: string;
+      framework?: string;
+      orgId?: number | null;
+      gitRemote?: string | null;
+      isolation?: Isolation;
+    }): ProjectRow => {
+      const existing = this.projects.findByPath(params.path);
       if (existing) return existing;
-      return this.projects.create(name, projectPath, framework);
+      return this.projects.create(params);
     },
 
     findById: (id: number): ProjectRow | null =>
@@ -218,8 +431,156 @@ export class MyJarbisDB {
         | ProjectRow
         | undefined) ?? null,
 
-    list: (): ProjectRow[] =>
-      this.prep('SELECT * FROM projects ORDER BY name').all() as ProjectRow[],
+    /**
+     * Resolve by normalised git remote. See resolve.ts for normalisation.
+     *
+     * Returns null on a pre-v4 file rather than throwing: `git_remote` does
+     * not exist there, and an un-migrated project must keep resolving the
+     * way it always did (by path) instead of failing to open at all.
+     */
+    findByRemote: (remote: string): ProjectRow | null => {
+      if (this.schemaVersion < 4) return null;
+      return (
+        (this.prep('SELECT * FROM projects WHERE git_remote = ?').get(remote) as
+          | ProjectRow
+          | undefined) ?? null
+      );
+    },
+
+    /** The projects visible under the bound scope: one, or all under 'all'. */
+    list: (): ProjectRow[] => {
+      const s = this.scope;
+      if (s.kind === 'project') {
+        const row = this.projects.findById(s.id);
+        return row ? [row] : [];
+      }
+      return this.prep('SELECT * FROM projects ORDER BY name').all() as ProjectRow[];
+    },
+
+    /**
+     * Enumerate every project regardless of scope. Takes a reason because
+     * this is the one query that sees across tenants, and a caller that
+     * cannot say why it needs that probably does not.
+     */
+    listAll: (reason: string): ProjectRow[] => {
+      if (!reason || !reason.trim()) {
+        throw new MyJarbisError(
+          ErrorType.SCOPE_NOT_RESOLVED,
+          'listAll() requires a reason describing why the read crosses projects.',
+        );
+      }
+      return this.prep('SELECT * FROM projects ORDER BY name').all() as ProjectRow[];
+    },
+
+    setOrg: (id: number, orgId: number | null): void => {
+      this.prep('UPDATE projects SET org_id = ? WHERE id = ?').run(orgId, id);
+    },
+
+    setRemote: (id: number, remote: string | null): void => {
+      this.prep('UPDATE projects SET git_remote = ? WHERE id = ?').run(remote, id);
+    },
+
+    setIsolation: (id: number, isolation: Isolation): void => {
+      this.prep('UPDATE projects SET isolation = ? WHERE id = ?').run(isolation, id);
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // orgs
+  // ─────────────────────────────────────────────────────────────────
+  orgs = {
+    upsert: (params: {
+      slug: string;
+      name: string;
+      packPath?: string | null;
+      packRev?: string | null;
+    }): OrgRow => {
+      const existing = this.orgs.findBySlug(params.slug);
+      if (existing) {
+        this.prep(
+          'UPDATE orgs SET name = ?, pack_path = ?, pack_rev = ? WHERE id = ?',
+        ).run(params.name, params.packPath ?? null, params.packRev ?? null, existing.id);
+        return this.orgs.findBySlug(params.slug)!;
+      }
+      this.prep(
+        'INSERT INTO orgs(slug, name, pack_path, pack_rev) VALUES (?, ?, ?, ?)',
+      ).run(params.slug, params.name, params.packPath ?? null, params.packRev ?? null);
+      return this.orgs.findBySlug(params.slug)!;
+    },
+
+    findBySlug: (slug: string): OrgRow | null =>
+      (this.prep('SELECT * FROM orgs WHERE slug = ?').get(slug) as OrgRow | undefined) ?? null,
+
+    findById: (id: number): OrgRow | null =>
+      (this.prep('SELECT * FROM orgs WHERE id = ?').get(id) as OrgRow | undefined) ?? null,
+
+    list: (): OrgRow[] => this.prep('SELECT * FROM orgs ORDER BY slug').all() as OrgRow[],
+
+    setRev: (id: number, rev: string | null): void => {
+      this.prep('UPDATE orgs SET pack_rev = ? WHERE id = ?').run(rev, id);
+    },
+
+    /** Projects belonging to an org. Used by `org sync`, which is by
+     *  definition a cross-project operation, so it needs the 'all' scope. */
+    projectsOf: (orgId: number): ProjectRow[] => {
+      const s = this.scope;
+      if (s.kind === 'project') {
+        return this.prep('SELECT * FROM projects WHERE org_id = ? AND id = ? ORDER BY name').all(
+          orgId,
+          s.id,
+        ) as ProjectRow[];
+      }
+      return this.prep('SELECT * FROM projects WHERE org_id = ? ORDER BY name').all(
+        orgId,
+      ) as ProjectRow[];
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // context_kinds — the taxonomy catalogue
+  // ─────────────────────────────────────────────────────────────────
+  contextKinds = {
+    list: (orgId?: number | null): ContextKindRow[] =>
+      this.prep(
+        `SELECT * FROM context_kinds
+          WHERE org_id IS NULL ${orgId == null ? '' : 'OR org_id = ?'}
+          ORDER BY position, slug`,
+      ).all(...(orgId == null ? [] : [orgId])) as ContextKindRow[],
+
+    exists: (slug: string, orgId?: number | null): boolean => {
+      const row = this.prep(
+        `SELECT 1 AS ok FROM context_kinds
+          WHERE slug = ? AND (org_id IS NULL ${orgId == null ? '' : 'OR org_id = ?'})`,
+      ).get(...(orgId == null ? [slug] : [slug, orgId])) as { ok: number } | undefined;
+      return !!row;
+    },
+
+    upsert: (params: {
+      slug: string;
+      label: string;
+      description?: string | null;
+      orgId?: number | null;
+      position?: number;
+    }): ContextKindRow => {
+      this.prep(
+        `INSERT INTO context_kinds(slug, label, description, org_id, position)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(slug) DO UPDATE SET
+           label = excluded.label,
+           description = excluded.description,
+           org_id = excluded.org_id,
+           position = excluded.position`,
+      ).run(
+        params.slug,
+        params.label,
+        params.description ?? null,
+        params.orgId ?? null,
+        params.position ?? 100,
+      );
+      return this.prep('SELECT * FROM context_kinds WHERE slug = ?').get(
+        params.slug,
+      ) as ContextKindRow;
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────
@@ -238,6 +599,7 @@ export class MyJarbisDB {
       tags?: string;
       sourcePath?: string;
     }): { row: ProjectContextRow; status: 'inserted' | 'updated' | 'unchanged' } => {
+      this.assertInScope(params.projectId, 'project_context row');
       const hash = sha256(params.content);
 
       const existing = params.sourcePath
@@ -281,15 +643,75 @@ export class MyJarbisDB {
       };
     },
 
-    findById: (id: number): ProjectContextRow | null =>
-      (this.prep('SELECT * FROM project_context WHERE id = ?').get(id) as
-        | ProjectContextRow
-        | undefined) ?? null,
+    findById: (id: number): ProjectContextRow | null => {
+      const row =
+        (this.prep('SELECT * FROM project_context WHERE id = ?').get(id) as
+          | ProjectContextRow
+          | undefined) ?? null;
+      if (row) this.assertInScope(row.project_id, `project_context row ${id}`);
+      return row;
+    },
 
-    listByProject: (projectId: number): ProjectContextRow[] =>
-      this.prep('SELECT * FROM project_context WHERE project_id = ? ORDER BY kind, title').all(
-        projectId,
-      ) as ProjectContextRow[],
+    /** Same lookup as findById but returns null for out-of-scope rows
+     *  instead of throwing. For callers probing an id they did not choose. */
+    findByIdInScope: (id: number): ProjectContextRow | null => {
+      const row =
+        (this.prep('SELECT * FROM project_context WHERE id = ?').get(id) as
+          | ProjectContextRow
+          | undefined) ?? null;
+      if (!row) return null;
+      const s = this.scope;
+      if (s.kind === 'project' && row.project_id !== s.id) return null;
+      return row;
+    },
+
+    listByProject: (projectId: number): ProjectContextRow[] => {
+      this.assertInScope(projectId, 'project_context listing');
+      return this.prep(
+        'SELECT * FROM project_context WHERE project_id = ? ORDER BY kind, title',
+      ).all(projectId) as ProjectContextRow[];
+    },
+
+    /** Rows of a given kind, used by the session hook to always load the
+     *  same two kinds without having to ask what the project called them. */
+    listByKind: (projectId: number, kind: ContextKind): ProjectContextRow[] => {
+      this.assertInScope(projectId, 'project_context listing');
+      return this.prep(
+        'SELECT * FROM project_context WHERE project_id = ? AND kind = ? ORDER BY title',
+      ).all(projectId, kind) as ProjectContextRow[];
+    },
+
+    findByTopic: (projectId: number, topicKey: string): ProjectContextRow | null => {
+      this.assertInScope(projectId, 'project_context lookup');
+      return (
+        (this.prep(
+          'SELECT * FROM project_context WHERE project_id = ? AND topic_key = ?',
+        ).get(projectId, topicKey) as ProjectContextRow | undefined) ?? null
+      );
+    },
+
+    setTopicKey: (id: number, topicKey: string | null): void => {
+      const row = this.projectContext.findById(id);
+      if (!row) return;
+      this.prep('UPDATE project_context SET topic_key = ? WHERE id = ?').run(topicKey, id);
+    },
+
+    /** Rewrite a row's kind. Used by the taxonomy migration, which reports
+     *  every change it makes rather than rewriting silently. */
+    setKind: (id: number, kind: ContextKind): void => {
+      this.prep(
+        `UPDATE project_context SET kind = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(kind, id);
+    },
+
+    /** Distinct kinds in use, for the migration's dry run. */
+    distinctKinds: (projectId: number): Array<{ kind: string; n: number }> => {
+      this.assertInScope(projectId, 'project_context listing');
+      return this.prep(
+        `SELECT kind, COUNT(*) AS n FROM project_context
+          WHERE project_id = ? GROUP BY kind ORDER BY n DESC`,
+      ).all(projectId) as Array<{ kind: string; n: number }>;
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────
@@ -297,6 +719,7 @@ export class MyJarbisDB {
   // ─────────────────────────────────────────────────────────────────
   modules = {
     create: (projectId: number, name: string, description?: string): ModuleRow => {
+      this.assertInScope(projectId, 'module');
       const info = this.prep(
         'INSERT INTO modules(project_id, name, description) VALUES (?, ?, ?)',
       ).run(projectId, name, description ?? null);
@@ -309,21 +732,32 @@ export class MyJarbisDB {
       return this.modules.create(projectId, name, description);
     },
 
-    findById: (id: number): ModuleRow | null =>
-      (this.prep('SELECT * FROM modules WHERE id = ?').get(id) as ModuleRow | undefined) ?? null,
+    findById: (id: number): ModuleRow | null => {
+      const row =
+        (this.prep('SELECT * FROM modules WHERE id = ?').get(id) as ModuleRow | undefined) ?? null;
+      if (row) this.assertInScope(row.project_id, `module ${id}`);
+      return row;
+    },
 
-    findByName: (projectId: number, name: string): ModuleRow | null =>
-      (this.prep('SELECT * FROM modules WHERE project_id = ? AND name = ?').get(
-        projectId,
-        name,
-      ) as ModuleRow | undefined) ?? null,
+    findByName: (projectId: number, name: string): ModuleRow | null => {
+      this.assertInScope(projectId, 'module lookup');
+      return (
+        (this.prep('SELECT * FROM modules WHERE project_id = ? AND name = ?').get(
+          projectId,
+          name,
+        ) as ModuleRow | undefined) ?? null
+      );
+    },
 
-    listByProject: (projectId: number): ModuleRow[] =>
-      this.prep('SELECT * FROM modules WHERE project_id = ? ORDER BY name').all(
+    listByProject: (projectId: number): ModuleRow[] => {
+      this.assertInScope(projectId, 'module listing');
+      return this.prep('SELECT * FROM modules WHERE project_id = ? ORDER BY name').all(
         projectId,
-      ) as ModuleRow[],
+      ) as ModuleRow[];
+    },
 
     setStatus: (id: number, status: ModuleStatus): void => {
+      this.modules.findById(id); // scope check
       this.prep('UPDATE modules SET status = ? WHERE id = ?').run(status, id);
     },
   };
@@ -340,6 +774,7 @@ export class MyJarbisDB {
       tags?: string;
       sourcePath?: string;
     }): { row: ModuleContextRow; status: 'inserted' | 'updated' | 'unchanged' } => {
+      this.assertInScope(this.projectIdOfModule(params.moduleId), 'module_context row');
       const hash = sha256(params.content);
 
       const existing = params.sourcePath
@@ -383,15 +818,37 @@ export class MyJarbisDB {
       };
     },
 
-    findById: (id: number): ModuleContextRow | null =>
-      (this.prep('SELECT * FROM module_context WHERE id = ?').get(id) as
-        | ModuleContextRow
-        | undefined) ?? null,
+    findById: (id: number): ModuleContextRow | null => {
+      const row =
+        (this.prep('SELECT * FROM module_context WHERE id = ?').get(id) as
+          | ModuleContextRow
+          | undefined) ?? null;
+      if (row) {
+        this.assertInScope(this.projectIdOfModule(row.module_id), `module_context row ${id}`);
+      }
+      return row;
+    },
 
-    listByModule: (moduleId: number): ModuleContextRow[] =>
-      this.prep('SELECT * FROM module_context WHERE module_id = ? ORDER BY kind, title').all(
-        moduleId,
-      ) as ModuleContextRow[],
+    listByModule: (moduleId: number): ModuleContextRow[] => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'module_context listing');
+      return this.prep(
+        'SELECT * FROM module_context WHERE module_id = ? ORDER BY kind, title',
+      ).all(moduleId) as ModuleContextRow[];
+    },
+
+    setKind: (id: number, kind: ContextKind): void => {
+      this.prep(
+        `UPDATE module_context SET kind = ?, updated_at = datetime('now') WHERE id = ?`,
+      ).run(kind, id);
+    },
+
+    distinctKinds: (moduleId: number): Array<{ kind: string; n: number }> => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'module_context listing');
+      return this.prep(
+        `SELECT kind, COUNT(*) AS n FROM module_context
+          WHERE module_id = ? GROUP BY kind ORDER BY n DESC`,
+      ).all(moduleId) as Array<{ kind: string; n: number }>;
+    },
 
     /** Resolve a story-style row by its localId. import_json writes
      *  source_path as "<file>#<localId>"; we also tolerate localId
@@ -435,6 +892,7 @@ export class MyJarbisDB {
       content: string;
       enabled?: boolean;
     }): { row: SkillRow; status: 'inserted' | 'updated' | 'unchanged' } => {
+      this.assertInScope(params.projectId, 'skill');
       const hash = sha256(params.content);
       const moduleId = params.moduleId ?? null;
 
@@ -475,45 +933,63 @@ export class MyJarbisDB {
       return { row: this.skills.findById(Number(info.lastInsertRowid))!, status: 'inserted' };
     },
 
-    findById: (id: number): SkillRow | null =>
-      (this.prep('SELECT * FROM skills WHERE id = ?').get(id) as SkillRow | undefined) ?? null,
+    findById: (id: number): SkillRow | null => {
+      const row =
+        (this.prep('SELECT * FROM skills WHERE id = ?').get(id) as SkillRow | undefined) ?? null;
+      if (row) this.assertInScope(row.project_id, `skill ${id}`);
+      return row;
+    },
 
-    findByName: (projectId: number, moduleId: number | null, name: string): SkillRow | null =>
-      (this.prep(
-        moduleId === null
-          ? 'SELECT * FROM skills WHERE project_id = ? AND module_id IS NULL AND name = ?'
-          : 'SELECT * FROM skills WHERE project_id = ? AND module_id = ? AND name = ?',
-      ).get(...(moduleId === null ? [projectId, name] : [projectId, moduleId, name])) as
-        | SkillRow
-        | undefined) ?? null,
+    findByName: (projectId: number, moduleId: number | null, name: string): SkillRow | null => {
+      this.assertInScope(projectId, 'skill lookup');
+      return (
+        (this.prep(
+          moduleId === null
+            ? 'SELECT * FROM skills WHERE project_id = ? AND module_id IS NULL AND name = ?'
+            : 'SELECT * FROM skills WHERE project_id = ? AND module_id = ? AND name = ?',
+        ).get(...(moduleId === null ? [projectId, name] : [projectId, moduleId, name])) as
+          | SkillRow
+          | undefined) ?? null
+      );
+    },
 
     /** Skills that should be loaded for a session in `moduleId`:
      *  project-level (module_id IS NULL) + module-level for that module.
      *  Both filtered by enabled = 1.
      */
-    listForSession: (projectId: number, moduleId: number): SkillRow[] =>
-      this.prep(
+    listForSession: (projectId: number, moduleId: number): SkillRow[] => {
+      this.assertInScope(projectId, 'skill listing');
+      return this.prep(
         `SELECT * FROM skills
           WHERE project_id = ? AND enabled = 1
             AND (module_id IS NULL OR module_id = ?)
           ORDER BY module_id IS NOT NULL, name`,
-      ).all(projectId, moduleId) as SkillRow[],
+      ).all(projectId, moduleId) as SkillRow[];
+    },
 
-    listByProject: (projectId: number, opts: { onlyProjectLevel?: boolean } = {}): SkillRow[] =>
-      this.prep(
+    listByProject: (projectId: number, opts: { onlyProjectLevel?: boolean } = {}): SkillRow[] => {
+      this.assertInScope(projectId, 'skill listing');
+      return this.prep(
         opts.onlyProjectLevel
           ? 'SELECT * FROM skills WHERE project_id = ? AND module_id IS NULL ORDER BY name'
           : 'SELECT * FROM skills WHERE project_id = ? ORDER BY module_id IS NOT NULL, name',
-      ).all(projectId) as SkillRow[],
+      ).all(projectId) as SkillRow[];
+    },
 
-    listByModule: (moduleId: number): SkillRow[] =>
-      this.prep('SELECT * FROM skills WHERE module_id = ? ORDER BY name').all(moduleId) as SkillRow[],
+    listByModule: (moduleId: number): SkillRow[] => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'skill listing');
+      return this.prep('SELECT * FROM skills WHERE module_id = ? ORDER BY name').all(
+        moduleId,
+      ) as SkillRow[];
+    },
 
     setEnabled: (id: number, enabled: boolean): void => {
+      this.skills.findById(id); // scope check
       this.prep('UPDATE skills SET enabled = ? WHERE id = ?').run(enabled ? 1 : 0, id);
     },
 
     delete: (id: number): void => {
+      this.skills.findById(id); // scope check
       this.prep('DELETE FROM skills WHERE id = ?').run(id);
     },
   };
@@ -523,11 +999,13 @@ export class MyJarbisDB {
   // ─────────────────────────────────────────────────────────────────
   sessions = {
     start: (moduleId: number): SessionRow => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session');
       const info = this.prep('INSERT INTO sessions(module_id) VALUES (?)').run(moduleId);
       return this.sessions.findById(Number(info.lastInsertRowid))!;
     },
 
     end: (id: number, summary: string, nextSession: string): SessionRow => {
+      this.sessions.findById(id); // scope check
       this.prep(
         `UPDATE sessions
             SET ended_at = datetime('now'), summary = ?, next_session = ?
@@ -536,34 +1014,73 @@ export class MyJarbisDB {
       return this.sessions.findById(id)!;
     },
 
-    findById: (id: number): SessionRow | null =>
-      (this.prep('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined) ?? null,
+    findById: (id: number): SessionRow | null => {
+      const row =
+        (this.prep('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined) ??
+        null;
+      if (row) this.assertInScope(this.projectIdOfModule(row.module_id), `session ${id}`);
+      return row;
+    },
 
     /** Latest session of a module, regardless of ended_at. */
-    findLastByModule: (moduleId: number): SessionRow | null =>
-      (this.prep(
-        'SELECT * FROM sessions WHERE module_id = ? ORDER BY started_at DESC LIMIT 1',
-      ).get(moduleId) as SessionRow | undefined) ?? null,
+    findLastByModule: (moduleId: number): SessionRow | null => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
+      return (
+        (this.prep(
+          'SELECT * FROM sessions WHERE module_id = ? ORDER BY started_at DESC LIMIT 1',
+        ).get(moduleId) as SessionRow | undefined) ?? null
+      );
+    },
 
-    /** Latest CLOSED session (has next_session) for the "Retomar aquí" lookup. */
-    findLastClosedByModule: (moduleId: number): SessionRow | null =>
-      (this.prep(
-        `SELECT * FROM sessions
-          WHERE module_id = ? AND ended_at IS NOT NULL AND next_session IS NOT NULL
-          ORDER BY ended_at DESC LIMIT 1`,
-      ).get(moduleId) as SessionRow | undefined) ?? null,
+    /** Latest CLOSED session (has next_session) for the "resume here" lookup. */
+    findLastClosedByModule: (moduleId: number): SessionRow | null => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
+      return (
+        (this.prep(
+          `SELECT * FROM sessions
+            WHERE module_id = ? AND ended_at IS NOT NULL AND next_session IS NOT NULL
+            ORDER BY ended_at DESC LIMIT 1`,
+        ).get(moduleId) as SessionRow | undefined) ?? null
+      );
+    },
 
     /** Currently-open session (no ended_at) for a module, if any. */
-    findActiveByModule: (moduleId: number): SessionRow | null =>
-      (this.prep(
-        'SELECT * FROM sessions WHERE module_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
-      ).get(moduleId) as SessionRow | undefined) ?? null,
+    findActiveByModule: (moduleId: number): SessionRow | null => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
+      return (
+        (this.prep(
+          'SELECT * FROM sessions WHERE module_id = ? AND ended_at IS NULL ORDER BY started_at DESC LIMIT 1',
+        ).get(moduleId) as SessionRow | undefined) ?? null
+      );
+    },
+
+    /** Sessions left open across the whole project. Feeds the automatic
+     *  close in the stop hook: `summary` came back NULL on a third of real
+     *  sessions, which is the brain quietly losing a day's work. */
+    listOpenByProject: (projectId: number): SessionRow[] => {
+      this.assertInScope(projectId, 'session listing');
+      return this.prep(
+        `SELECT s.* FROM sessions s
+           JOIN modules m ON m.id = s.module_id
+          WHERE m.project_id = ? AND s.ended_at IS NULL
+          ORDER BY s.started_at`,
+      ).all(projectId) as SessionRow[];
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────
   // observations
   // ─────────────────────────────────────────────────────────────────
   observations = {
+    /**
+     * Insert a note, or update the one that already covers this topic.
+     *
+     * With `topicKey` set this is an upsert: the existing row for that
+     * topic is rewritten in place and `updated_at` is stamped. That is the
+     * whole point of topic identity — the agent used to express it by
+     * titling a new note "DEFINITIVE — supersedes notes 80 and 81", which
+     * left the reader to work out which version won.
+     */
     add: (params: {
       sessionId: number;
       kind: ObservationKind;
@@ -572,40 +1089,463 @@ export class MyJarbisDB {
       storyLocalId?: string;
       files?: string;
       tags?: string;
-    }): ObservationRow => {
+      topicKey?: string | null;
+      /** Keep the previous row and point at it instead of overwriting. */
+      keepHistory?: boolean;
+    }): { row: ObservationRow; status: 'inserted' | 'updated' } => {
+      const session = this.sessions.findById(params.sessionId);
+      if (!session) {
+        throw new MyJarbisError(
+          ErrorType.SESSION_NOT_ACTIVE,
+          `Session ${params.sessionId} not found.`,
+        );
+      }
+      const projectId = this.projectIdOfModule(session.module_id);
+      this.assertInScope(projectId, 'observation');
+
+      const topicKey = params.topicKey ?? null;
+      const existing =
+        topicKey && projectId !== null
+          ? ((this.prep(
+              'SELECT * FROM observations WHERE project_id = ? AND topic_key = ?',
+            ).get(projectId, topicKey) as ObservationRow | undefined) ?? null)
+          : null;
+
+      if (existing && !params.keepHistory) {
+        this.prep(
+          `UPDATE observations
+              SET session_id = ?, kind = ?, title = ?, content = ?,
+                  story_local_id = ?, files = ?, tags = ?,
+                  updated_at = datetime('now')
+            WHERE id = ?`,
+        ).run(
+          params.sessionId,
+          params.kind,
+          params.title,
+          params.content,
+          params.storyLocalId ?? null,
+          params.files ?? null,
+          params.tags ?? null,
+          existing.id,
+        );
+        return { row: this.observations.findById(existing.id)!, status: 'updated' };
+      }
+
+      // keepHistory: free the unique topic slot on the old row first, then
+      // insert the new one pointing back at it. Without releasing it the
+      // partial unique index rejects the insert.
+      if (existing && params.keepHistory) {
+        this.prep('UPDATE observations SET topic_key = NULL WHERE id = ?').run(existing.id);
+      }
+
       const info = this.prep(
-        `INSERT INTO observations(session_id, kind, title, content, story_local_id, files, tags)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO observations(
+           session_id, project_id, kind, title, content,
+           story_local_id, files, tags, topic_key, supersedes)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         params.sessionId,
+        projectId,
         params.kind,
         params.title,
         params.content,
         params.storyLocalId ?? null,
         params.files ?? null,
         params.tags ?? null,
+        topicKey,
+        existing && params.keepHistory ? existing.id : null,
       );
-      return this.observations.findById(Number(info.lastInsertRowid))!;
+      return {
+        row: this.observations.findById(Number(info.lastInsertRowid))!,
+        status: 'inserted',
+      };
     },
 
-    findById: (id: number): ObservationRow | null =>
-      (this.prep('SELECT * FROM observations WHERE id = ?').get(id) as
-        | ObservationRow
-        | undefined) ?? null,
-
-    listBySession: (sessionId: number): ObservationRow[] =>
-      this.prep('SELECT * FROM observations WHERE session_id = ? ORDER BY created_at').all(
-        sessionId,
-      ) as ObservationRow[],
-
-    listByModule: (moduleId: number, limit = 50): ObservationRow[] =>
+    update: (
+      id: number,
+      patch: { title?: string; content?: string; tags?: string | null; kind?: ObservationKind },
+    ): ObservationRow => {
+      const row = this.observations.findById(id);
+      if (!row) {
+        throw new MyJarbisError(ErrorType.INVALID_INPUT, `Observation ${id} not found.`);
+      }
       this.prep(
+        `UPDATE observations
+            SET title = ?, content = ?, tags = ?, kind = ?, updated_at = datetime('now')
+          WHERE id = ?`,
+      ).run(
+        patch.title ?? row.title,
+        patch.content ?? row.content,
+        patch.tags === undefined ? row.tags : patch.tags,
+        patch.kind ?? row.kind,
+        id,
+      );
+      return this.observations.findById(id)!;
+    },
+
+    findById: (id: number): ObservationRow | null => {
+      const row =
+        (this.prep('SELECT * FROM observations WHERE id = ?').get(id) as
+          | ObservationRow
+          | undefined) ?? null;
+      if (row) this.assertInScope(row.project_id, `observation ${id}`);
+      return row;
+    },
+
+    findByTopic: (projectId: number, topicKey: string): ObservationRow | null => {
+      this.assertInScope(projectId, 'observation lookup');
+      return (
+        (this.prep(
+          'SELECT * FROM observations WHERE project_id = ? AND topic_key = ?',
+        ).get(projectId, topicKey) as ObservationRow | undefined) ?? null
+      );
+    },
+
+    /** Every topic key in use, so the agent can reuse one instead of
+     *  inventing a near-duplicate. Without this, topic keys drift the same
+     *  way free-text kinds did. */
+    listTopicKeys: (projectId: number): Array<{ topic_key: string; title: string; updated_at: string | null }> => {
+      this.assertInScope(projectId, 'observation listing');
+      return this.prep(
+        `SELECT topic_key, title, updated_at FROM observations
+          WHERE project_id = ? AND topic_key IS NOT NULL
+          ORDER BY topic_key`,
+      ).all(projectId) as Array<{ topic_key: string; title: string; updated_at: string | null }>;
+    },
+
+    listBySession: (sessionId: number): ObservationRow[] => {
+      this.sessions.findById(sessionId); // scope check
+      return this.prep(
+        'SELECT * FROM observations WHERE session_id = ? ORDER BY created_at',
+      ).all(sessionId) as ObservationRow[];
+    },
+
+    listByModule: (moduleId: number, limit = 50): ObservationRow[] => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'observation listing');
+      return this.prep(
         `SELECT o.* FROM observations o
            JOIN sessions s ON s.id = o.session_id
           WHERE s.module_id = ?
           ORDER BY o.created_at DESC
           LIMIT ?`,
-      ).all(moduleId, limit) as ObservationRow[],
+      ).all(moduleId, limit) as ObservationRow[];
+    },
+
+    listByProject: (projectId: number, limit = 50): ObservationRow[] => {
+      this.assertInScope(projectId, 'observation listing');
+      return this.prep(
+        `SELECT * FROM observations WHERE project_id = ?
+          ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?`,
+      ).all(projectId, limit) as ObservationRow[];
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // refs — typed links out of a note
+  // ─────────────────────────────────────────────────────────────────
+  refs = {
+    add: (params: {
+      observationId: number;
+      kind: RefKind;
+      provider: string;
+      externalId: string;
+      url?: string | null;
+    }): RefRow => {
+      this.observations.findById(params.observationId); // scope check
+      this.prep(
+        `INSERT INTO refs(observation_id, kind, provider, external_id, url)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(observation_id, provider, kind, external_id)
+           DO UPDATE SET url = excluded.url`,
+      ).run(
+        params.observationId,
+        params.kind,
+        params.provider,
+        params.externalId,
+        params.url ?? null,
+      );
+      return this.prep(
+        `SELECT * FROM refs
+          WHERE observation_id = ? AND provider = ? AND kind = ? AND external_id = ?`,
+      ).get(
+        params.observationId,
+        params.provider,
+        params.kind,
+        params.externalId,
+      ) as RefRow;
+    },
+
+    listByObservation: (observationId: number): RefRow[] => {
+      this.observations.findById(observationId); // scope check
+      return this.prep('SELECT * FROM refs WHERE observation_id = ? ORDER BY id').all(
+        observationId,
+      ) as RefRow[];
+    },
+
+    /**
+     * "Did I already do this?" as a lookup rather than a paragraph.
+     *
+     * Scoped through the owning observation, so one project cannot learn
+     * what another has already published.
+     */
+    find: (params: {
+      provider: string;
+      kind?: RefKind;
+      externalId: string;
+    }): Array<RefRow & { observation_title: string; project_id: number | null }> => {
+      const scope = this.scopeFilter('o.project_id');
+      const extra = params.kind ? ' AND r.kind = ?' : '';
+      const args: unknown[] = [params.provider, params.externalId];
+      if (params.kind) args.push(params.kind);
+      args.push(...scope.params);
+      return this.prep(
+        `SELECT r.*, o.title AS observation_title, o.project_id
+           FROM refs r
+           JOIN observations o ON o.id = r.observation_id
+          WHERE r.provider = ? AND r.external_id = ?${extra}${scope.sql}
+          ORDER BY r.created_at DESC`,
+      ).all(...args) as Array<RefRow & { observation_title: string; project_id: number | null }>;
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // project_state — the living "resume here", one row per project
+  // ─────────────────────────────────────────────────────────────────
+  projectState = {
+    get: (projectId: number): ProjectStateRow | null => {
+      this.assertInScope(projectId, 'project_state');
+      return (
+        (this.prep('SELECT * FROM project_state WHERE project_id = ?').get(projectId) as
+          | ProjectStateRow
+          | undefined) ?? null
+      );
+    },
+
+    set: (params: {
+      projectId: number;
+      content: string;
+      updatedBy?: string | null;
+    }): ProjectStateRow => {
+      this.assertInScope(params.projectId, 'project_state');
+      this.prep(
+        `INSERT INTO project_state(project_id, content, updated_at, updated_by)
+         VALUES (?, ?, datetime('now'), ?)
+         ON CONFLICT(project_id) DO UPDATE SET
+           content    = excluded.content,
+           updated_at = excluded.updated_at,
+           updated_by = excluded.updated_by`,
+      ).run(params.projectId, params.content, params.updatedBy ?? null);
+      return this.projectState.get(params.projectId)!;
+    },
+
+    /**
+     * Take the advisory write lock, unless someone else holds a live one.
+     *
+     * `ttlSeconds` is what keeps this usable: a lock with no expiry wedges
+     * the project the first time a process dies holding it, and the user
+     * has no obvious way to tell a crashed session from a busy one.
+     * Returns the holder when the lock is denied.
+     */
+    lock: (params: {
+      projectId: number;
+      sessionTag: string;
+      ttlSeconds?: number;
+    }): { acquired: boolean; heldBy?: string; heldSince?: string } => {
+      this.assertInScope(params.projectId, 'project_state');
+      const ttl = params.ttlSeconds ?? 900;
+      const current = this.projectState.get(params.projectId);
+
+      if (current?.locked_by && current.locked_at && current.locked_by !== params.sessionTag) {
+        const ageSeconds = this.prep(
+          `SELECT CAST((julianday('now') - julianday(?)) * 86400 AS INTEGER) AS age`,
+        ).get(current.locked_at) as { age: number };
+        if (ageSeconds.age < ttl) {
+          return {
+            acquired: false,
+            heldBy: current.locked_by,
+            heldSince: current.locked_at,
+          };
+        }
+        // Expired: fall through and take it over.
+      }
+
+      this.prep(
+        `INSERT INTO project_state(project_id, content, locked_by, locked_at)
+         VALUES (?, '', ?, datetime('now'))
+         ON CONFLICT(project_id) DO UPDATE SET
+           locked_by = excluded.locked_by,
+           locked_at = excluded.locked_at`,
+      ).run(params.projectId, params.sessionTag);
+      return { acquired: true };
+    },
+
+    unlock: (projectId: number, sessionTag: string): void => {
+      this.assertInScope(projectId, 'project_state');
+      this.prep(
+        `UPDATE project_state SET locked_by = NULL, locked_at = NULL
+          WHERE project_id = ? AND locked_by = ?`,
+      ).run(projectId, sessionTag);
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // providers — what a project talks to
+  // ─────────────────────────────────────────────────────────────────
+  providers = {
+    upsert: (params: {
+      projectId: number;
+      role: ProviderRole;
+      kind: string;
+      config?: string | null;
+    }): ProviderRow => {
+      this.assertInScope(params.projectId, 'provider');
+      this.prep(
+        `INSERT INTO providers(project_id, role, kind, config)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(project_id, role) DO UPDATE SET
+           kind = excluded.kind, config = excluded.config`,
+      ).run(params.projectId, params.role, params.kind, params.config ?? null);
+      return this.providers.findByRole(params.projectId, params.role)!;
+    },
+
+    findByRole: (projectId: number, role: ProviderRole): ProviderRow | null => {
+      this.assertInScope(projectId, 'provider lookup');
+      return (
+        (this.prep('SELECT * FROM providers WHERE project_id = ? AND role = ?').get(
+          projectId,
+          role,
+        ) as ProviderRow | undefined) ?? null
+      );
+    },
+
+    listByProject: (projectId: number): ProviderRow[] => {
+      this.assertInScope(projectId, 'provider listing');
+      return this.prep('SELECT * FROM providers WHERE project_id = ? ORDER BY role').all(
+        projectId,
+      ) as ProviderRow[];
+    },
+
+    delete: (projectId: number, role: ProviderRole): void => {
+      this.assertInScope(projectId, 'provider');
+      this.prep('DELETE FROM providers WHERE project_id = ? AND role = ?').run(projectId, role);
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // workflows — rows, with org → project → user inheritance
+  // ─────────────────────────────────────────────────────────────────
+  workflows = {
+    upsert: (params: {
+      slug: string;
+      name: string;
+      scope: WorkflowScope;
+      scopeId: number;
+      extends?: number | null;
+    }): WorkflowRow => {
+      if (params.scope === 'project') {
+        this.assertInScope(params.scopeId, 'workflow');
+      }
+      this.prep(
+        `INSERT INTO workflows(slug, name, scope, scope_id, extends)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(slug, scope, scope_id) DO UPDATE SET
+           name = excluded.name, extends = excluded.extends`,
+      ).run(params.slug, params.name, params.scope, params.scopeId, params.extends ?? null);
+      return this.workflows.find(params.slug, params.scope, params.scopeId)!;
+    },
+
+    find: (slug: string, scope: WorkflowScope, scopeId: number): WorkflowRow | null =>
+      (this.prep(
+        'SELECT * FROM workflows WHERE slug = ? AND scope = ? AND scope_id = ?',
+      ).get(slug, scope, scopeId) as WorkflowRow | undefined) ?? null,
+
+    findById: (id: number): WorkflowRow | null =>
+      (this.prep('SELECT * FROM workflows WHERE id = ?').get(id) as WorkflowRow | undefined) ??
+      null,
+
+    /** Every slug reachable from a project: its own, its org's, the user's. */
+    listSlugs: (projectId: number, orgId: number | null): string[] => {
+      this.assertInScope(projectId, 'workflow listing');
+      const rows = this.prep(
+        `SELECT DISTINCT slug FROM workflows
+          WHERE (scope = 'project' AND scope_id = ?)
+             OR (scope = 'org'     AND scope_id = ?)
+             OR  scope = 'user'
+          ORDER BY slug`,
+      ).all(projectId, orgId ?? -1) as Array<{ slug: string }>;
+      return rows.map((r) => r.slug);
+    },
+
+    /** The three layers for one slug, ordered least to most specific. */
+    layersFor: (slug: string, projectId: number, orgId: number | null): WorkflowRow[] => {
+      this.assertInScope(projectId, 'workflow lookup');
+      return this.prep(
+        `SELECT * FROM workflows
+          WHERE slug = ?
+            AND ( (scope = 'org'     AND scope_id = ?)
+               OR (scope = 'project' AND scope_id = ?)
+               OR  scope = 'user' )
+          ORDER BY CASE scope WHEN 'org' THEN 1 WHEN 'project' THEN 2 ELSE 3 END`,
+      ).all(slug, orgId ?? -1, projectId) as WorkflowRow[];
+    },
+
+    delete: (id: number): void => {
+      this.prep('DELETE FROM workflows WHERE id = ?').run(id);
+    },
+  };
+
+  workflowSteps = {
+    upsert: (params: {
+      workflowId: number;
+      position: number;
+      name: string;
+      actor: string;
+      gate?: StepGate;
+      capability?: string | null;
+      condition?: string | null;
+      notes?: string | null;
+      overrides?: number | null;
+      disabled?: boolean;
+    }): WorkflowStepRow => {
+      this.prep(
+        `INSERT INTO workflow_steps(
+           workflow_id, position, name, actor, gate, capability,
+           condition, notes, overrides, disabled)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(workflow_id, name) DO UPDATE SET
+           position   = excluded.position,
+           actor      = excluded.actor,
+           gate       = excluded.gate,
+           capability = excluded.capability,
+           condition  = excluded.condition,
+           notes      = excluded.notes,
+           overrides  = excluded.overrides,
+           disabled   = excluded.disabled`,
+      ).run(
+        params.workflowId,
+        params.position,
+        params.name,
+        params.actor,
+        params.gate ?? 'none',
+        params.capability ?? null,
+        params.condition ?? null,
+        params.notes ?? null,
+        params.overrides ?? null,
+        params.disabled ? 1 : 0,
+      );
+      return this.prep(
+        'SELECT * FROM workflow_steps WHERE workflow_id = ? AND name = ?',
+      ).get(params.workflowId, params.name) as WorkflowStepRow;
+    },
+
+    listByWorkflow: (workflowId: number): WorkflowStepRow[] =>
+      this.prep(
+        'SELECT * FROM workflow_steps WHERE workflow_id = ? ORDER BY position, id',
+      ).all(workflowId) as WorkflowStepRow[],
+
+    delete: (id: number): void => {
+      this.prep('DELETE FROM workflow_steps WHERE id = ?').run(id);
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────
@@ -691,7 +1631,6 @@ export class MyJarbisDB {
     query: string,
     opts: {
       scope?: SearchScope;
-      projectId?: number;
       moduleId?: number;
       limit?: number;
     } = {},
@@ -700,6 +1639,14 @@ export class MyJarbisDB {
     const limit = opts.limit ?? 50;
     const hits: SearchHit[] = [];
 
+    // The tenant filter comes from the connection, never from the caller.
+    // There used to be an optional `projectId` here, and omitting it meant
+    // "search every project in the file". Under one DB per project that was
+    // harmless; under a shared DB it is a cross-client text search, which
+    // is precisely how these tools leak. Reading `this.scope` also means an
+    // unscoped connection throws rather than quietly matching everything.
+    const projectScope = this.scopeFilter('pc.project_id');
+    const scopedProjectId = this.scopedProjectId;
     const ftsQuery = sanitizeFtsQuery(query);
 
     const wantPC = scope === 'module' || scope === 'project';
@@ -707,18 +1654,17 @@ export class MyJarbisDB {
     const wantObs = scope === 'observations';
     const wantSkills = scope === 'skills';
 
-    if (wantPC && opts.projectId) {
+    if (wantPC) {
       const rows = this.prep(
         `SELECT pc.id AS rowid, pc.title, pc.kind,
                 snippet(project_context_fts, 1, '«', '»', '…', 12) AS snippet,
                 rank
            FROM project_context_fts
            JOIN project_context pc ON pc.id = project_context_fts.rowid
-          WHERE project_context_fts MATCH ?
-            AND pc.project_id = ?
+          WHERE project_context_fts MATCH ?${projectScope.sql}
           ORDER BY rank
           LIMIT ?`,
-      ).all(ftsQuery, opts.projectId, limit) as Array<{
+      ).all(ftsQuery, ...projectScope.params, limit) as Array<{
         rowid: number;
         title: string;
         kind: string;
@@ -744,9 +1690,11 @@ export class MyJarbisDB {
       if (filterByModule && opts.moduleId) {
         where += ' AND mc.module_id = ?';
         params.push(opts.moduleId);
-      } else if (scope === 'project' && opts.projectId) {
+      }
+      // Always pin to the tenant, module filter or not.
+      if (scopedProjectId !== null) {
         where += ' AND m.project_id = ?';
-        params.push(opts.projectId);
+        params.push(scopedProjectId);
       }
       params.push(limit);
 
@@ -786,20 +1734,21 @@ export class MyJarbisDB {
       if (opts.moduleId) {
         where += ' AND s.module_id = ?';
         params.push(opts.moduleId);
-      } else if (opts.projectId) {
-        where += ' AND m.project_id = ?';
-        params.push(opts.projectId);
+      }
+      // Filter on the denormalised column; it is why that column exists.
+      if (scopedProjectId !== null) {
+        where += ' AND o.project_id = ?';
+        params.push(scopedProjectId);
       }
       params.push(limit);
 
       const rows = this.prep(
-        `SELECT o.id AS rowid, o.title, o.kind, o.story_local_id,
+        `SELECT o.id AS rowid, o.title, o.kind, o.story_local_id, o.project_id,
                 snippet(observations_fts, 1, '«', '»', '…', 12) AS snippet,
                 rank
            FROM observations_fts
            JOIN observations o ON o.id = observations_fts.rowid
            JOIN sessions s ON s.id = o.session_id
-           JOIN modules m  ON m.id = s.module_id
            ${where}
           ORDER BY rank
           LIMIT ?`,
@@ -808,6 +1757,7 @@ export class MyJarbisDB {
         title: string;
         kind: string;
         story_local_id: string | null;
+        project_id: number | null;
         snippet: string;
         rank: number;
       }>;
@@ -818,7 +1768,11 @@ export class MyJarbisDB {
           title: r.title,
           snippet: r.snippet,
           rank: r.rank,
-          meta: { kind: r.kind, storyLocalId: r.story_local_id },
+          meta: {
+            kind: r.kind,
+            storyLocalId: r.story_local_id,
+            ...(scopedProjectId === null ? { projectId: r.project_id } : {}),
+          },
         });
       }
     }
@@ -826,9 +1780,9 @@ export class MyJarbisDB {
     if (wantSkills) {
       const params: unknown[] = [ftsQuery];
       let where = 'WHERE skills_fts MATCH ?';
-      if (opts.projectId) {
+      if (scopedProjectId !== null) {
         where += ' AND sk.project_id = ?';
-        params.push(opts.projectId);
+        params.push(scopedProjectId);
       }
       params.push(limit);
 
@@ -861,6 +1815,25 @@ export class MyJarbisDB {
     }
 
     return hits.sort((a, b) => a.rank - b.rank).slice(0, limit);
+  }
+
+  /**
+   * Rebuild every FTS5 index from its content table.
+   *
+   * Required after a merge: the indexes are contentless and keyed by
+   * rowid, so remapping ids leaves them pointing at the wrong rows. An
+   * index that resolves to a different row than it indexed is worse than
+   * no index, because the hit looks legitimate.
+   */
+  rebuildFts(): void {
+    for (const t of [
+      'project_context_fts',
+      'module_context_fts',
+      'skills_fts',
+      'observations_fts',
+    ]) {
+      this.db.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`);
+    }
   }
 }
 

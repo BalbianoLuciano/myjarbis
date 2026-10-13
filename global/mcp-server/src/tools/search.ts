@@ -100,9 +100,10 @@ export function search(ctx: ServerContext, rawArgs: unknown): SearchResult {
     }
   }
 
+  // No projectId here on purpose: the tenant filter lives on the
+  // connection (see MyJarbisDB.bindScope), so it cannot be omitted.
   const hits = ctx.db.search(args.query, {
     scope,
-    projectId: project.id,
     moduleId,
     limit: args.limit ?? 50,
   });

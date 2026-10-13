@@ -206,6 +206,8 @@ if [ -d ".myjarbis" ] && [ -f ".myjarbis/memory.db" ] && [ -f "$INSTALL_DIR/mcp-
         const db = MyJarbisDB.open('$CURRENT_DIR');
         const project = db.projects.findByPath('$CURRENT_DIR');
         if (!project) { console.log('NO_PROJECT'); process.exit(0); }
+        // Listing rows requires a bound tenant scope.
+        db.bindScope({ kind: 'project', id: project.id });
         const modules = db.modules.listByProject(project.id);
         const skills = db.skills.listByProject(project.id);
         console.log('OK', project.name, modules.length, skills.length);

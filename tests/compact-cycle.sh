@@ -71,6 +71,8 @@ node --input-type=module -e "
   import { MyJarbisDB } from '$MYJARBIS_INSTALL_DIR/mcp-server/build/db/index.js';
   const db = MyJarbisDB.open('$WORK');
   const proj = db.projects.findByPath('$WORK');
+  // Writes need a bound tenant scope; there is no implicit 'current project'.
+  db.bindScope({ kind: 'project', id: proj.id });
   const m = db.modules.findByName(proj.id, 'MM');
   const session = db.sessions.findActiveByModule(m.id) || db.sessions.findLastByModule(m.id);
   db.observations.add({
@@ -109,6 +111,8 @@ node --input-type=module -e "
   import { MyJarbisDB } from '$MYJARBIS_INSTALL_DIR/mcp-server/build/db/index.js';
   const db = MyJarbisDB.open('$WORK');
   const proj = db.projects.findByPath('$WORK');
+  // Writes need a bound tenant scope; there is no implicit 'current project'.
+  db.bindScope({ kind: 'project', id: proj.id });
   const m = db.modules.findByName(proj.id, 'MM');
   const session = db.sessions.findLastByModule(m.id);
   db.observations.add({
