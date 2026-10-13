@@ -1,0 +1,38 @@
+# A workflow is an ordered list of steps with an actor and a gate.
+#
+# `capability` is abstract on purpose: "tracker.comment", never the name of
+# a product. Which tool that resolves to comes from the project's providers
+# row, so the same workflow serves a client on one tracker and a client on
+# another — and this repository never learns a vendor's name.
+slug: ticket-close
+name: Closing a ticket
+steps:
+  - name: run-tests
+    actor: agent
+    gate: none
+    capability: ci.run
+    notes: Full suite, not just the touched files.
+
+  - name: open-merge-request
+    actor: agent
+    gate: none
+    capability: forge.merge_request
+
+  - name: get-approval
+    actor: human
+    gate: approve
+    condition: branch != none
+    notes: >-
+      A gate is a decidable condition, not a judgement call. Anything
+      advisory goes here in notes instead.
+
+  - name: comment-on-ticket
+    actor: agent
+    gate: none
+    capability: tracker.comment
+    condition: has_tracker == true
+
+  - name: hand-back-to-reporter
+    actor: human
+    gate: none
+    notes: The reporter closes the ticket; the implementer never does.

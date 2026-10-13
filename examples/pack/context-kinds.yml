@@ -1,0 +1,11 @@
+# Taxonomy labels this org needs on top of the core catalogue.
+# The core kinds are always available; these are additive.
+kinds:
+  - slug: incident
+    label: Incident
+    description: Post-incident writeups
+    position: 300
+  - slug: runbook
+    label: Runbook
+    description: Step-by-step operational procedures
+    position: 310
