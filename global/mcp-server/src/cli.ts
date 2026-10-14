@@ -37,7 +37,7 @@ import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
 import { autoCloseAll } from './tools/autoClose.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
-import { readRegistry } from './org/registry.js';
+import { readRegistry, readRegistryRaw } from './org/registry.js';
 import { listContextKinds, migrateKinds } from './tools/kinds.js';
 import {
   listWorkflowsTool,
@@ -48,7 +48,9 @@ import {
 import { getProjectState, setProjectState } from './tools/state.js';
 import { upgradeBrain } from './db/upgrade.js';
 import { mergeBrain } from './db/merge.js';
-import { globalDbPath, siloDbPath, detectRemote } from './resolve.js';
+import { collectHealth } from './health.js';
+import { runGarbageCollect } from './gc.js';
+import { globalDbPath, siloDbPath, detectRemote, resolveProject } from './resolve.js';
 import { openInVscode } from './diagram/open.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -103,6 +105,8 @@ function printJson(obj: unknown): void {
 
 const ANSI = {
   red: '\x1b[38;5;88m',
+  green: '\x1b[38;5;65m',
+  amber: '\x1b[38;5;136m',
   bold: '\x1b[1m',
   dim: '\x1b[2m',
   reset: '\x1b[0m',
@@ -118,6 +122,11 @@ function c(code: string, s: string): string {
 const red = (s: string) => c(ANSI.red, s);
 const bold = (s: string) => c(ANSI.bold, s);
 const dim = (s: string) => c(ANSI.dim, s);
+// Green and amber exist only for `health`, where the whole point is that a
+// number is read as a signal before it is read as a number. Everywhere else
+// the palette stays red/bold/dim on purpose.
+const green = (s: string) => c(ANSI.green, s);
+const amber = (s: string) => c(ANSI.amber, s);
 
 /** Section header in red bold, like install.sh `section()`. */
 function ptySection(title: string): void {
@@ -2456,6 +2465,291 @@ function runMerge(argv: string[]): void {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Subcommand: health
+//
+// `status` and `doctor` answer for one project. This answers for the
+// machine, which is the question nobody could ask — and the reason three
+// v0.3 features sat at 0% adoption without anyone noticing.
+// ─────────────────────────────────────────────────────────────────────
+
+/** A 10-cell bar. Colour carries the verdict so the number is a detail. */
+function bar(filled: number, tone: (s: string) => string, width = 10): string {
+  const n = Math.max(0, Math.min(width, Math.round(filled * width)));
+  return tone('█'.repeat(n)) + dim('░'.repeat(width - n));
+}
+
+function idleTone(days: number | null): (s: string) => string {
+  if (days === null) return dim;
+  if (days > 60) return red;
+  if (days > 14) return amber;
+  return green;
+}
+
+function clip(s: string, n: number): string {
+  return s.length <= n ? s.padEnd(n) : s.slice(0, n - 1) + '…';
+}
+
+function runHealth(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const r = collectHealth();
+
+  if (wantsJson(flags)) {
+    printJson(r);
+    return;
+  }
+
+  const t = r.totals;
+  ptySection('MyJarbis · health');
+  ptyKV('Projects', `${t.projects}` + dim(
+    t.onCurrentSchema === t.projects
+      ? `  ·  all on schema v${r.schemaVersion}`
+      : `  ·  ${t.projects - t.onCurrentSchema} not on schema v${r.schemaVersion}`,
+  ));
+  ptyKV(
+    'Brain',
+    r.sharedBrain.exists
+      ? `${r.sharedBrain.projects} shared` + dim(`  ·  ${r.sharedBrain.path}`)
+      : dim('no shared brain — every project is a silo'),
+  );
+  ptyKV('Notes', `${t.observations}` + dim(`  ·  across ${t.modules} modules`));
+  if (t.sessionsOpen) {
+    ptyKV('Sessions', `${t.sessionsOpen} open` + dim('  ·  they close themselves on next start'));
+  }
+
+  // ── per project ──
+  const maxIdle = Math.max(1, ...r.projects.map((p) => p.daysIdle ?? 0));
+  ptySection('Projects');
+  console.log(
+    '  ' +
+      dim(
+        clip('NAME', 23) +
+          ' ' +
+          clip('BRAIN', 8) +
+          'NOTES'.padStart(6) +
+          'MOD'.padStart(5) +
+          'OPEN'.padStart(6) +
+          '  ACTIVITY',
+      ),
+  );
+  for (const p of r.projects) {
+    const tone = idleTone(p.daysIdle);
+    const flagsOut: string[] = [];
+    if (!p.pathExists) flagsOut.push(red('path gone'));
+    if (!p.brain) flagsOut.push(red('no brain'));
+    else if (!p.schemaCurrent) flagsOut.push(red(`v${p.schema}`));
+    if (p.hooks === 'stale' || p.hooks === 'missing') flagsOut.push(amber(`hooks ${p.hooks}`));
+
+    // The bar shows freshness, not idleness: a full bar is a live project.
+    // Filling it as it rots would put the longest bar on the most abandoned
+    // thing, which reads as "most", not "worst".
+    const fresh = p.daysIdle === null ? 0 : 1 - p.daysIdle / maxIdle;
+    console.log(
+      '  ' +
+        bold(clip(p.name, 23)) +
+        ' ' +
+        dim(clip(p.isolation ?? '—', 8)) +
+        String(p.observations || '').padStart(6) +
+        String(p.modules || '').padStart(5) +
+        (p.sessionsOpen ? amber(String(p.sessionsOpen).padStart(6)) : ''.padStart(6)) +
+        '  ' +
+        bar(fresh, tone) +
+        ' ' +
+        tone(p.daysIdle === null ? '    —' : `${p.daysIdle}d`.padStart(5)) +
+        (flagsOut.length ? '  ' + flagsOut.join(' ') : ''),
+    );
+  }
+  if (t.modulesUnused) {
+    ptyDim(`${t.modulesUnused} of ${t.modules} modules have never had a session.`);
+  }
+  if (t.cold60d) {
+    ptyDim(`${t.cold60d} project(s) untouched for more than 60 days.`);
+  }
+
+  // ── adoption ──
+  // The number that mattered today: a feature nobody uses is either
+  // undiscoverable or broken, and both are worth knowing before shipping
+  // the next one.
+  ptySection('Shipped, and actually used');
+  for (const a of r.adoption) {
+    const frac = a.of ? a.used / a.of : 0;
+    const tone = frac === 0 ? red : frac < 0.5 ? amber : green;
+    console.log(
+      '  ' + bold(clip(a.feature, 16)) + bar(frac, tone) + '  ' + tone(`${a.used}/${a.of}`),
+    );
+    if (frac < 1) ptyDim(`  ${a.hint}`);
+  }
+
+  // ── taxonomy ──
+  ptySection('Taxonomy');
+  if (r.kindDrift.length === 0) {
+    ptyDim('Every context kind is in the catalogue.');
+  } else {
+    // Tallied per table upstream, because that is what `kinds migrate`
+    // operates on; collapsed by kind here, because the reader wants to know
+    // which labels are loose, not which table each one sits in.
+    const byKind = new Map<string, number>();
+    for (const k of r.kindDrift) byKind.set(k.kind, (byKind.get(k.kind) ?? 0) + k.count);
+    const sorted = [...byKind.entries()].sort((a, b) => b[1] - a[1]);
+    const total = r.kindDrift.reduce((s, k) => s + k.count, 0);
+    ptyDim(`${sorted.length} kind(s) outside the catalogue, ${total} row(s):`);
+    console.log(
+      '  ' +
+        sorted
+          .slice(0, 10)
+          .map(([kind, n]) => `${kind}${dim('×' + n)}`)
+          .join('  ') +
+        (sorted.length > 10 ? dim('  …') : ''),
+    );
+    ptyDim('Fold them onto the catalogue: myjarbis kinds migrate --dry-run');
+  }
+
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Subcommand: gc
+// ─────────────────────────────────────────────────────────────────────
+
+function human(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+}
+
+const GC_LABELS: Record<string, string> = {
+  'dead-registry': 'registry entries for directories that are gone',
+  'dead-mcp': 'myjarbis registrations in ~/.claude.json for gone directories',
+  'old-backup': 'superseded brain backups',
+  'dryrun-leftover': '--dry-run copies that outlived their run',
+  'orphan-claude-project': 'Claude Code project dirs holding only a generated MEMORY.md',
+};
+
+function runGc(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+  const olderThanDays = flags['older-than'] ? parseInt(String(flags['older-than']), 10) : 30;
+  if (!Number.isFinite(olderThanDays) || olderThanDays < 0) {
+    fail('--older-than must be a number of days');
+  }
+
+  const r = runGarbageCollect({ apply, olderThanDays });
+
+  if (wantsJson(flags)) {
+    printJson(r);
+    return;
+  }
+
+  ptySection(apply ? 'MyJarbis · gc' : 'MyJarbis · gc (report only)');
+  if (r.items.length === 0) {
+    ptyDim('Nothing to collect.');
+    console.log('');
+    return;
+  }
+
+  const byKind = new Map<string, typeof r.items>();
+  for (const i of r.items) {
+    if (!byKind.has(i.kind)) byKind.set(i.kind, []);
+    byKind.get(i.kind)!.push(i);
+  }
+
+  for (const [kind, items] of byKind) {
+    const bytes = items.reduce((a, i) => a + i.bytes, 0);
+    console.log('');
+    console.log(
+      '  ' +
+        bold(`${items.length}`) +
+        ' ' +
+        (GC_LABELS[kind] ?? kind) +
+        (bytes ? dim(`  ·  ${human(bytes)}`) : ''),
+    );
+    for (const i of items.slice(0, 5)) {
+      ptyDim(`  ${i.what.replace(os.homedir(), '~')}`);
+    }
+    if (items.length > 5) ptyDim(`  … and ${items.length - 5} more`);
+  }
+
+  console.log('');
+  ptyKV('Total', `${r.totals.count} item(s)` + dim(`  ·  ${human(r.totals.bytes)}`));
+  if (r.errors.length) {
+    for (const e of r.errors) console.log('  ' + red('FAIL') + '  ' + e);
+  }
+  if (apply) {
+    ptyDim('Removed. The registry and ~/.claude.json were backed up next to themselves first.');
+  } else {
+    ptyDim(`Nothing was removed. Re-run with --apply. Backups newer than ${r.olderThanDays} days are kept.`);
+    ptyDim('Rollback copies (.silo-retired-, .merged-) are never collected.');
+  }
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Subcommand: backfill-remotes
+//
+// `init` has recorded the remote since v0.3, so only older projects lack
+// it — which left resolution-by-remote switched on and matching nothing.
+// ─────────────────────────────────────────────────────────────────────
+
+function runBackfillRemotes(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+
+  const updated: Array<{ project: string; remote: string; had: string | null }> = [];
+  const skipped: Array<{ project: string; reason: string }> = [];
+
+  for (const entry of readRegistryRaw()) {
+    if (!fs.existsSync(entry.path)) {
+      skipped.push({ project: entry.name, reason: 'path is gone' });
+      continue;
+    }
+    const remote = detectRemote(entry.path);
+    if (!remote) {
+      skipped.push({ project: entry.name, reason: 'no git remote' });
+      continue;
+    }
+    const resolution = resolveProject({ cwd: entry.path });
+    if (!resolution) {
+      skipped.push({ project: entry.name, reason: 'no brain holds this project' });
+      continue;
+    }
+    try {
+      const had = resolution.project.git_remote ?? null;
+      if (had === remote) {
+        skipped.push({ project: entry.name, reason: 'already recorded' });
+        continue;
+      }
+      if (apply) resolution.db.projects.setRemote(resolution.project.id, remote);
+      updated.push({ project: entry.name, remote, had });
+    } finally {
+      resolution.db.close();
+    }
+  }
+
+  if (wantsJson(flags)) {
+    printJson({ applied: apply, updated, skipped });
+    return;
+  }
+
+  ptySection(apply ? 'MyJarbis · backfill-remotes' : 'MyJarbis · backfill-remotes (report only)');
+  if (updated.length === 0) {
+    ptyDim('Every project that has a remote already records it.');
+  }
+  for (const u of updated) {
+    console.log(
+      '  ' + bold(clip(u.project, 24)) + ' ' + green(u.remote) + (u.had ? dim(`  was ${u.had}`) : ''),
+    );
+  }
+  const reasons = new Map<string, number>();
+  for (const s of skipped) reasons.set(s.reason, (reasons.get(s.reason) ?? 0) + 1);
+  if (reasons.size) {
+    console.log('');
+    for (const [reason, n] of reasons) ptyDim(`${n} skipped — ${reason}`);
+  }
+  console.log('');
+  ptyDim(apply ? 'Recorded.' : 'Nothing was written. Re-run with --apply.');
+  console.log('');
+}
+
 /** parseFlags yields `true` for a bare flag and a string for --k=v. */
 function truthy(v: string | boolean | undefined): boolean {
   return v === true || v === 'true' || v === '1';
@@ -2486,6 +2780,12 @@ export function main(argv: string[]): void {
         return runConfig(rest);
       case 'status':
         return runStatus(rest);
+      case 'health':
+        return runHealth(rest);
+      case 'gc':
+        return runGc(rest);
+      case 'backfill-remotes':
+        return runBackfillRemotes(rest);
       case 'timeline':
         return runTimeline(rest);
       case 'diagram':

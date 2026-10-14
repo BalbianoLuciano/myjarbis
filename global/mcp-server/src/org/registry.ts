@@ -38,6 +38,31 @@ export function registryPath(): string {
   return path.join(installDir, 'projects-registry.json');
 }
 
+/**
+ * Every registered project, including ones whose path is gone.
+ *
+ * `readRegistry` hides those, which is right for commands that are about
+ * to do work in each directory. It is wrong for anything whose job is to
+ * report or clean up, because a dead entry is the thing being looked for.
+ */
+export function readRegistryRaw(): RegistryEntry[] {
+  const file = registryPath();
+  if (!fs.existsSync(file)) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch {
+    return [];
+  }
+  const projects =
+    parsed && typeof parsed === 'object'
+      ? ((parsed as { projects?: Record<string, RegistryEntry> }).projects ?? {})
+      : {};
+  return Object.entries(projects)
+    .map(([name, v]) => ({ ...v, name: v?.name ?? name }))
+    .filter((e): e is RegistryEntry => typeof e.path === 'string' && e.path.length > 0);
+}
+
 /** Every registered project whose path still exists. */
 export function readRegistry(): RegistryEntry[] {
   const file = registryPath();
