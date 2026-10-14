@@ -426,7 +426,7 @@ INSERT OR IGNORE INTO context_kinds (slug, label, description, position) VALUES
   ('dependency',          'Dependency',          'A dependency and how it is used',               110),
   ('convention',          'Convention',          'Naming, layout and style conventions',          120),
   ('functional_spec',     'Functional spec',     'What the product must do',                      130),
-  ('jira_rules',          'Tracker rules',       'How issues are tracked and reported',           140),
+  ('tracker_rules',      'Tracker rules',        'How issues are tracked and reported',           140),
   ('error_log',           'Error log',           'Known failures and their resolutions',          150),
   ('design_guideline',    'Design guideline',    'Visual and interaction rules',                  160),
   ('workflow',            'Workflow',            'A documented sequence of work steps',           170),
@@ -438,7 +438,15 @@ INSERT OR IGNORE INTO context_kinds (slug, label, description, position) VALUES
   ('context',            'Context',              'Module-level background',                       230),
 
   ('other',              'Other',                'Does not fit another kind',                     900),
-  ('misc',               'Misc',                 'Unclassified; migrated from an unknown label',  999);
+  ('misc',               'Misc',                 'Unclassified; migrated from an unknown label',  999),
+
+  -- Deprecated: named a specific commercial tracker in a vocabulary that
+  -- has to stay vendor-neutral. Still listed so rows already written
+  -- against it remain valid; new writes are redirected to tracker_rules
+  -- (see DEPRECATED_CONTEXT_KINDS). Which tracker a project uses lives in
+  -- "providers", where it can differ per project.
+  ('jira_rules',         'Tracker rules (legacy)',
+   'Deprecated — use tracker_rules; the tracker itself belongs in providers', 141);
 
 -- ─────────────────────────────────────────────────────────────────
 -- FTS5 virtual tables (contentless, mirror searchable columns)
@@ -649,6 +657,9 @@ export type KnownContextKind =
   | 'dependency'
   | 'convention'
   | 'functional_spec'
+  | 'tracker_rules'
+  /** @deprecated vendor-specific; use 'tracker_rules'. Kept so rows
+   *  already written against it still type-check. */
   | 'jira_rules'
   | 'error_log'
   | 'design_guideline'
@@ -670,7 +681,7 @@ export type ContextKind = KnownContextKind | (string & {});
 
 /** Labels seen in the wild, mapped onto catalogue slugs. Anything absent
  *  here and absent from the catalogue migrates to 'misc' — deliberately
- *  NOT to 'gotchas', which the session hook loads on every start: dumping
+ *  NOT to 'gotchas', which is read on every session start: dumping
  *  unclassified rows there would poison the one kind that is always read. */
 export const CONTEXT_KIND_ALIASES: Record<string, KnownContextKind> = {
   dominio: 'domain',
@@ -683,6 +694,24 @@ export const CONTEXT_KIND_ALIASES: Record<string, KnownContextKind> = {
   logbok: 'logbook',
   proceso: 'process',
   stack_tecnologico: 'stack',
+};
+
+/**
+ * Slugs that still exist in the catalogue, for rows already written against
+ * them, but that NEW writes get redirected away from. Checked before the
+ * catalogue lookup, which is the only way a redirect can fire for a slug
+ * that is itself still valid.
+ *
+ * `jira_rules` is the case this exists for. It named a specific commercial
+ * tracker inside the one vocabulary that is supposed to be vendor-neutral —
+ * the same mistake the `capability` design avoids by saying
+ * `tracker.comment` instead of naming a product. Which tracker a project
+ * actually uses belongs in `providers`, where it can differ per project;
+ * baking one vendor into a shared label makes the taxonomy un-portable the
+ * moment a second client uses something else.
+ */
+export const DEPRECATED_CONTEXT_KINDS: Record<string, KnownContextKind> = {
+  jira_rules: 'tracker_rules',
 };
 
 export interface ProjectContextRow {

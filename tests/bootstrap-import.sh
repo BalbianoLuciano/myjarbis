@@ -120,7 +120,7 @@ import_json() {
 echo "→ first-pass imports"
 import_md  agents/example-project/WORKFLOW.md            project    workflow
 import_md  agents/example-project/PLAN.md                project    plan
-import_md  agents/example-project/TRACKING.md            project    jira_rules
+import_md  agents/example-project/TRACKING.md            project    tracker_rules
 import_md  agents/example-project/ERRORS.md              project    error_log
 import_md  agents/example-project/SPEC.md                project    functional_spec
 import_md  agents/example-project/CURRENT.md             project    other

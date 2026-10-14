@@ -375,7 +375,7 @@ myjarbis module add frontend
 
 myjarbis import agents/WORKFLOW.md         --target=project        --kind=workflow
 myjarbis import agents/backend/PLAN.md     --target=module:backend --kind=plan
-myjarbis import agents/backend/Jira.json   --target=module:backend --kind=story --mapping='stories[]'
+myjarbis import agents/backend/tickets.json --target=module:backend --kind=story --mapping='stories[]'
 ```
 
 Re-imports are **idempotent** (SHA-256 on content): unchanged → no-op,
@@ -513,8 +513,8 @@ with `myjarbis skill edit interaction-style`.
 
 ```bash
 # project-level (always active here)
-myjarbis skill add jira-rules --content-from=docs/jira-rules.md \
-  --description="JIRA tracking rules for this project"
+myjarbis skill add tracker-rules --content-from=docs/tracker-rules.md \
+  --description="Issue-tracking rules for this project"
 
 # module-level (only active when working on MM)
 myjarbis skill add mm-pixel-perfect --module=MM \

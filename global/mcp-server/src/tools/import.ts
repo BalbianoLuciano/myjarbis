@@ -91,7 +91,7 @@ export const importMdInputSchema = {
       type: 'string' as const,
       description:
         'Kind of context entry: practice | dependency | convention | ' +
-        'functional_spec | jira_rules | error_log | design_guideline | ' +
+        'functional_spec | tracker_rules | error_log | design_guideline | ' +
         'workflow | plan | functional_doc | use_cases | acceptance_criteria | ' +
         'story | other.',
     },

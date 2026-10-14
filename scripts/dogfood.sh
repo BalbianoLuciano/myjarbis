@@ -72,6 +72,7 @@ guess_kind() {
   base="$(basename "$1" .md | tr '[:upper:]' '[:lower:]')"
   case "$base" in
     workflow|process)              echo workflow ;;
+    tracking|tracker|issues)       echo tracker_rules ;;
     plan|roadmap)                  echo plan ;;
     errors|error_log|troubleshoot*) echo error_log ;;
     architecture|conventions)      echo convention ;;

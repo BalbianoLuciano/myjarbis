@@ -9,15 +9,25 @@
  * code fixes to a list, came out identical in all three — the divergence was
  * caused by the absence of a catalogue, not by the projects differing.
  *
- * With a fixed vocabulary the session hook can always load the same kinds
- * (logbook + gotchas) without asking each project what it called them, and
- * a cross-project question about gotchas becomes answerable.
+ * With a fixed vocabulary, `load_project_core(kinds=[...])` becomes
+ * trustworthy — before, no caller could assume a project used any
+ * particular label — and a cross-project question about gotchas becomes
+ * answerable at all.
+ *
+ * Note it does NOT mean the session hook preferentially loads some kinds:
+ * start_session still loads every project_context row as an excerpt, as it
+ * always has. The catalogue makes a kind-filtered read reliable; it does
+ * not itself change what bootstrap reads.
  */
 
 import { z } from 'zod';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
-import { CONTEXT_KIND_ALIASES, ContextKind } from '../db/schema.js';
+import {
+  CONTEXT_KIND_ALIASES,
+  DEPRECATED_CONTEXT_KINDS,
+  ContextKind,
+} from '../db/schema.js';
 
 /** Levenshtein distance, for "did you mean". Bounded inputs (slugs). */
 function distance(a: string, b: string): number {
@@ -66,6 +76,14 @@ export function resolveContextKind(ctx: ServerContext, kind: string): ContextKin
   const project = ctx.project;
   const orgId = project?.org_id ?? null;
   const raw = kind.trim().toLowerCase();
+
+  // Deprecated slugs first: they ARE in the catalogue (so rows already
+  // written against them stay valid), which means the exists() check below
+  // would accept them and the redirect would never fire.
+  const replacement = DEPRECATED_CONTEXT_KINDS[raw];
+  if (replacement && ctx.db.contextKinds.exists(replacement, orgId)) {
+    return replacement;
+  }
 
   if (ctx.db.contextKinds.exists(raw, orgId)) return raw;
 
@@ -116,9 +134,10 @@ export function listContextKinds(ctx: ServerContext): ListContextKindsResult {
     kinds,
     hint:
       'Use one of these as `kind` when importing or saving context. ' +
-      '"logbook" is the living state and "gotchas" the traps — the session ' +
-      'hook always loads those two, so put anything that should be read on ' +
-      'every start into them.',
+      '"logbook" is living state and "gotchas" is traps; both are reliable ' +
+      'targets for load_project_core(kinds=[...]) now that every project ' +
+      'uses the same vocabulary. A slug marked "(legacy)" still works for ' +
+      'existing rows but new writes are redirected to its replacement.',
   };
 }
 
@@ -139,11 +158,11 @@ export interface KindMigrationResult {
 /**
  * Rewrite existing `kind` values onto catalogue slugs.
  *
- * Unmapped labels go to `misc`, deliberately NOT to `gotchas`. The session
- * hook loads gotchas on every start, so sending unclassified rows there
- * would poison the one kind that is always read — a migration should not
- * make the default reading experience worse. `misc` is inert and sorts last,
- * and every rewrite is reported so the leftovers can be triaged by hand.
+ * Unmapped labels go to `misc`, deliberately NOT to `gotchas`. `gotchas` is
+ * the kind a reader reaches for first when asking "what should I know before
+ * touching this", so filling it with unclassified rows would degrade the one
+ * label most worth trusting. `misc` is inert and sorts last, and every
+ * rewrite is reported so the leftovers can be triaged by hand.
  */
 export function migrateKinds(ctx: ServerContext, rawArgs: unknown): KindMigrationResult {
   const args = migrateKindsArgsZ.parse(rawArgs ?? {});
@@ -161,6 +180,10 @@ export function migrateKinds(ctx: ServerContext, rawArgs: unknown): KindMigratio
 
   const target = (kind: string): { to: string; reason: string } | null => {
     const raw = kind.trim().toLowerCase();
+    const deprecated = DEPRECATED_CONTEXT_KINDS[raw];
+    if (deprecated && ctx.db.contextKinds.exists(deprecated, orgId)) {
+      return { to: deprecated, reason: 'deprecated vendor-specific slug' };
+    }
     if (ctx.db.contextKinds.exists(raw, orgId)) return null; // already valid
     const alias = CONTEXT_KIND_ALIASES[raw];
     if (alias && ctx.db.contextKinds.exists(alias, orgId)) {
