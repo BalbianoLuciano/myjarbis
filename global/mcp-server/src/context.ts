@@ -65,16 +65,32 @@ export class ServerContext {
   static initialize(opts: { projectName?: string } = {}): ServerContext {
     const cwd = process.cwd();
 
-    // Migrate a v0.1 layout if one is sitting here. Idempotent, and a no-op
-    // when there is nothing to migrate.
-    const migration = migrateProject(cwd);
-    if (migration.migrated) {
-      console.error(
-        `[MyJarbis] Migrated project v0.1 → v0.2. Backup: ${migration.backupPath}`,
-      );
+    // Resolve BEFORE considering a v0.1 migration.
+    //
+    // `migrateProject` fires on one condition: `.myjarbis/` exists and
+    // `.myjarbis/memory.db` does not. That is also the exact shape of a v0.3
+    // project whose rows live in the shared brain — init writes
+    // `.myjarbis/config/settings.json` for every project regardless of
+    // isolation. Running it first therefore treated such a project as a v0.1
+    // layout and seeded a fresh silo beside it, which then won resolution
+    // permanently. It made the shared brain unusable.
+    //
+    // Resolution order settles it without needing a version marker (and there
+    // is none: v0.3 still writes '0.2.0' into settings.json). A genuine v0.1
+    // layout has rows in no brain at all, so it does not resolve and still
+    // migrates. A project that lives somewhere resolves, and is left alone.
+    let resolution = resolveProject({ cwd, projectName: opts.projectName });
+
+    if (!resolution) {
+      const migration = migrateProject(cwd);
+      if (migration.migrated) {
+        console.error(
+          `[MyJarbis] Migrated project v0.1 → v0.2. Backup: ${migration.backupPath}`,
+        );
+        resolution = resolveProject({ cwd, projectName: opts.projectName });
+      }
     }
 
-    const resolution = resolveProject({ cwd, projectName: opts.projectName });
     if (resolution) {
       return new ServerContext(
         cwd,
@@ -96,9 +112,16 @@ export class ServerContext {
   /**
    * Open (creating if needed) the brain for a project being initialised.
    * The one path allowed to bring a DB into existence.
+   *
+   * `dbPath` is where `seedNewProject` actually put the rows, which is the
+   * shared brain when the project was created with `isolation = shared`.
+   * Without it this always opened the silo next to the project — so an
+   * `--isolation=shared` init seeded the shared brain correctly and then
+   * created an empty silo beside it, and since resolution prefers a silo,
+   * every later command found the empty one. The flag could not work.
    */
-  static initializeForSeed(projectPath: string): ServerContext {
-    const db = MyJarbisDB.open(projectPath);
+  static initializeForSeed(projectPath: string, dbPath?: string): ServerContext {
+    const db = dbPath ? MyJarbisDB.openAtPath(dbPath) : MyJarbisDB.open(projectPath);
     const project = db.projects.findByPath(projectPath);
     if (project) db.bindScope({ kind: 'project', id: project.id });
     return new ServerContext(projectPath, projectPath, db, project, 'path');

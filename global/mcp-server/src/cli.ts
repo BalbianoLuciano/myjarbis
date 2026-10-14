@@ -1039,7 +1039,10 @@ function runInitProject(argv: string[]): void {
 
   // 3. Compose interaction-style with the chosen language + persona
   //    (overwrites the placeholder default seeded by seedNewProject).
-  const ctx = ServerContext.initializeForSeed(projectPath);
+  //    `seed.dbPath` is where the rows actually went — the shared brain when
+  //    isolation is 'shared'. Passing it is what stops init from creating an
+  //    empty silo beside a shared project and shadowing it.
+  const ctx = ServerContext.initializeForSeed(projectPath, seed.dbPath);
   let materialized;
   let packReport: PackApplyReport | undefined;
   try {
@@ -2438,7 +2441,7 @@ function runMerge(argv: string[]): void {
   if (!from) {
     fail(
       'Usage: myjarbis merge --from=<project>/.myjarbis/memory.db [--into=PATH] ' +
-        '[--as=NAME] [--source-project=NAME] [--dry-run]',
+        '[--as=NAME] [--source-project=NAME] [--retire-source] [--dry-run]',
     );
   }
   printJson(
@@ -2447,6 +2450,7 @@ function runMerge(argv: string[]): void {
       into: flags.into ? path.resolve(flags.into as string) : globalDbPath(),
       asName: flags.as as string | undefined,
       sourceProject: flags['source-project'] as string | undefined,
+      retireSource: truthy(flags['retire-source']),
       dryRun: truthy(flags['dry-run']),
     }),
   );

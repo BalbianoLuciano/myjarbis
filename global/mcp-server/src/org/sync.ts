@@ -144,7 +144,10 @@ export function syncOrg(
 
   for (const t of targets) {
     try {
-      const ctx = ServerContext.initializeForSeed(t.path);
+      // `t.dbPath` is already resolved per isolation by findOrgProjects.
+      // Dropping it here opened a silo next to every shared project and then
+      // reported 'project row not found in its own brain' for each one.
+      const ctx = ServerContext.initializeForSeed(t.path, t.dbPath);
       try {
         if (!ctx.project) {
           results.push({

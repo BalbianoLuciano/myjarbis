@@ -19,6 +19,7 @@ SUITES=(
   compact-cycle
   dx-batch-1
   v03-isolation
+  v03-shared-resolution
   v03-migrate-merge
   v03-org-pack
   v03-auto-close

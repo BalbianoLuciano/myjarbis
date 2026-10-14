@@ -38,6 +38,8 @@ export interface MergeReport {
   project: { sourceName: string; importedAs: string; newId: number };
   dryRun: boolean;
   backup?: BackupResult;
+  /** Where the source brain was renamed to, when --retire-source was given. */
+  retiredSourceTo?: string;
   /** Rows copied, per table. */
   copied: Record<string, number>;
   /** Destination counts before and after; after - before must equal copied. */
@@ -74,6 +76,16 @@ export function mergeBrain(opts: {
   skipBackup?: boolean;
   /** Which project to take, when the source holds more than one. */
   sourceProject?: string;
+  /**
+   * Rename the source brain aside once the merge is verified, so the project
+   * actually starts using the destination.
+   *
+   * Without this a merge has no observable effect: resolution prefers a silo
+   * over the shared brain unconditionally, so the source file keeps winning
+   * and the copied rows are never read. Renaming rather than deleting keeps
+   * the rollback a `mv`.
+   */
+  retireSource?: boolean;
 }): MergeReport {
   const dryRun = opts.dryRun === true;
   const warnings: string[] = [];
@@ -147,6 +159,10 @@ export function mergeBrain(opts: {
       }
     }
   }
+
+  // Set when the source is closed early to be renamed, so the finally below
+  // does not close it twice.
+  let srcClosed = false;
 
   const dest = MyJarbisDB.openAtPath(destPath);
   if (!dryRun && destExisted && dest.schemaVersion !== SCHEMA_VERSION) {
@@ -552,12 +568,43 @@ export function mergeBrain(opts: {
       );
     }
 
+    // Retire the source only once the merge is verified — a mismatch or a
+    // failed integrity check means the destination is not trustworthy yet,
+    // and moving the original away would be the worst possible moment.
+    let retiredSourceTo: string | undefined;
+    const healthy = mismatches.length === 0 && integrity === 'ok' && fk === 0;
+    if (!dryRun && opts.retireSource && healthy) {
+      src.close();
+      srcClosed = true;
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      retiredSourceTo = `${opts.from}.merged-${ts}`;
+      for (const suffix of ['', '-wal', '-shm']) {
+        if (fs.existsSync(`${opts.from}${suffix}`)) {
+          fs.renameSync(`${opts.from}${suffix}`, `${retiredSourceTo}${suffix}`);
+        }
+      }
+      warnings.push(
+        `source renamed to ${retiredSourceTo} — the project now resolves to ` +
+          `${opts.into}. To undo, rename it back.`,
+      );
+    } else if (!dryRun && !opts.retireSource) {
+      // Say it loudly: without this step the merge looks successful and
+      // changes nothing the user can observe.
+      warnings.push(
+        `the source brain is still at ${opts.from}, and resolution prefers a ` +
+          `silo over the shared brain — so this project still reads its old ` +
+          `file and the rows just copied will go stale. Re-run with ` +
+          `--retire-source, or rename the file aside yourself.`,
+      );
+    }
+
     return {
       from: opts.from,
       into: opts.into,
       project: { sourceName: chosen.name, importedAs, newId: newProjectId },
       dryRun,
       backup,
+      retiredSourceTo,
       copied,
       destBefore,
       destAfter,
@@ -572,7 +619,7 @@ export function mergeBrain(opts: {
     };
   } finally {
     dest.close();
-    src.close();
+    if (!srcClosed) src.close();
     for (const f of scratch) {
       try {
         if (fs.existsSync(f)) fs.unlinkSync(f);
