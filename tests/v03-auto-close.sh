@@ -365,6 +365,62 @@ echo "$HOOKOUT" | grep -qi "automátic\|automatic\|automát" \
   && pass "and says the newest close was automatic" \
   || oops "the hook does not explain why an older note is being shown"
 
+# Burial is ordered by ended_at, NOT by id.
+#
+# A session started long ago and auto-closed today has a LOW id and a RECENT
+# ended_at, so it buries a handoff whose id is higher than its own. Counting
+# by id reported "buried under 0" for handoffs that were plainly buried —
+# which is what showed up after closing 54 abandoned sessions across 12
+# projects.
+#
+# Built here in the order that produces it, with no id surgery: open the
+# abandoned session FIRST so it takes the lower id, write the curated handoff
+# SECOND, and only then let the hook close the abandoned one. Its ended_at
+# lands after the handoff's while its id stays before it.
+echo "→ [8] burial is counted by ended_at, not by id"
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession, endSession } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+const p = ctx.requireProject();
+const m = ctx.db.modules.create(p.id, 'abandoned-first');
+const stale = ctx.db.sessions.start(m.id);           // lower id, stays open
+ctx.db.db
+  .prepare(\"UPDATE sessions SET started_at = datetime('now','-90 days') WHERE id = ?\")
+  .run(stale.id);
+const later = ctx.db.sessions.start(m.id);           // higher id
+ctx.setActiveSession(later.id, m.id);
+endSession(ctx, { summary: 'Wrote this one up.', next_session: 'CURATED UNDER A LOW ID: finish the exporter.' });
+// Back-date the curated close by a day. Everything in a test happens inside
+// one second, and ended_at is only second-granular, so without this the
+// handoff and the auto-close tie and the id tie-break picks the handoff —
+// hiding the very arrangement under test. In the real case the handoff was
+// written days before the abandoned session got closed.
+ctx.db.db
+  .prepare(\"UPDATE sessions SET ended_at = datetime('now','-1 day') WHERE id = ?\")
+  .run(later.id);
+ctx.close();
+"
+node "$CLI" hook session-end >/dev/null 2>&1
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { resume } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+const r = resume(ctx, { module: 'abandoned-first' });
+const c = r.curatedResume;
+const out = [];
+const t = (x, m) => out.push((x ? 'PASS|' : 'FAIL|') + m);
+t(r.nextSession.startsWith('[auto]'),
+  'the abandoned session, auto-closed today, is the newest close');
+t(/CURATED UNDER A LOW ID/.test(c?.nextSession ?? ''),
+  'the curated handoff is still found, even with a higher id than its burier');
+t((c?.buriedUnder ?? 0) === 1,
+  'buriedUnder is 1 — counted by ended_at; by id it would have read 0');
+console.log(out.join('\n'));
+ctx.close();
+" > "$ASSERTS"
+read_asserts
+
 # A curated close on top of auto-closes goes back to the normal path.
 node --input-type=module -e "
 import { ServerContext } from '$B/context.js';

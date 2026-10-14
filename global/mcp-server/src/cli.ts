@@ -1388,7 +1388,7 @@ function runHookSessionStart(): void {
           const show = curated?.next_session ? curated : last;
 
           if (curated?.next_session) {
-            const buried = ctx.db.sessions.countClosedAfterInModule(target.id, curated.id);
+            const buried = ctx.db.sessions.countClosedAfterInModule(target.id, curated);
             blocks.push('', t.curated_note);
             blocks.push(
               '',
@@ -1474,7 +1474,7 @@ function runHookSessionStart(): void {
       if (curated?.next_session) {
         const buried = ctx.db.sessions.countClosedAfterInModule(
           mostRecent.moduleId,
-          curated.id,
+          curated,
         );
         lines.push('', t.curated_note);
         lines.push(

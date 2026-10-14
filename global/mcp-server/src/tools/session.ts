@@ -449,7 +449,7 @@ function resolveCuratedResume(
     nextSession: curated.next_session,
     daysSinceClose: staleness?.days ?? null,
     stale: staleness?.stale ?? false,
-    buriedUnder: ctx.db.sessions.countClosedAfterInModule(moduleId, curated.id),
+    buriedUnder: ctx.db.sessions.countClosedAfterInModule(moduleId, curated),
   };
 }
 

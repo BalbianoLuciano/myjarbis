@@ -1091,15 +1091,25 @@ export class MyJarbisDB {
       );
     },
 
-    /** How many closed sessions sit on top of `sessionId` in this module —
-     *  i.e. how deep a curated handoff has been buried. */
-    countClosedAfterInModule: (moduleId: number, sessionId: number): number => {
+    /**
+     * How many closed sessions sit on top of `session` in this module — i.e.
+     * how deep a curated handoff has been buried.
+     *
+     * Ordered by `(ended_at, id)`, matching `findLastCuratedByModule`, and
+     * NOT by id alone. Id order is not burial order: a session started months
+     * ago and auto-closed today has a LOW id and a RECENT ended_at, so it
+     * buries a handoff whose id is higher than its own. Counting by id
+     * reported "buried under 0" for handoffs that were demonstrably buried —
+     * seen across 12 projects right after closing 54 abandoned sessions.
+     */
+    countClosedAfterInModule: (moduleId: number, session: SessionRow): number => {
       this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
       const row = this.prep(
         `SELECT COUNT(*) AS n FROM sessions
-          WHERE module_id = ? AND id > ? AND ended_at IS NOT NULL
-            AND next_session IS NOT NULL`,
-      ).get(moduleId, sessionId) as { n: number };
+          WHERE module_id = ? AND ended_at IS NOT NULL
+            AND next_session IS NOT NULL
+            AND (ended_at > ? OR (ended_at = ? AND id > ?))`,
+      ).get(moduleId, session.ended_at, session.ended_at, session.id) as { n: number };
       return row.n;
     },
 
