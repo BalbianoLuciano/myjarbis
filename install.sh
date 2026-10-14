@@ -64,16 +64,55 @@ ok
 step 2 "Prepare install directory"
 if [ -d "$INSTALL_DIR" ]; then
     warn "$INSTALL_DIR already exists"
-    read -p "       Remove and continue? (y/n) " -n 1 -r
-    echo
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
-        rm -rf "$INSTALL_DIR"
-    else
-        echo "       Cancelled"
-        exit 0
+
+    # An existing install almost always wants `myjarbis update`, not this.
+    # Reinstalling removes the directory, and the project registry lives in
+    # it — so a fresh install silently un-registers every project. Say that
+    # out loud, and say how many, before asking.
+    EXISTING_REGISTRY="$INSTALL_DIR/projects-registry.json"
+    if [ -f "$EXISTING_REGISTRY" ]; then
+        REG_COUNT=$(node -e "
+          try {
+            const r = JSON.parse(require('fs').readFileSync('$EXISTING_REGISTRY','utf8'));
+            console.log(Object.keys(r.projects || {}).length);
+          } catch { console.log('?'); }
+        " 2>/dev/null || echo '?')
+        note "it holds a registry with $REG_COUNT registered project(s)"
+        note "reinstalling DELETES that registry (your projects' own"
+        note ".myjarbis/ data is untouched, but they stop being listed)"
+        echo
+        note "to upgrade without losing it, cancel and run:"
+        note "  myjarbis update"
+        echo
+        REGISTRY_RESCUE="$(mktemp)"
+        cp "$EXISTING_REGISTRY" "$REGISTRY_RESCUE"
     fi
+
+    if [ -n "${MYJARBIS_ASSUME_YES:-}" ]; then
+        note "MYJARBIS_ASSUME_YES set, continuing"
+    elif [ -t 0 ]; then
+        read -p "       Remove and reinstall anyway? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "       Cancelled"
+            exit 0
+        fi
+    else
+        fail "refusing to reinstall over an existing install without a terminal"
+        note "run 'myjarbis update', or set MYJARBIS_ASSUME_YES=1 to force"
+        exit 1
+    fi
+    rm -rf "$INSTALL_DIR"
 fi
 mkdir -p "$INSTALL_DIR"
+
+# Put the registry back. The user agreed to reinstall the CODE; there is no
+# reason that should also forget which projects exist.
+if [ -n "${REGISTRY_RESCUE:-}" ] && [ -f "$REGISTRY_RESCUE" ]; then
+    cp "$REGISTRY_RESCUE" "$INSTALL_DIR/projects-registry.json"
+    rm -f "$REGISTRY_RESCUE"
+    note "existing registry carried over"
+fi
 ok
 
 # ─── [3/7] copy files ─────────────────────────────────────────────
