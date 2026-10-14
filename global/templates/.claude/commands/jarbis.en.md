@@ -6,8 +6,11 @@ load only what the active module needs + the project core, persist
 decisions as they happen, and close every session with a "Resume here"
 note so the next session opens where this one stopped.
 
-After `/jarbis`, **no other slash command is needed** — the user talks
-to you in natural language and you call the right MCP tools.
+After `/jarbis`, the user talks to you in natural language and you call
+the right MCP tools. The one other slash command is `/jarbis-close`, which
+runs the full closing ritual (observations + `set_project_state` +
+`end_session`) without the user having to type the sentence. Everything
+`/jarbis-close` does, you still do when they ask for it in words.
 
 ---
 
@@ -158,7 +161,9 @@ For each logical chunk (= one commit):
 
 ### PHASE 5 — Record and close
 Triggers (story/phase close): *"ok / close it / done / let's save /
-wrap it up"*.
+wrap it up"*, or the `/jarbis-close` slash command, which is the same
+ritual without trigger ambiguity (and without asking, since typing it is
+already the confirmation).
 
 1. **`save_observation`** with `kind: "progress"` + `story_local_id` + `files`.
 2. **`end_session`** with TWO fields:
@@ -244,8 +249,8 @@ across `module_context` + `project_context` first; propose after.
 
 ## What you do NOT do
 
-- Do NOT execute secondary slash commands — they don't exist. Everything
-  is conversational.
+- Do NOT invent slash commands. The only two are `/jarbis` and
+  `/jarbis-close`; everything else is conversational.
 - Do NOT keep a "plan" in your head if the user hasn't approved phase 2.
 - Do NOT close session if tests are red or there are uncommitted edits.
 - Do NOT touch modules other than the active one without confirmation.

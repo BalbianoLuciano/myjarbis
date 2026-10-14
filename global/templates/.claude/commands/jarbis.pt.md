@@ -6,8 +6,11 @@ só o do módulo ativo + o core do projeto, persiste decisões à medida
 que acontecem, e fecha cada sessão com um "Retomar aqui" para que a
 próxima abra onde parou.
 
-Após `/jarbis`, **você não precisa de nenhum outro slash command** — o
-usuário fala em linguagem natural e você chama os MCP tools certos.
+Após `/jarbis`, o usuário fala em linguagem natural e você chama os MCP
+tools certos. O único outro slash command é `/jarbis-close`, que roda o
+ritual de fechamento completo (observações + `set_project_state` +
+`end_session`) sem o usuário precisar escrever a frase. Tudo o que
+`/jarbis-close` faz, você também faz quando ele pede falando.
 
 ---
 
@@ -158,7 +161,9 @@ Para cada chunk lógico (= um commit):
 
 ### FASE 5 — Registro e fechamento
 Triggers (fechamento de story/fase): *"pronto / fecha / terminei /
-done / vamos salvar"*.
+done / vamos salvar"*, ou o slash command `/jarbis-close`, que é o mesmo
+ritual sem ambiguidade de trigger (e sem perguntar, porque escrevê-lo já
+é a confirmação).
 
 1. **`save_observation`** com `kind: "progress"` + `story_local_id` + `files`.
 2. **`end_session`** com DOIS campos:
@@ -244,8 +249,8 @@ um passo do processo parece pedir isso, diga e pare.
 
 ## O que você NÃO faz
 
-- NÃO executa slash commands secundários — eles não existem. Tudo é
-  conversacional.
+- NÃO invente slash commands. Os únicos dois são `/jarbis` e
+  `/jarbis-close`; o resto é conversacional.
 - NÃO mantenha um "plano" na cabeça se o usuário não aprovou FASE 2.
 - NÃO feche sessão se tests estão vermelhos ou há edits sem commit.
 - NÃO toque módulos que não são o ativo sem confirmação.

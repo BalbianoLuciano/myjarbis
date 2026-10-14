@@ -24,9 +24,10 @@ Three numbers that are often different and all matter:
 | CLI version | the installed copy under `~/.myjarbis-global` | `myjarbis update` |
 | schema version | the shape of each `memory.db` | `myjarbis migrate` |
 | skill content | rows inside each brain, not files | `myjarbis skill reseed` |
+| slash commands | files in each project's `.claude/commands/` | `myjarbis commands sync` |
 
 Updating the code does **not** update the schema, and neither of them updates
-the skills. Three separate steps, deliberately.
+the skills or the slash commands. Four separate steps, deliberately.
 
 ---
 
@@ -195,6 +196,41 @@ the user's configuration with a placeholder everywhere at once.
 `--include-owned` overrides, only if that is genuinely meant.
 
 Then open Claude in a project so `.claude/skills/` re-materialises from the DB.
+
+---
+
+## 5b. Slash commands live in files, and also only reach new projects
+
+Same gap, one layer out: `.claude/commands/*.md` is written by `init` and by
+nothing else, so a project created before a command existed never gets it.
+On the machine this was written from, all 23 projects were missing
+`/jarbis-close` and 21 were still carrying a `/jarbis` from an older version
+— including the MyJarbis repo itself, which was running the v0.2 copy.
+
+```bash
+myjarbis commands sync --all          # report
+myjarbis commands sync --all --apply  # write
+```
+
+The report classifies every file, and the classification is the point:
+
+| status | meaning | `--apply` writes it? |
+|---|---|---|
+| `current` | identical to the template for the project's language | no, nothing to do |
+| `new` | the project never got this command | yes |
+| `other-language` | matches another language's template, so it is ours and only the language is stale | yes |
+| `diverged` | matches nothing shipped: hand-edited, or from an older version | **no** — needs `--force` |
+
+Nothing distinguishes a hand-edit from an old version, so `diverged` stops and
+asks rather than guessing. Diff one before reaching for `--force`:
+
+```bash
+diff <project>/.claude/commands/jarbis.md \
+     ~/.myjarbis-global/templates/.claude/commands/jarbis.en.md
+```
+
+Unlike skills, this takes effect with no re-materialisation — the file on disk
+*is* the command.
 
 ---
 

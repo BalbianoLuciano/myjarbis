@@ -284,13 +284,23 @@ LANG_CHOICE="${LANG_CHOICE:-EN}"
 LANG_CHOICE=$(echo "$LANG_CHOICE" | tr '[:lower:]' '[:upper:]')
 JARBIS_LANG=$(echo "$LANG_CHOICE" | tr '[:upper:]' '[:lower:]')
 
-JARBIS_TEMPLATE="$INSTALL_DIR/templates/.claude/commands/jarbis.${JARBIS_LANG}.md"
-if [ ! -f "$JARBIS_TEMPLATE" ]; then
-    note "jarbis.${JARBIS_LANG}.md not found, falling back to ES"
-    JARBIS_TEMPLATE="$INSTALL_DIR/templates/.claude/commands/jarbis.es.md"
-fi
-cp "$JARBIS_TEMPLATE" .claude/commands/jarbis.md
-note "installed jarbis.md ($LANG_CHOICE variant)"
+# Every slash command ships as <name>.<lang>.md and installs as <name>.md.
+# Listed rather than globbed so a half-finished template in the install dir
+# cannot become a live command, and so `commands sync` (which propagates
+# these to projects that already exist) has the same list to work from.
+for cmd in jarbis jarbis-close; do
+    CMD_TEMPLATE="$INSTALL_DIR/templates/.claude/commands/${cmd}.${JARBIS_LANG}.md"
+    if [ ! -f "$CMD_TEMPLATE" ]; then
+        note "${cmd}.${JARBIS_LANG}.md not found, falling back to ES"
+        CMD_TEMPLATE="$INSTALL_DIR/templates/.claude/commands/${cmd}.es.md"
+    fi
+    if [ ! -f "$CMD_TEMPLATE" ]; then
+        warn "no template for /${cmd}, skipping"
+        continue
+    fi
+    cp "$CMD_TEMPLATE" ".claude/commands/${cmd}.md"
+    note "installed ${cmd}.md ($LANG_CHOICE variant)"
+done
 
 # Cleanup stale slash commands from previous MyJarbis versions
 STALE_REMOVED=0

@@ -25,6 +25,7 @@ SUITES=(
   v03-auto-close
   v03-maintenance
   v04-review-reseed
+  v04-commands-sync
 )
 
 PASS=0; FAIL=0; FAILED_NAMES=()

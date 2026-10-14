@@ -40,6 +40,7 @@ show_help() {
     echo -e "  ${BOLD}merge${NC}      Merge a project's brain into the shared one"
     echo -e "  ${BOLD}module${NC}     Manage modules (add/list)"
     echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable/reseed)"
+    echo -e "  ${BOLD}commands${NC}   Propagate the slash commands to existing projects (sync)"
     echo -e "  ${BOLD}stats${NC}      Show row counts per table"
     echo -e "  ${BOLD}status${NC}     git-like overview: project, active module, last session, counts"
     echo -e "  ${BOLD}health${NC}     Every project at once: schema, activity, what is going cold"
@@ -202,7 +203,7 @@ case "${1:-help}" in
         ;;
 
     import|brain|module|skill|stats|cost|config|status|health|review|gc|backfill-remotes|timeline|diagram|hook|\
-    org|kinds|workflow|provider|state|migrate|merge)
+    org|kinds|workflow|provider|state|migrate|merge|commands)
         # v0.2 subcommands delegated to the node CLI helper
         CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
         if [ ! -f "$CLI_JS" ]; then

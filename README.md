@@ -2,7 +2,7 @@
 
 <p align="center">
   <b>Persistent memory + per-project workflow + scoped skills for Claude Code.</b><br>
-  One slash command. Everything else is a conversation.
+  Two slash commands: open and close. Everything else is a conversation.
 </p>
 
 <p align="center">
@@ -628,7 +628,7 @@ context still applies before the agent proceeds.
 ┌─────────────────────────────────────────────────────────────────┐
 │  CLAUDE CODE (harness)                                          │
 │  hooks: SessionStart · UserPromptSubmit · Stop · SessionEnd     │
-│  /jarbis (the only slash command)  ·  skills read from .claude/ │
+│  /jarbis · /jarbis-close  ·  skills read from .claude/          │
 └────────────────────────────────┬────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -803,8 +803,9 @@ tests/dx-batch-1.sh            # stale-resume + timeline + post-commit auto-obse
 ---
 
 <p align="center">
-  <b>The single slash command is <code>/jarbis</code>.</b> Everything else is conversation or a quick CLI verb.<br>
-  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 10 baseline skills let the agent infer all of it.
+  <b>Two slash commands: <code>/jarbis</code> to open, <code>/jarbis-close</code> to close.</b> Everything else is conversation or a quick CLI verb.<br>
+  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 10 baseline skills let the agent infer all of it.<br>
+  <code>/jarbis-close</code> is not a new capability, it is the one ritual worth having a key for: the <code>SessionEnd</code> hook always closes the session, but only a written handoff tells the next one what to do.
 </p>
 
 <p align="center">

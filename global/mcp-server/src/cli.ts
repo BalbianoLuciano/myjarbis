@@ -38,6 +38,7 @@ import { autoCloseAll, AUTO_MARKER } from './tools/autoClose.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
+import { syncCommands, pendingFiles, CommandStatus } from './commands.js';
 import { listContextKinds, migrateKinds } from './tools/kinds.js';
 import {
   listWorkflowsTool,
@@ -2954,6 +2955,84 @@ function runSkillReseed(argv: string[]): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Subcommand: commands sync
+//
+// Same gap as `skill reseed`, one layer out: slash commands are files
+// written only by `init`, so a new command reached new projects and
+// nothing else. See commands.ts for why `diverged` needs --force.
+// ─────────────────────────────────────────────────────────────────────
+
+const COMMAND_STATUS_LABEL: Record<CommandStatus, (s: string) => string> = {
+  new: green,
+  'other-language': amber,
+  diverged: red,
+  current: dim,
+  'no-template': red,
+};
+
+function runCommands(argv: string[]): void {
+  const [sub, ...rest] = argv;
+  if (sub !== 'sync') {
+    fail('Usage: cli.js commands sync [--all] [--apply] [--force]');
+  }
+
+  const { flags } = parseFlags(rest);
+  const apply = truthy(flags.apply);
+  const force = truthy(flags.force);
+  const report = syncCommands({ all: truthy(flags.all), apply, force });
+
+  if (wantsJson(flags)) {
+    printJson(report);
+    return;
+  }
+
+  ptySection(apply ? 'MyJarbis · commands sync' : 'MyJarbis · commands sync (report only)');
+
+  let touched = 0;
+  let diverged = 0;
+  for (const p of report.projects) {
+    if (p.error) {
+      console.log('  ' + bold(clip(p.project, 26)) + red(p.error));
+      continue;
+    }
+    const pending = pendingFiles(p, force);
+    const blocked = p.files.filter((f) => f.status === 'diverged' && !force);
+    diverged += blocked.length;
+    if (pending.length === 0 && blocked.length === 0) continue;
+    touched++;
+    console.log(
+      '  ' +
+        bold(clip(p.project, 26)) +
+        dim(`${p.language}  ·  `) +
+        [...pending, ...blocked]
+          .map((f) => COMMAND_STATUS_LABEL[f.status](`${f.command} (${f.status})`))
+          .join('  '),
+    );
+  }
+
+  console.log('');
+  if (touched === 0) {
+    ptyDim('Every project has the current commands.');
+    console.log('');
+    return;
+  }
+
+  ptyKV('Projects', `${touched} of ${report.projects.length} out of date`);
+  if (diverged > 0) {
+    ptyDim(
+      `${diverged} file(s) match no shipped template — hand-edited, or from an older version.`,
+    );
+    ptyDim('Diff one before deciding; --force overwrites them.');
+  }
+  ptyDim(
+    apply
+      ? 'Written. The new command is available the next time Claude opens there.'
+      : 'Nothing was written. Re-run with --apply (add --all for every project).',
+  );
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Subcommand: review
 // ─────────────────────────────────────────────────────────────────────
 
@@ -3044,6 +3123,8 @@ export function main(argv: string[]): void {
         return runHealth(rest);
       case 'review':
         return runReview(rest);
+      case 'commands':
+        return runCommands(rest);
       case 'gc':
         return runGc(rest);
       case 'backfill-remotes':
