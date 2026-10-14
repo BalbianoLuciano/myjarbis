@@ -34,7 +34,13 @@ RED, BOLD = "#e0413f", "#ffffff"
 GREEN, YELLOW, CYAN = "#3ddc84", "#f5c451", "#5fb3d4"
 COLORS = {"r": RED, "d": DIM, "g": GREEN, "y": YELLOW, "c": CYAN}
 
-MONO = "ui-monospace, 'DejaVu Sans Mono', 'Cascadia Code', Menlo, monospace"
+# The generic `monospace` keyword must be LAST and must be present: cairosvg
+# resolves the stack through fontconfig, which knows nothing about
+# `ui-monospace`, and silently fell back to a PROPORTIONAL face. The lines
+# still carried the right number of spaces, so the columns looked aligned in
+# the source and wobbled in the PNG — the one failure mode you cannot catch
+# by reading the frame definitions.
+MONO = "'DejaVu Sans Mono', 'Liberation Mono', 'Cascadia Code', Menlo, monospace"
 SANS = "'DejaVu Sans', Helvetica, Arial, sans-serif"
 FS, CH, LH = 15.5, 9.34, 26
 PAD_X, PAD_TOP, BAR_H = 26, 22, 38
@@ -240,18 +246,61 @@ render("● claude — api-server", [
 render("myjarbis status", [
     "[r]MyJarbis[/] [d]·[/] [b]api-server[/] [d](laravel)[/]",
     "  Path          [d]~/dev/api-server[/]",
-    "  Branch        [b]feature/auth-12-refresh[/]",
+    "  Branch        [b]feature/auth-12-refresh[/] [d]· in sync[/]",
+    "  Resolved      [d]by remote[/]",
+    "  Org           [r][b]example-co[/][/] [d]· pack git:4f1c2ab[/]",
+    "  Brain         [d]~/dev/api-server/.myjarbis/memory.db · silo[/]",
+    "  Schema        [d]v4[/]",
     "",
     "[r]Active module[/]",
-    "  Name          [b]auth[/]",
+    "  Name          [r][b]auth[/][/]",
     "  About         [d]login, OAuth, token refresh[/]",
+    "  Last close    2026-10-13 18:42 UTC",
+    "",
+    '    [d]"Resume here" excerpt:[/]',
+    "      Ask for sign-off on AUTH-12, then enable",
+    "      REFRESH_V2 in staging.",
     "",
     "[r]Counts[/]",
     "  Modules       5",
+    "  Project ctx   12 [d]entries[/]",
+    "  Module ctx    68 entries · 60 stories [d](41 with progress)[/]",
     "  Observations  128",
-    "  Skills        [g]10 baselines materialized[/]",
-    "  Sessions      [d]42 closed · 1 open[/]",
+    "  Skills        14 [d]in the brain[/]",
+    "  Sessions      42 closed · 42 total",
 ], "04-status")
+
+render("myjarbis workflow show ticket-close", [
+    "[d]$[/] [b]myjarbis workflow show ticket-close[/]",
+    "",
+    "[r]ticket-close[/] [d]— resolved from[/] org [r]→[/] project [r]→[/] user",
+    "",
+    "  [d]pos[/]  [d]step[/]                   [d]from[/]      [d]gate[/]       [d]provider[/]",
+    "  [b] 10[/]  run-tests              [d]org[/]       [d]-[/]        [d](ci unset)[/]",
+    "  [b] 20[/]  open-merge-request     [d]org[/]       [d]-[/]        [g]acme-forge[/]",
+    "  [b] 30[/]  get-approval           [r]user[/]      [y]approve[/]  [d]-[/]",
+    "  [b] 40[/]  comment-on-ticket      [d]org[/]       [d]-[/]        [g]acme-tracker[/]",
+    "",
+    "  [d]suppressed by project:[/] hand-back-to-reporter",
+    "",
+    "  [g]✓[/] 4 of 4 steps apply on [b]feature/auth-12-refresh[/]",
+    "  [y]![/] [b]get-approval[/] is a gate — the agent stops and asks",
+], "05-workflow-resolved")
+
+render("myjarbis org sync example-co", [
+    "[d]$[/] [b]myjarbis org sync example-co[/]",
+    "",
+    "[r]example-co[/] [d]· pack git:4f1c2ab[/]",
+    "",
+    "  [b]api-server[/]     [g]✓[/] 14 skills [d]· 14 on disk[/]",
+    "  [b]web-client[/]     [g]✓[/] 14 skills [d]· 14 on disk[/]",
+    "  [b]mobile-app[/]     [g]✓[/] 14 skills [d]· 14 on disk[/]",
+    "  [b]data-pipeline[/]  [y]![/] skipped [d]— brain at v3, run `myjarbis migrate`[/]",
+    "",
+    "  [g]✓[/] 3 applied [d]·[/] 1 skipped [d]·[/] 0 failed",
+    "",
+    "  [d]one rule change, one command — not four visits[/]",
+], "06-org-sync")
 
 render_diagram([
     {"type": "banner", "text": "auth"},
