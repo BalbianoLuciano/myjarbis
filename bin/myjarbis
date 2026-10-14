@@ -136,10 +136,15 @@ case "${1:-help}" in
         # Resolve script: prefer $INSTALL_DIR/bin (production install
         # layout), fall back to $INSTALL_DIR/../bin (dev layout where
         # MYJARBIS_INSTALL_DIR points to <repo>/global).
+        #
+        # `shift` then "$@", same as start/update: without it every flag was
+        # dropped, so --isolation, --org, --yes and --skip-memory were inert
+        # from the CLI and init always produced a default silo project.
+        shift
         if [ -f "$INSTALL_DIR/bin/myjarbis-init" ]; then
-            exec "$INSTALL_DIR/bin/myjarbis-init"
+            exec "$INSTALL_DIR/bin/myjarbis-init" "$@"
         elif [ -f "$INSTALL_DIR/../bin/myjarbis-init" ]; then
-            exec "$INSTALL_DIR/../bin/myjarbis-init"
+            exec "$INSTALL_DIR/../bin/myjarbis-init" "$@"
         fi
         echo -e "  ${RED}${BOLD}FAIL${NC}  myjarbis-init not found"
         echo -e "        ${DIM}run ./install.sh or set MYJARBIS_INSTALL_DIR${NC}"
@@ -147,10 +152,11 @@ case "${1:-help}" in
         ;;
 
     doctor)
+        shift
         if [ -f "$INSTALL_DIR/bin/myjarbis-doctor" ]; then
-            exec "$INSTALL_DIR/bin/myjarbis-doctor"
+            exec "$INSTALL_DIR/bin/myjarbis-doctor" "$@"
         elif [ -f "$INSTALL_DIR/../bin/myjarbis-doctor" ]; then
-            exec "$INSTALL_DIR/../bin/myjarbis-doctor"
+            exec "$INSTALL_DIR/../bin/myjarbis-doctor" "$@"
         fi
         echo -e "  ${RED}${BOLD}FAIL${NC}  myjarbis-doctor not found"
         echo -e "        ${DIM}run ./install.sh or set MYJARBIS_INSTALL_DIR${NC}"

@@ -24,18 +24,32 @@ PROJECT_NAME="$(basename "$CURRENT_DIR")"
 ASSUME_YES="${MYJARBIS_ASSUME_YES:-}"
 SKIP_MEMORY=""
 ORG_SLUG="${MYJARBIS_ORG:-}"
+ISOLATION=""
+PACK_PATH=""
 
 for arg in "$@"; do
     case "$arg" in
         --yes|-y)        ASSUME_YES=1 ;;
         --skip-memory)   SKIP_MEMORY=1 ;;
         --org=*)         ORG_SLUG="${arg#*=}" ;;
+        # Accepted here AND forwarded below. cli.ts has understood both since
+        # v0.3, but this script neither parsed nor passed them, so they were
+        # unreachable from `myjarbis init` — --isolation=shared in particular,
+        # which is the only way to create a project in the shared brain.
+        --isolation=*)   ISOLATION="${arg#*=}" ;;
+        --pack-path=*)   PACK_PATH="${arg#*=}" ;;
         --help|-h)
             echo "Usage: myjarbis init [--yes] [--skip-memory] [--org=<slug>]"
+            echo "                     [--isolation=silo|shared] [--pack-path=<dir>]"
             echo
-            echo "  --yes, -y       Do not prompt; accept reinitialization."
-            echo "  --skip-memory   Leave Claude Code's MEMORY.md untouched."
-            echo "  --org=<slug>    Seed this project from a registered org pack."
+            echo "  --yes, -y           Do not prompt; accept reinitialization."
+            echo "  --skip-memory       Leave Claude Code's MEMORY.md untouched."
+            echo "  --org=<slug>        Seed this project from a registered org pack."
+            echo "  --isolation=<mode>  Where the rows live: 'silo' (default, its"
+            echo "                      own .myjarbis/memory.db) or 'shared' (the"
+            echo "                      brain at ~/.myjarbis/memory.db)."
+            echo "  --pack-path=<dir>   Use a pack from this path instead of a"
+            echo "                      registered one. Implies --org."
             exit 0
             ;;
         *)
@@ -44,6 +58,11 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+if [ -n "$ISOLATION" ] && [ "$ISOLATION" != "silo" ] && [ "$ISOLATION" != "shared" ]; then
+    echo "--isolation must be \"silo\" or \"shared\" (got \"$ISOLATION\")" >&2
+    exit 1
+fi
 
 # ─── helpers ──────────────────────────────────────────────────────
 section() { echo; echo -e "${RED}${BOLD}$1${NC}"; }
@@ -386,8 +405,18 @@ if [ -f "$CLI_JS" ]; then
     if [ -n "$ORG_SLUG" ]; then
         INIT_ARGS+=(--org="$ORG_SLUG")
     fi
+    if [ -n "$ISOLATION" ]; then
+        INIT_ARGS+=(--isolation="$ISOLATION")
+    fi
+    if [ -n "$PACK_PATH" ]; then
+        INIT_ARGS+=(--pack-path="$PACK_PATH")
+    fi
     if node "$CLI_JS" "${INIT_ARGS[@]}" >/dev/null; then
-        note "memory.db + 10 baseline skills + interaction-style"
+        if [ "$ISOLATION" = "shared" ]; then
+            note "rows seeded into the shared brain + 10 baseline skills"
+        else
+            note "memory.db + 10 baseline skills + interaction-style"
+        fi
         if [ -n "$ORG_SLUG" ]; then
             note "org pack: $ORG_SLUG"
         fi
