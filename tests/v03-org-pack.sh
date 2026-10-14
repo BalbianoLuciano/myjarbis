@@ -48,6 +48,21 @@ FAILED=0
 pass() { echo "    ✓ $1"; }
 oops() { echo "    ✗ $1" >&2; FAILED=$((FAILED + 1)); }
 
+# Assertions produced by a node block are read back through a FILE, not a pipe.
+#
+# `cmd | while read ... oops` puts the loop in a subshell, so every
+# FAILED=$((FAILED+1)) inside it is discarded when the subshell exits. The
+# suite printed the ✗ lines and then exited 0 anyway, which means none of the
+# assertions made this way could ever turn the suite red. Found by reverting a
+# real fix and watching six ✗ lines still report "all assertions passed".
+ASSERTS="$WORK/asserts.out"
+read_asserts() {
+  while IFS='|' read -r st msg; do
+    [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
+  done < "$ASSERTS"
+}
+
+
 # ─── a project to apply packs to ───
 mkdir -p "$WORK/alpha"
 cd "$WORK/alpha"
@@ -87,9 +102,8 @@ t(r.workflows.length === 1 && r.workflows[0].steps === 5, 'one workflow with 5 s
 t(r.providers.length === 2, 'two provider templates');
 t(r.materialized.count >= 12, r.materialized.count + ' skills materialised to disk');
 console.log(out.join('\n'));
-" | while IFS='|' read -r st msg; do
-  [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
-done
+" > "$ASSERTS"
+read_asserts
 
 echo "→ [2] the override reached .claude/skills/, not just the DB"
 if grep -q "Example Co commit format" .claude/skills/myjarbis-commit-hygiene/SKILL.md 2>/dev/null; then
@@ -117,9 +131,8 @@ out.push((r.contextKinds.every((k) => k.status === 'unchanged') ? 'PASS|' : 'FAI
 out.push((r.materialized.count >= 12 ? 'PASS|' : 'FAIL|') +
   'on-disk count stays at ' + r.materialized.count + ' (counting only changes would read as 0)');
 console.log(out.join('\n'));
-" | while IFS='|' read -r st msg; do
-  [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
-done
+" > "$ASSERTS"
+read_asserts
 
 echo "→ [4] a malformed pack is rejected with a reason"
 BADPACK="$WORK/badpack"
@@ -233,9 +246,8 @@ out.push((row?.to === 'misc' ? 'PASS|' : 'FAIL|') +
 out.push((r.dryRun === true ? 'PASS|' : 'FAIL|') + 'migrate_kinds --dry-run reports without writing');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do
-  [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
-done
+" > "$ASSERTS"
+read_asserts
 
 echo "→ [7,8] workflow inheritance, position, disable, and provider resolution"
 node --input-type=module -e "
@@ -289,9 +301,8 @@ t(tests.capability === 'ci.run' && tests.provider === null,
 
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do
-  [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
-done
+" > "$ASSERTS"
+read_asserts
 
 echo "→ [9] org sync re-applies to every project of the org"
 mkdir -p "$WORK/beta"
@@ -313,9 +324,8 @@ t(r.summary.failed === 0, 'no project failed');
 t(r.projects.every((p) => !p.ok || (p.materialized ?? 0) >= 12),
   'every synced project ended with its skills on disk');
 console.log(out.join('\n'));
-" | while IFS='|' read -r st msg; do
-  [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
-done
+" > "$ASSERTS"
+read_asserts
 
 "$MJ" org diff example-co "$EXAMPLE_PACK" > "$WORK/diff.json" 2>&1
 if node -e "

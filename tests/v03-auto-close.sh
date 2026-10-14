@@ -57,13 +57,28 @@ FAILED=0
 pass() { echo "    ✓ $1"; }
 oops() { echo "    ✗ $1" >&2; FAILED=$((FAILED + 1)); }
 
+# Assertions produced by a node block are read back through a FILE, not a pipe.
+#
+# `cmd | while read ... oops` puts the loop in a subshell, so every
+# FAILED=$((FAILED+1)) inside it is discarded when the subshell exits. The
+# suite printed the ✗ lines and then exited 0 anyway, which means none of the
+# assertions made this way could ever turn the suite red. Found by reverting a
+# real fix and watching six ✗ lines still report "all assertions passed".
+ASSERTS="$WORK/asserts.out"
+read_asserts() {
+  while IFS='|' read -r st msg; do
+    [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
+  done < "$ASSERTS"
+}
+
+
 mkdir -p "$WORK/proj"
 cd "$WORK/proj"
 git init -q .
 git config user.email t@example.com
 git config user.name Test
 "$MJ" init --yes --skip-memory >/dev/null 2>&1
-echo seed > a.txt && git add -A && git commit -qm "feat(api): add the rollup endpoint"
+echo seed > a.txt && git add -A && git commit -qm "chore: seed the repo"
 
 # ─── 1. work happens, the agent never closes ───
 echo "→ [1] a session with work, left open, closed by the hook"
@@ -78,6 +93,15 @@ saveObservation(ctx, { kind:'gotcha',   title:'The nightly job runs in UTC, not 
 saveObservation(ctx, { kind:'progress', title:'Closed API-12: rollup endpoint shipped', content:'Behind a flag.' });
 ctx.close();
 "
+
+# The commit the summary is supposed to report has to land AFTER the session
+# opened, because `commitsSince` asks git for `--since <session start>`. This
+# used to be committed before the session, and passed only when the commit and
+# the session start happened to fall inside the same second — `--since` is
+# inclusive at one-second granularity. It was a coin flip that the suite could
+# not report either way, because the assertion ran inside a pipe.
+echo rollup > b.txt && git add b.txt && git commit -qm "feat(api): add the rollup endpoint"
+
 # Before: this is the state the project has been living in.
 BEFORE=$(node --input-type=module -e "
 import { ServerContext } from '$B/context.js';
@@ -111,7 +135,8 @@ t(/rollup endpoint/.test(r.summary), 'the summary names the observations');
 t(/feat\(api\): add the rollup endpoint/.test(r.summary), 'the summary includes commits made during the session');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 # ─── 2. project_state becomes the resume point ───
 echo "→ [2] with project_state set, that becomes the resume point"
@@ -136,7 +161,8 @@ t(/ROLLUP_V2/.test(r.nextSession), 'the living state is used verbatim as the res
 t(/set deliberately/.test(r.nextSession), 'and is marked as the trustworthy source');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 # ─── 3. no hook fires at all ───
 echo "→ [3] no hook fires (killed terminal): the next start_session closes it"
@@ -165,7 +191,8 @@ t(ctx.db.sessions.listOpenByProject(p.id).length === 1,
   'exactly one session open afterwards: the new one');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 # ─── 4. a curated close is never overwritten, even on a same-second tie ───
 echo "→ [4] a curated close wins, including against a same-second auto-close"
@@ -191,7 +218,8 @@ t(/verified it in staging/.test(r.summary), 'and it is the right curated summary
 t(/sign-off on API-12/.test(r.nextSession), 'with the curated next_session');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 # A properly closed session leaves the hook nothing to do.
 OUT=$(node "$CLI" hook session-end 2>&1)
@@ -236,7 +264,8 @@ t(/session-end\.sh/.test(JSON.stringify(d.hooks.SessionEnd)), 'pointing at sessi
 t(!/session-end\.sh/.test(JSON.stringify(d.hooks.Stop)),
   'and Stop does NOT close sessions — it fires every turn');
 console.log(out.join('\n'));
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 [ -x "$WORK/proj/.claude-plugin/scripts/session-end.sh" ] \
   && pass "session-end.sh is executable in the provisioned project" \
   || oops "session-end.sh missing or not executable"
@@ -324,7 +353,8 @@ t(r.curatedResume !== undefined, 'resume surfaces it too');
 t(/CURATED HANDOFF/.test(r.curatedResume?.nextSession ?? ''), 'and the same text');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 # The hook output is what the USER reads, and it was showing the empty one.
 HOOKOUT=$(node "$CLI" hook session-start 2>/dev/null)
@@ -350,7 +380,8 @@ t(r.curatedResume === undefined,
   'and curatedResume is absent — nothing is buried, so nothing is duplicated');
 console.log(out.join('\n'));
 ctx.close();
-" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+" > "$ASSERTS"
+read_asserts
 
 if [ "$FAILED" -gt 0 ]; then
   echo
