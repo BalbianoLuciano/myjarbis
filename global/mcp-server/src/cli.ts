@@ -1089,6 +1089,10 @@ function runInitProject(argv: string[]): void {
       '.myjarbis/memory.db-journal',
       '.myjarbis/memory.db-wal',
       '.myjarbis/memory.db-shm',
+      // backupBrain() writes `memory.db.<label>.<timestamp>` plus its own
+      // -wal/-shm. The four patterns above name the SQLite sidecars
+      // exactly, so none of them match a backup.
+      '.myjarbis/memory.db.*',
       '.claude/skills/myjarbis-*/',
     ]);
   }
@@ -2392,6 +2396,33 @@ function runMigrate(argv: string[]): void {
   }
 
   const reports = targets.map((t) => upgradeBrain(t, { dryRun }));
+
+  // Make sure the backup this just wrote is ignored.
+  //
+  // backupBrain() leaves `memory.db.<label>.<timestamp>` next to the brain,
+  // and the ignore patterns `init` writes name the SQLite sidecars exactly
+  // — so nothing matches it. Every project initialised before this fix has
+  // that gap, and the first `migrate` is what fills it: a full copy of the
+  // brain, untracked but visible, one `git add -A` away from being
+  // committed. That is precisely the leak the ignore rules exist to
+  // prevent, so the command that creates the file is the one that has to
+  // cover it, rather than hoping the user notices.
+  //
+  // Done even when `shared` is true: a shared brain is state the team
+  // agreed to commit, but a backup is a local artifact of a migration this
+  // machine happened to run, which nobody else wants.
+  if (!dryRun) {
+    for (const t of targets) {
+      // <project>/.myjarbis/memory.db — two levels up is the project. The
+      // global brain lives at ~/.myjarbis/memory.db and has no repo, which
+      // the .git check below rules out along with non-git projects.
+      const projectPath = path.dirname(path.dirname(t));
+      if (fs.existsSync(path.join(projectPath, '.git'))) {
+        appendToGitignore(projectPath, ['.myjarbis/memory.db.*']);
+      }
+    }
+  }
+
   printJson({
     dryRun,
     migrated: reports.filter((r) => !r.alreadyCurrent).length,
