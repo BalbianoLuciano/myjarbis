@@ -49,6 +49,9 @@ import { getProjectState, setProjectState } from './tools/state.js';
 import { upgradeBrain } from './db/upgrade.js';
 import { mergeBrain } from './db/merge.js';
 import { collectHealth } from './health.js';
+import { collectReview, applyReview } from './review.js';
+import { BASELINE_SKILLS } from './db/migrate.js';
+import { sha256 } from './db/index.js';
 import { runGarbageCollect } from './gc.js';
 import { globalDbPath, siloDbPath, detectRemote, resolveProject } from './resolve.js';
 import { openInVscode } from './diagram/open.js';
@@ -632,9 +635,12 @@ function runSkill(argv: string[]): void {
   const [sub, ...rest] = argv;
   if (!sub) {
     fail(
-      'Usage: myjarbis skill <list|add|edit|delete|enable|disable|materialize> [args...]',
+      'Usage: myjarbis skill <list|add|edit|delete|enable|disable|materialize|reseed> [args...]',
     );
   }
+
+  // `reseed` is fleet-wide and must not resolve a project first.
+  if (sub === 'reseed') return runSkillReseed(rest);
 
   const ctx = ServerContext.initialize();
   try {
@@ -2750,6 +2756,196 @@ function runBackfillRemotes(argv: string[]): void {
   console.log('');
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Subcommand: skill reseed
+//
+// Baseline skills are seeded per project, and the only writers are `init`
+// and the v0.1 migration. So improving a baseline reached new projects
+// and nothing else — the same shape of gap as `--isolation` and
+// `git_remote` before it. This is the missing path.
+// ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Baselines that a project is MEANT to diverge from, and which reseeding
+ * would therefore destroy.
+ *
+ * `interaction-style` is composed at init from the chosen language and
+ * persona (cli.ts, step 3), and its own text tells the agent the user owns
+ * it. Its baseline is a placeholder that init overwrites — so every
+ * project legitimately differs from it, and a hash comparison flags all of
+ * them as "out of date". Reseeding would have replaced the user's language
+ * and persona with the placeholder in every project at once.
+ */
+const RESEED_EXCLUDED = new Set(['interaction-style']);
+
+function runSkillReseed(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+  const all = truthy(flags.all);
+  const force = truthy(flags['include-owned']);
+
+  const targets = all
+    ? readRegistry().map((e) => e.path)
+    : [process.cwd()];
+
+  const results: Array<{
+    project: string;
+    updated: string[];
+    inserted: string[];
+    unchanged: number;
+    error?: string;
+  }> = [];
+
+  for (const dir of targets) {
+    const resolution = resolveProject({ cwd: dir });
+    if (!resolution) {
+      results.push({ project: dir, updated: [], inserted: [], unchanged: 0, error: 'no brain holds this project' });
+      continue;
+    }
+    const { db, project } = resolution;
+    const updated: string[] = [];
+    const inserted: string[] = [];
+    let unchanged = 0;
+    try {
+      for (const skill of BASELINE_SKILLS) {
+        if (RESEED_EXCLUDED.has(skill.name) && !force) {
+          unchanged++;
+          continue;
+        }
+        // Dry run compares the hash without writing, so the report is the
+        // same list `--apply` would act on.
+        const existing = db.skills.findByName(project.id, null, skill.name);
+        const same = existing && existing.content_hash === sha256(skill.content);
+        if (same) {
+          unchanged++;
+          continue;
+        }
+        if (apply) {
+          const r = db.skills.upsert({
+            projectId: project.id,
+            name: skill.name,
+            description: skill.description,
+            triggerPattern: skill.triggerPattern,
+            content: skill.content,
+          });
+          (r.status === 'inserted' ? inserted : updated).push(skill.name);
+        } else {
+          (existing ? updated : inserted).push(skill.name);
+        }
+      }
+      results.push({ project: project.name, updated, inserted, unchanged });
+    } catch (e) {
+      results.push({
+        project: project.name,
+        updated: [],
+        inserted: [],
+        unchanged: 0,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  if (wantsJson(flags)) {
+    printJson({ applied: apply, results });
+    return;
+  }
+
+  ptySection(apply ? 'MyJarbis · skill reseed' : 'MyJarbis · skill reseed (report only)');
+  let touched = 0;
+  for (const r of results) {
+    const n = r.updated.length + r.inserted.length;
+    if (r.error) {
+      console.log('  ' + bold(clip(r.project, 26)) + red(r.error));
+      continue;
+    }
+    if (n === 0) continue;
+    touched++;
+    console.log(
+      '  ' +
+        bold(clip(r.project, 26)) +
+        (r.updated.length ? amber(`${r.updated.length} updated`) : '') +
+        (r.updated.length && r.inserted.length ? '  ' : '') +
+        (r.inserted.length ? green(`${r.inserted.length} new`) : '') +
+        dim(`  ·  ${r.unchanged} unchanged`),
+    );
+    for (const s of [...r.updated, ...r.inserted].slice(0, 6)) ptyDim(`  ${s}`);
+  }
+  console.log('');
+  if (touched === 0) {
+    ptyDim('Every baseline is already current.');
+  } else {
+    ptyKV('Projects', `${touched} of ${results.length} out of date`);
+    if (!force) {
+      ptyDim(`Skipped (the project owns these): ${[...RESEED_EXCLUDED].join(', ')}`);
+    }
+    ptyDim(
+      apply
+        ? 'Rewritten. Open Claude in each project to re-materialise .claude/skills/.'
+        : 'Nothing was written. Re-run with --apply (add --all for every project).',
+    );
+  }
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Subcommand: review
+// ─────────────────────────────────────────────────────────────────────
+
+function runReview(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+  const ctx = ServerContext.initialize();
+  try {
+    let report = collectReview(ctx, {
+      module: flags.module as string | undefined,
+      threshold: flags.threshold ? parseFloat(String(flags.threshold)) : undefined,
+    });
+    if (apply && report.clusters.length) report = applyReview(ctx, report);
+
+    if (wantsJson(flags)) {
+      printJson(report);
+      return;
+    }
+
+    ptySection(apply ? 'MyJarbis · review' : 'MyJarbis · review (report only)');
+    ptyKV('Project', report.project);
+    ptyKV('Scanned', `${report.scanned} note(s)` + dim(`  ·  ${report.alreadyKeyed} already grouped`));
+
+    if (report.clusters.length === 0) {
+      console.log('');
+      ptyDim('No notes look like successive versions of one topic.');
+      console.log('');
+      return;
+    }
+
+    for (const c of report.clusters) {
+      console.log('');
+      console.log(
+        '  ' + bold(c.topicKey) + dim(`  ·  ${c.kind} · ${c.moduleName} · ${c.members.length} notes`),
+      );
+      for (const m of c.members) {
+        const tag = m.role === 'current' ? green('current   ') : dim('superseded');
+        console.log(`    ${tag} ${dim(m.createdAt.slice(0, 10))}  ${clip(m.title, 62)}`);
+      }
+    }
+
+    console.log('');
+    const total = report.clusters.reduce((a, c) => a + c.members.length, 0);
+    ptyKV('Groups', `${report.clusters.length}` + dim(`  ·  ${total} notes`));
+    if (apply) {
+      ptyDim('Grouped. Saving under the same topic_key now updates in place.');
+    } else {
+      ptyDim('Nothing was written. Re-run with --apply to assign topic_key + supersedes.');
+      ptyDim('Nothing is ever deleted or merged — only linked.');
+    }
+    console.log('');
+  } finally {
+    ctx.close();
+  }
+}
+
 /** parseFlags yields `true` for a bare flag and a string for --k=v. */
 function truthy(v: string | boolean | undefined): boolean {
   return v === true || v === 'true' || v === '1';
@@ -2782,6 +2978,8 @@ export function main(argv: string[]): void {
         return runStatus(rest);
       case 'health':
         return runHealth(rest);
+      case 'review':
+        return runReview(rest);
       case 'gc':
         return runGc(rest);
       case 'backfill-remotes':

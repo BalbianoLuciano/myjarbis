@@ -39,10 +39,11 @@ show_help() {
     echo -e "  ${BOLD}migrate${NC}    Upgrade a brain to the current schema, backing it up first"
     echo -e "  ${BOLD}merge${NC}      Merge a project's brain into the shared one"
     echo -e "  ${BOLD}module${NC}     Manage modules (add/list)"
-    echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable)"
+    echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable/reseed)"
     echo -e "  ${BOLD}stats${NC}      Show row counts per table"
     echo -e "  ${BOLD}status${NC}     git-like overview: project, active module, last session, counts"
     echo -e "  ${BOLD}health${NC}     Every project at once: schema, activity, what is going cold"
+    echo -e "  ${BOLD}review${NC}     Group notes that are successive versions of one topic"
     echo -e "  ${BOLD}gc${NC}         Report (and with --apply, remove) the litter MyJarbis leaves"
     echo -e "  ${BOLD}backfill-remotes${NC}  Record the git remote on projects that predate the field"
     echo -e "  ${BOLD}timeline${NC}   Chronological feed of sessions + observations for a module"
@@ -200,7 +201,7 @@ case "${1:-help}" in
         exit 1
         ;;
 
-    import|brain|module|skill|stats|cost|config|status|health|gc|backfill-remotes|timeline|diagram|hook|\
+    import|brain|module|skill|stats|cost|config|status|health|review|gc|backfill-remotes|timeline|diagram|hook|\
     org|kinds|workflow|provider|state|migrate|merge)
         # v0.2 subcommands delegated to the node CLI helper
         CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
@@ -217,7 +218,7 @@ case "${1:-help}" in
         ;;
 
     --version|-v)
-        echo "MyJarbis v0.4.0"
+        echo "MyJarbis v0.4.1"
         ;;
 
     *)

@@ -24,6 +24,7 @@ SUITES=(
   v03-org-pack
   v03-auto-close
   v03-maintenance
+  v04-review-reseed
 )
 
 PASS=0; FAIL=0; FAILED_NAMES=()

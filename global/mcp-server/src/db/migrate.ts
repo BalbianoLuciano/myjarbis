@@ -83,7 +83,7 @@ interface BaselineSkill {
   content: string;
 }
 
-const BASELINE_SKILLS: BaselineSkill[] = [
+export const BASELINE_SKILLS: BaselineSkill[] = [
   {
     name: 'module-orchestration',
     description: 'Choose/create a module at session start; switch when the context changes',
