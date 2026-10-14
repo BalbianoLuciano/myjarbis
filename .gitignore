@@ -73,3 +73,12 @@ launch-plan/
 
 # MyJarbis
 .myjarbis/context/codebase.txt
+
+# Local operational notes — machine-specific, and they name real projects.
+# docs/ holds both tracked docs and untracked working notes; these are the
+# untracked kind and must stay that way: this repo is public, and the rule
+# is that no client or private project name ever lands in it.
+docs/MIGRATION-v0.3.md
+docs/HOW-IT-WORKS.md
+docs/SESSION-*.md
+docs/COMPARISON-*.md

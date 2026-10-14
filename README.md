@@ -15,6 +15,32 @@
 
 ---
 
+## In plain terms
+
+AI coding assistants forget everything when you close them. Every morning
+you re-explain the same things: how this project is built, the rules the
+team follows, what you were in the middle of yesterday.
+
+MyJarbis is the notebook the assistant never had. It remembers:
+
+- **the decisions** — what you chose and *why*, so nobody re-opens it later
+- **the traps** — the thing that broke once, so it doesn't break twice
+- **where you stopped** — so tomorrow starts with "here's where you were",
+  not a blank page
+- **how your team works** — the review rules, the release checklist, the
+  order things get done in
+
+It also *enforces* that last one. If the team's process says "someone else
+approves before this merges", the assistant stops and asks instead of
+deciding on its own.
+
+Everything is stored on your own machine, in a plain database file. Nothing
+is uploaded anywhere.
+
+<sub>The rest of this page is for developers.</sub>
+
+---
+
 ## What it is
 
 Claude Code has no project memory. You repeat conventions, re-explain
@@ -147,16 +173,16 @@ MyJarbis models that explicitly — and **only loads the vertical you're in**:
 org (optional — owns the pack: skills, workflows, taxonomy)
  └ project
   ├── project_context (practices, deps, conventions — always loaded)
-  ├── project_state   (★ the living "resume here" — one row, not N notes)
-  ├── providers       (★ which tracker / forge / ci this project talks to)
-  ├── workflows       (★ process as rows, inherited org → project → user)
+  ├── project_state   (new in v0.3 — the living "resume here", one row not N notes)
+  ├── providers       (new in v0.3 — which tracker / forge / ci this project uses)
+  ├── workflows       (new in v0.3 — process as rows, org to project to user)
   ├── modules (verticals — you create them)
   │     ├── module_context (workflow, plan, stories, AC)
-  │     │     └── progress  (★ per-row state, like a "Smoke/Commit" column)
+  │     │     └── progress  (per-row state, like a "Smoke/Commit" column)
   │     ├── sessions (start → save observations → end, closed automatically)
   │     │     └── observations (decisions, gotchas, progress)
-  │     │           ├── topic_key (★ identity — saving again updates it)
-  │     │           └── refs      (★ links to commits / MRs / tickets)
+  │     │           ├── topic_key (new in v0.3 — identity; saving again updates it)
+  │     │           └── refs      (new in v0.3 — links to commits / MRs / tickets)
   │     └── skills (module-level — only when this module is active)
   └── skills (project-level — always loaded: 10 baselines + any org pack)
 ```
@@ -479,7 +505,7 @@ every `module_context` row (typically a story) has a free-form markdown
   ↓
 update_progress(
   local_id = "MM-S3.6",
-  progress = "✅ done batch 2 (2026-05-04) · commit abc1234 · smoke OK"
+  progress = "done · batch 2 (2026-05-04) · commit abc1234 · smoke OK"
 )
 ```
 
@@ -489,7 +515,7 @@ in progress, or blocked, without reading any MD.
 
 | MD workflow                            | MyJarbis equivalent                          |
 |----------------------------------------|----------------------------------------------|
-| Edit PROGRESS.md "Smoke" column        | `update_progress(local_id, "✅ done · ...")` |
+| Edit PROGRESS.md "Smoke" column        | `update_progress(local_id, "done · ...")`    |
 | Edit CURRENT.md rolling summary        | `end_session(summary, next_session)`         |
 | Edit ERRORS.md new lesson              | `save_observation(kind=gotcha, ...)`         |
 | Read CURRENT.md next morning           | `previousSession.nextSession` in `start_session` |
