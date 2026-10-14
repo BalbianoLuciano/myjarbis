@@ -48,7 +48,7 @@ import {
 import { getProjectState, setProjectState } from './tools/state.js';
 import { upgradeBrain } from './db/upgrade.js';
 import { mergeBrain } from './db/merge.js';
-import { globalDbPath, siloDbPath } from './resolve.js';
+import { globalDbPath, siloDbPath, detectRemote } from './resolve.js';
 import { openInVscode } from './diagram/open.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -479,9 +479,11 @@ function runStatus(argv: string[]): void {
     ).get(project.id) as { n: number }).n;
     const skillsCount = (ctx.db.db.prepare('SELECT COUNT(*) AS n FROM skills WHERE project_id=?').get(project.id) as { n: number }).n;
     const sessAgg = ctx.db.db.prepare(
-      `SELECT COUNT(*) AS total, SUM(CASE WHEN ended_at IS NOT NULL THEN 1 ELSE 0 END) AS closed
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN ended_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS closed,
+              COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END), 0) AS open
        FROM sessions s JOIN modules m ON m.id=s.module_id WHERE m.project_id=?`,
-    ).get(project.id) as { total: number; closed: number };
+    ).get(project.id) as { total: number; closed: number; open: number };
 
     let git: { branch: string | null; ahead: number | null } = { branch: null, ahead: null };
     try {
@@ -497,8 +499,25 @@ function runStatus(argv: string[]): void {
       // Not a git repo
     }
 
+    const org = project.org_id === null ? null : ctx.db.orgs.findById(project.org_id);
+    const brain = {
+      path: ctx.db.dbPath,
+      isolation: project.isolation,
+      schema_version: ctx.db.schemaVersion,
+      expected_schema_version: SCHEMA_VERSION,
+      needs_migration: ctx.db.needsMigration,
+    };
+
     const data = {
-      project: { name: project.name, path: project.path, framework: project.framework },
+      project: {
+        name: project.name,
+        path: project.path,
+        framework: project.framework,
+        git_remote: project.git_remote,
+        resolved_via: ctx.resolvedVia,
+      },
+      org: org ? { slug: org.slug, name: org.name, pack_rev: org.pack_rev } : null,
+      brain,
       active_module: active,
       active_module_status: activeMod?.status ?? null,
       active_module_description: activeMod?.description ?? null,
@@ -533,6 +552,24 @@ function runStatus(argv: string[]): void {
       const aheadStr = git.ahead === null ? '' : git.ahead > 0 ? ` ${red('· ' + git.ahead + ' ahead of origin')}` : ' · in sync';
       ptyKV('Branch', bold(git.branch) + aheadStr);
     }
+    if (ctx.resolvedVia) {
+      // Worth printing: "resolved by remote" vs "by path" is the difference
+      // between a project that follows the repo and one pinned to a path.
+      ptyKV('Resolved', dim('by ' + ctx.resolvedVia));
+    }
+    if (org) {
+      ptyKV('Org', red(bold(org.slug)) + dim(org.pack_rev ? ` · pack ${org.pack_rev}` : ''));
+    }
+    ptyKV('Brain', dim(brain.path) + dim(` · ${brain.isolation}`));
+    if (brain.needs_migration) {
+      ptyKV(
+        'Schema',
+        red(bold(`v${brain.schema_version}`)) +
+          red(` · expected v${brain.expected_schema_version} — run \`myjarbis migrate\``),
+      );
+    } else {
+      ptyKV('Schema', dim(`v${brain.schema_version}`));
+    }
 
     ptySection('Active module');
     if (active && activeMod) {
@@ -562,8 +599,15 @@ function runStatus(argv: string[]): void {
     ptyKV('Project ctx', String(projCtxCount) + dim(' entries'));
     ptyKV('Module ctx', `${modCtxCounts.reduce((a, m) => a + m.total, 0)} entries · ${totalStories} stories ${dim(`(${storiesWithProgress} with progress)`)}`);
     ptyKV('Observations', String(obsCount));
-    ptyKV('Skills', String(skillsCount) + dim(' baselines materialized'));
-    ptyKV('Sessions', `${sessAgg.closed} closed · ${sessAgg.total} total`);
+    ptyKV('Skills', String(skillsCount) + dim(' in the brain'));
+    ptyKV(
+      'Sessions',
+      `${sessAgg.closed} closed · ${sessAgg.total} total` +
+        (sessAgg.open > 0
+          ? dim(` · ${sessAgg.open} open`) +
+            (sessAgg.open > 1 ? red(' (auto-closed on exit)') : '')
+          : ''),
+    );
 
     console.log('');
   } finally {
@@ -911,7 +955,8 @@ function runInitProject(argv: string[]): void {
     fail(
       'Usage: cli.js init-project --name=<project> [--framework=<fw>] ' +
         '[--shared=true|false] [--language=EN|ES|PT] ' +
-        '[--persona=concise|pair|mentor|reviewer] [--org=<slug>] [--pack-path=<dir>]',
+        '[--persona=concise|pair|mentor|reviewer] [--org=<slug>] [--pack-path=<dir>] ' +
+        '[--isolation=silo|shared]',
     );
   }
 
@@ -921,9 +966,31 @@ function runInitProject(argv: string[]): void {
 
   const projectPath = process.cwd();
 
+  const isolationRaw = (flags.isolation as string | undefined) ?? 'silo';
+  if (isolationRaw !== 'silo' && isolationRaw !== 'shared') {
+    fail(`--isolation must be "silo" or "shared" (got "${isolationRaw}")`);
+  }
+  const isolationMode = isolationRaw as 'silo' | 'shared';
+
   // 1. seedNewProject (creates memory.db + project + _general module +
   //    10 baseline skills, idempotent)
-  const seed = seedNewProject(projectPath, { name, framework });
+  //
+  // Record the git remote here. Without it `projects.git_remote` stays NULL
+  // and the whole resolve-by-remote chain is inert for every new project —
+  // it would only ever match projects whose remote some other command had
+  // happened to set. The remote is what lets the same repo resolve from a
+  // different path on a second machine, which is the case the portable brain
+  // dump exists for.
+  const detectedRemote = detectRemote(projectPath);
+  const seed = seedNewProject(projectPath, {
+    name,
+    framework,
+    gitRemote: detectedRemote,
+    // NOTE: distinct from --shared, which decides whether memory.db is
+    // git-ignored. This decides WHERE the rows live: its own file, or the
+    // global brain. Defaults to 'silo', the pre-v0.3 layout.
+    isolation: isolationMode,
+  });
 
   // 2. Write settings.json v0.2 schema (preserve existing fields if any)
   const myjarbisDir = path.join(projectPath, '.myjarbis');
@@ -1027,7 +1094,15 @@ function runInitProject(argv: string[]): void {
   }
 
   printJson({
-    project: { id: seed.projectId, name, framework: framework ?? null, path: projectPath },
+    project: {
+      id: seed.projectId,
+      name,
+      framework: framework ?? null,
+      path: projectPath,
+      git_remote: detectedRemote,
+      isolation: isolationMode,
+    },
+    brain_path: seed.dbPath,
     schema_version: SCHEMA_VERSION,
     seeded: { module_id: seed.moduleId, baseline_skills: seed.skills },
     interaction_style: { language, persona, label: personaLabel(persona) },
