@@ -326,6 +326,24 @@ Claude Code exposes an \`Agent\` tool that spawns a sub-agent in its own
 context window. MyJarbis tells you **when** to use it so the main agent
 stays focused on coordination.
 
+## Preguntate una vez, al empezar
+
+Antes de arrancar una tarea de varios pasos, hacete **una** pregunta:
+*¿hay dos o más piezas de esto que no dependan entre sí?*
+
+- **Sí** → delegalas juntas, en un solo mensaje con varias llamadas a
+  \`Agent\`. Barrer tres áreas en serie cuando podían ir en paralelo es
+  tiempo y contexto tirados.
+- **No** → no fuerces. La profundidad secuencial encuentra lo que la
+  amplitud paralela no: un sub-agente arranca **sin** el contexto que vos
+  acumulaste, así que es bueno barriendo y malo razonando sobre una
+  cadena de causas que no vio.
+
+El chequeo es el hábito, no el paralelismo. "Tantos agentes como sea
+posible" rinde menos que "los que de verdad son independientes": cada
+spawn paga prompt + reporte en tokens, y nada que escriba puede correr en
+paralelo sin pisarse (mismo archivo, mismo índice de git).
+
 ## Delegate when
 
 - **Auditing N parallel ACs of a story.** Each AC is independent verification
