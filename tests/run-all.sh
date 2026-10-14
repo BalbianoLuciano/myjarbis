@@ -26,6 +26,7 @@ SUITES=(
   v03-maintenance
   v04-review-reseed
   v04-commands-sync
+  v04-close-ritual
 )
 
 PASS=0; FAIL=0; FAILED_NAMES=()
