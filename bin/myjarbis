@@ -179,10 +179,13 @@ case "${1:-help}" in
         ;;
 
     update)
+        # `shift` then "$@": without it the flags were dropped, so
+        # `myjarbis update --projects` silently ran a plain update.
+        shift
         if [ -f "$INSTALL_DIR/bin/myjarbis-update" ]; then
-            exec "$INSTALL_DIR/bin/myjarbis-update"
+            exec "$INSTALL_DIR/bin/myjarbis-update" "$@"
         elif [ -f "$INSTALL_DIR/../bin/myjarbis-update" ]; then
-            exec "$INSTALL_DIR/../bin/myjarbis-update"
+            exec "$INSTALL_DIR/../bin/myjarbis-update" "$@"
         fi
         echo -e "  ${RED}${BOLD}FAIL${NC}  myjarbis-update not found"
         exit 1

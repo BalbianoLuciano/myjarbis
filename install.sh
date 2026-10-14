@@ -78,8 +78,28 @@ ok
 
 # ─── [3/7] copy files ─────────────────────────────────────────────
 step 3 "Copy MyJarbis files"
-cp -r global/* "$INSTALL_DIR/"
+# Copy the code and templates, NOT local state.
+#
+# `cp -r global/*` used to be the whole step, and it is a trap: a working
+# checkout accumulates `global/projects-registry.json` and stray
+# `global/**/.myjarbis/memory.db` files (both gitignored), so installing from
+# a checkout that had been used for testing would overwrite the user's real
+# project registry with whatever the developer's test runs left behind.
+# Those two are state, they belong to the installation, and they are excluded
+# here. `myjarbis update` excludes them for the same reason.
+for item in global/*; do
+    base="$(basename "$item")"
+    [ "$base" = "projects-registry.json" ] && continue
+    cp -r "$item" "$INSTALL_DIR/"
+done
 cp -r bin "$INSTALL_DIR/"
+find "$INSTALL_DIR" -type d -name '.myjarbis' -prune -exec rm -rf {} + 2>/dev/null || true
+
+# Record where this was installed FROM, so `myjarbis update` can pull and
+# re-sync without the user having to remember the path. The install dir is a
+# copy, not a clone, so it has no remote of its own to pull from — which is
+# precisely why `myjarbis update` never actually updated anything before.
+printf '%s\n' "$(pwd)" > "$INSTALL_DIR/.source"
 
 CRITICAL_FILES=(
     "$INSTALL_DIR/mcp-server/package.json"
