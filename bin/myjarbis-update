@@ -134,7 +134,12 @@ for item in "$SOURCE"/global/*; do
 done
 cp -r "$SOURCE/bin" "$INSTALL_DIR/"
 # Stray brains a checkout may have accumulated are not part of the product.
-find "$INSTALL_DIR" -type d -name '.myjarbis' -prune -exec rm -rf {} + 2>/dev/null || true
+# backups/ is excluded: like the registry, it is state owned by this
+# installation, not code coming from the checkout. The snapshots under it
+# contain a project's own .myjarbis/ by design, and a sync must not eat them.
+find "$INSTALL_DIR" \
+    -path "$INSTALL_DIR/backups" -prune -o \
+    -type d -name '.myjarbis' -prune -exec rm -rf {} + 2>/dev/null || true
 
 if [ -n "$REGISTRY_BACKUP" ]; then
     cp "$REGISTRY_BACKUP" "$REGISTRY_FILE"
