@@ -131,6 +131,24 @@ export interface StartSessionResult {
      *  in the tool response. */
     staleAfterDays: number;
   } | null;
+  /** The last handoff a HUMAN wrote, when `previousSession.nextSession` is
+   *  machine-written and this is not the same session.
+   *
+   *  An auto-close is always the newest close, so it is what previousSession
+   *  returns — and the curated handoff ends up one level down per auto-close,
+   *  visible to nobody. Its staleness is computed from ITS OWN ended_at, which
+   *  matters: an auto-close that ran today resets previousSession.daysSinceClose
+   *  to 0, so the stale warning never fires for a handoff that is weeks old. */
+  curatedResume?: {
+    sessionId: number;
+    endedAt: string | null;
+    summary: string | null;
+    nextSession: string;
+    daysSinceClose: number | null;
+    stale: boolean;
+    /** Closed sessions between this one and now, all machine-written. */
+    buriedUnder: number;
+  };
   /** Set when a session left open in this module was closed retroactively
    *  on the way in. Surfaced so the agent can say so rather than silently
    *  presenting a machine-written resume point as if it were curated. */
@@ -207,6 +225,10 @@ export function startSession(
     ? computeStaleness(previousClosed.ended_at, staleAfterDays)
     : null;
 
+  // Dig out the curated handoff when the newest close is machine-written.
+  // Skipped when previousClosed IS the curated one, which is the common case.
+  const curated = resolveCuratedResume(ctx, module.id, previousClosed, staleAfterDays);
+
   return {
     sessionId: session.id,
     startedAt: session.started_at,
@@ -231,6 +253,7 @@ export function startSession(
           staleAfterDays,
         }
       : null,
+    curatedResume: curated ?? undefined,
     autoClosedPrevious: autoClosed
       ? {
           sessionId: autoClosed.sessionId,
@@ -247,7 +270,11 @@ export function startSession(
         `things stand before acting on it.` +
         (autoClosed.nextSessionSource === 'project_state'
           ? ' It came from the project living state, which was set deliberately, so it is the most trustworthy source available.'
-          : ' It was derived from the last notes, so it may be incomplete.')
+          : ' It was derived from the last notes, so it may be incomplete.') +
+        (curated ? ` ${curatedHint(curated)}` : '')
+      : curated
+      ? `previousSession.nextSession is MACHINE-WRITTEN (starts with "${AUTO_MARKER}"). ` +
+        `${curatedHint(curated)}`
       : previousClosed?.next_session
       ? (staleness?.stale
           ? `⚠ STALE RESUME — previousSession.nextSession is ${staleness.days} day(s) old (closed ${previousClosed.ended_at} UTC, threshold ${staleAfterDays}d). Before assuming it still applies, ask the user: branch state, open PRs, anything that moved since. THEN continue from previousSession.nextSession.`
@@ -342,6 +369,9 @@ export interface ResumeResult {
   lastSessionEndedAt: string | null;
   summary: string | null;
   nextSession: string | null;
+  /** Same contract as in start_session: the last human-written handoff, when
+   *  the newest close is machine-written and therefore hides it. */
+  curatedResume?: NonNullable<StartSessionResult['curatedResume']>;
   hint?: string;
 }
 
@@ -362,13 +392,23 @@ export function resume(ctx: ServerContext, rawArgs: unknown): ResumeResult {
   }
 
   const last = ctx.db.sessions.findLastClosedByModule(moduleRow.id);
+  const curated = resolveCuratedResume(
+    ctx,
+    moduleRow.id,
+    last,
+    readStaleThreshold(ctx.projectPath),
+  );
+
   return {
     module: { id: moduleRow.id, name: moduleRow.name },
     hasNextSession: !!(last && last.next_session),
     lastSessionEndedAt: last?.ended_at ?? null,
     summary: last?.summary ?? null,
     nextSession: last?.next_session ?? null,
-    hint: last?.next_session
+    curatedResume: curated ?? undefined,
+    hint: curated
+      ? curatedHint(curated)
+      : last?.next_session
       ? undefined
       : `Module "${moduleRow.name}" has no closed session yet — nothing to resume.`,
   };
@@ -377,6 +417,58 @@ export function resume(ctx: ServerContext, rawArgs: unknown): ResumeResult {
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────
+
+/** True when this text was written by autoClose rather than by a person. */
+function isSynthetic(nextSession: string | null): boolean {
+  return !!nextSession && nextSession.startsWith(AUTO_MARKER);
+}
+
+/**
+ * The curated handoff hiding under one or more machine-written closes.
+ *
+ * Returns null in the ordinary case — the newest close is the curated one, so
+ * `previousSession` already carries it and repeating it would just double the
+ * bootstrap payload.
+ */
+function resolveCuratedResume(
+  ctx: ServerContext,
+  moduleId: number,
+  previousClosed: { id: number; next_session: string | null } | null,
+  staleAfterDays: number,
+): NonNullable<StartSessionResult['curatedResume']> | null {
+  if (!previousClosed || !isSynthetic(previousClosed.next_session)) return null;
+
+  const curated = ctx.db.sessions.findLastCuratedByModule(moduleId);
+  if (!curated?.next_session || curated.id === previousClosed.id) return null;
+
+  const staleness = computeStaleness(curated.ended_at, staleAfterDays);
+  return {
+    sessionId: curated.id,
+    endedAt: curated.ended_at,
+    summary: curated.summary,
+    nextSession: curated.next_session,
+    daysSinceClose: staleness?.days ?? null,
+    stale: staleness?.stale ?? false,
+    buriedUnder: ctx.db.sessions.countClosedAfterInModule(moduleId, curated.id),
+  };
+}
+
+/** The instruction that goes with a recovered handoff. */
+function curatedHint(
+  curated: NonNullable<StartSessionResult['curatedResume']>,
+): string {
+  const age =
+    curated.daysSinceClose === null
+      ? ''
+      : ` It is ${curated.daysSinceClose} day(s) old${curated.stale ? ' and over the staleness threshold' : ''},` +
+        ` which previousSession.daysSinceClose does NOT show because the automatic close reset that clock.`;
+  return (
+    `The real "Retomar aquí" is in curatedResume (session #${curated.sessionId}, ` +
+    `buried under ${curated.buriedUnder} machine-written close(s)) — READ THAT, not ` +
+    `previousSession.nextSession.${age} Confirm with the user before acting on it: ` +
+    `whatever happened in the sessions that were never written up is not in there.`
+  );
+}
 
 const EXCERPT_LEN = 240;
 

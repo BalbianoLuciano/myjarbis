@@ -24,6 +24,13 @@
 #      one-second granularity, so that tie is ordinary rather than rare
 #   5. generated text is labelled, and the agent is told it is generated
 #   6. the opt-out is honoured
+#   7. a curated handoff with auto-closes stacked ON TOP of it is still
+#      reachable. Automatic closing is always the newest close, so it wins
+#      every "last closed session" lookup and pushes the real handoff one
+#      level down per occurrence. Seen in a real module: a 3538-char handoff,
+#      then two sessions left open on later days, auto-closed with 292 and
+#      124 chars of synthetic text. The agent read the emptiest of the three
+#      and told the user there was no resume point.
 #
 # Exits 0 on success, non-zero on the first failed assertion.
 
@@ -233,6 +240,117 @@ console.log(out.join('\n'));
 [ -x "$WORK/proj/.claude-plugin/scripts/session-end.sh" ] \
   && pass "session-end.sh is executable in the provisioned project" \
   || oops "session-end.sh missing or not executable"
+
+# ─── 7. a curated handoff is reachable under a stack of auto-closes ───
+#
+# A fresh project, because this exercises the fallback branches of
+# composeNextSession: proj has project_state set by [2], and that branch
+# deliberately carries no pointer (a living state set on purpose is more
+# current than an older handoff).
+echo "→ [7] two auto-closes on top of a curated handoff, which is still reachable"
+mkdir -p "$WORK/proj2"
+cd "$WORK/proj2"
+git init -q .
+git config user.email t@example.com
+git config user.name Test
+"$MJ" init --yes --skip-memory >/dev/null 2>&1
+
+# The curated handoff.
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession, endSession } from '$B/tools/session.js';
+import { saveObservation } from '$B/tools/observations.js';
+const ctx = ServerContext.initialize();
+startSession(ctx, { module: '_general' });
+saveObservation(ctx, { kind:'progress', title:'Closed BILL-7: invoice export', content:'Behind a flag.' });
+endSession(ctx, { summary: 'Shipped the invoice export and verified the CSV byte-for-byte.',
+                  next_session: 'CURATED HANDOFF: get sign-off on BILL-7, then turn on EXPORT_V2 for the pilot tenant.' });
+ctx.close();
+"
+# Two sessions left open on later days, each closed by the hook. This is the
+# shape that buried the real handoff: every auto-close is the newest close.
+for n in 1 2; do
+  node --input-type=module -e "
+  import { ServerContext } from '$B/context.js';
+  import { startSession } from '$B/tools/session.js';
+  import { saveObservation } from '$B/tools/observations.js';
+  const ctx = ServerContext.initialize();
+  startSession(ctx, { module: '_general' });
+  saveObservation(ctx, { kind:'progress', title:'poked at the exporter, nothing written up', content:'x' });
+  ctx.close();
+  "
+  node "$CLI" hook session-end >/dev/null 2>&1
+done
+
+# Age the curated close by 20 days. Without this the whole chain is same-day
+# and the staleness assertion below could not tell the two clocks apart —
+# which is the second half of the bug: an auto-close that ran today sets
+# previousSession.daysSinceClose to 0 for a handoff that is weeks old.
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+const ctx = ServerContext.initialize();
+const p = ctx.requireProject();
+const m = ctx.db.modules.listByProject(p.id).find((x) => x.name === '_general');
+const curated = ctx.db.sessions.findLastCuratedByModule(m.id);
+ctx.db.db.prepare(\"UPDATE sessions SET ended_at = datetime('now','-20 days') WHERE id = ?\").run(curated.id);
+ctx.close();
+"
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession, resume } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+const r = resume(ctx, { module: '_general' });
+const s = startSession(ctx, { module: '_general' });
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+
+t(s.previousSession.nextSession.startsWith('[auto]'),
+  'previousSession is the machine-written close, as before');
+t(s.curatedResume !== undefined, 'start_session surfaces curatedResume');
+t(/CURATED HANDOFF/.test(s.curatedResume?.nextSession ?? ''),
+  'and it is the handoff a human wrote');
+t(s.curatedResume?.buriedUnder === 2, 'reporting it was buried under 2 automatic closes');
+t(/verified the CSV/.test(s.curatedResume?.summary ?? ''),
+  'with the curated summary alongside it');
+t(/curatedResume/.test(s.hint ?? ''), 'the hint points the agent at curatedResume');
+t(s.curatedResume?.stale === true,
+  'the curated handoff is stale on ITS OWN clock (20 days)');
+t(s.previousSession.stale === false,
+  'while previousSession is not — the automatic close reset that clock');
+t(/session #/.test(s.previousSession.nextSession),
+  'the synthetic text itself points back at the curated session');
+t(r.curatedResume !== undefined, 'resume surfaces it too');
+t(/CURATED HANDOFF/.test(r.curatedResume?.nextSession ?? ''), 'and the same text');
+console.log(out.join('\n'));
+ctx.close();
+" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
+
+# The hook output is what the USER reads, and it was showing the empty one.
+HOOKOUT=$(node "$CLI" hook session-start 2>/dev/null)
+echo "$HOOKOUT" | grep -q "CURATED HANDOFF" \
+  && pass "the SessionStart hook prints the curated handoff, not the synthetic one" \
+  || oops "the hook still shows the machine-written resume point"
+echo "$HOOKOUT" | grep -qi "automátic\|automatic\|automát" \
+  && pass "and says the newest close was automatic" \
+  || oops "the hook does not explain why an older note is being shown"
+
+# A curated close on top of auto-closes goes back to the normal path.
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession, endSession, resume } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+startSession(ctx, { module: '_general' });
+endSession(ctx, { summary: 'Wrote it up properly this time.', next_session: 'NEWEST CURATED: enable EXPORT_V2 everywhere.' });
+const r = resume(ctx, { module: '_general' });
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+t(/NEWEST CURATED/.test(r.nextSession), 'resume returns the newest curated handoff');
+t(r.curatedResume === undefined,
+  'and curatedResume is absent — nothing is buried, so nothing is duplicated');
+console.log(out.join('\n'));
+ctx.close();
+" | while IFS='|' read -r st msg; do [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"; done
 
 if [ "$FAILED" -gt 0 ]; then
   echo

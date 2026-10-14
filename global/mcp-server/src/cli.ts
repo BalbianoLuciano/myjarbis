@@ -34,7 +34,7 @@ import {
 import { computeCost, formatTable } from './tools/cost.js';
 import { generateModuleDiagram, isDiagramAuto } from './diagram/generate.js';
 import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
-import { autoCloseAll } from './tools/autoClose.js';
+import { autoCloseAll, AUTO_MARKER } from './tools/autoClose.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
@@ -1248,6 +1248,10 @@ const HOOK_I18N = {
     create_option: '· "nuevo módulo <name>" → create_module + start_session',
     settings_option: '· "settings" → cambiar language / persona',
     resume_label: (mod: string, ts: string) => `── Última "Retomar aquí" (${mod}, ${ts} UTC) ──`,
+    curated_label: (mod: string, ts: string, buried: number) =>
+      `── "Retomar aquí" REAL, escrita a mano (${mod}, ${ts} UTC) — estaba tapada por ${buried} cierre(s) automático(s) ──`,
+    curated_note:
+      'El último cierre del módulo lo escribió la máquina: quedó abierta una sesión y se cerró sola. Lo de abajo es la última bitácora escrita a mano. Es anterior, así que confirmá con el usuario qué pasó en el medio antes de actuar.',
     stale_warning: (threshold: number) =>
       `⚠ Esta bitácora tiene más de ${threshold} día(s). Antes de continuar, confirmá con el usuario que el contexto sigue siendo válido (ramas, PRs, decisiones que pudieron cambiar).`,
     memory_contract: '[MyJarbis] Memory: prefer mcp__myjarbis__* tools over ~/.claude/projects/<slug>/memory/*.md (the latter is fallback only).',
@@ -1268,6 +1272,10 @@ const HOOK_I18N = {
     create_option: '· "new module <name>" → create_module + start_session',
     settings_option: '· "settings" → change language / persona',
     resume_label: (mod: string, ts: string) => `── Last "Resume here" (${mod}, ${ts} UTC) ──`,
+    curated_label: (mod: string, ts: string, buried: number) =>
+      `── The REAL "Resume here", human-written (${mod}, ${ts} UTC) — it was buried under ${buried} automatic close(s) ──`,
+    curated_note:
+      'The newest close in this module was machine-written: a session was left open and closed itself. What follows is the last handoff a person wrote. It is older, so confirm with the user what happened in between before acting on it.',
     stale_warning: (threshold: number) =>
       `⚠ This resume note is more than ${threshold} day(s) old. Before continuing, confirm with the user that the context still applies (branches, PRs, decisions that may have moved).`,
     memory_contract: '[MyJarbis] Memory: prefer mcp__myjarbis__* tools over ~/.claude/projects/<slug>/memory/*.md (the latter is fallback only).',
@@ -1288,6 +1296,10 @@ const HOOK_I18N = {
     create_option: '· "novo módulo <name>" → create_module + start_session',
     settings_option: '· "settings" → mudar language / persona',
     resume_label: (mod: string, ts: string) => `── Última "Retomar aqui" (${mod}, ${ts} UTC) ──`,
+    curated_label: (mod: string, ts: string, buried: number) =>
+      `── "Retomar aqui" REAL, escrita à mão (${mod}, ${ts} UTC) — estava coberta por ${buried} fechamento(s) automático(s) ──`,
+    curated_note:
+      'O último fechamento do módulo foi escrito pela máquina: uma sessão ficou aberta e se fechou sozinha. O que vem abaixo é a última retomada escrita por uma pessoa. É anterior, então confirme com o usuário o que aconteceu no meio antes de agir.',
     stale_warning: (threshold: number) =>
       `⚠ Esta nota de retomada tem mais de ${threshold} dia(s). Antes de continuar, confirme com o usuário que o contexto ainda se aplica (branches, PRs, decisões que podem ter mudado).`,
     memory_contract: '[MyJarbis] Memory: prefer mcp__myjarbis__* tools over ~/.claude/projects/<slug>/memory/*.md (the latter is fallback only).',
@@ -1364,10 +1376,30 @@ function runHookSessionStart(): void {
           `Skills materialized: ${mat.written.length + mat.unchanged.length} (${mat.written.length} written, ${mat.removed.length} stale removed).`,
         ];
         if (last?.next_session) {
-          blocks.push('', t.resume_label(target.name, stableDateLabel(last.ended_at)));
-          blocks.push(last.next_session);
           const staleAfter = readStaleThreshold(ctx.projectPath);
-          const staleness = computeStaleness(last.ended_at, staleAfter);
+          // When the newest close is machine-written, the handoff a person
+          // wrote is underneath it and this is the only place the user would
+          // ever see it. Print that one instead: the synthetic text says
+          // nothing the agent cannot re-derive, and printing both doubles the
+          // block for no gain.
+          const curated = last.next_session.startsWith(AUTO_MARKER)
+            ? ctx.db.sessions.findLastCuratedByModule(target.id)
+            : null;
+          const show = curated?.next_session ? curated : last;
+
+          if (curated?.next_session) {
+            const buried = ctx.db.sessions.countClosedAfterInModule(target.id, curated.id);
+            blocks.push('', t.curated_note);
+            blocks.push(
+              '',
+              t.curated_label(target.name, stableDateLabel(curated.ended_at), buried),
+            );
+          } else {
+            blocks.push('', t.resume_label(target.name, stableDateLabel(last.ended_at)));
+          }
+          blocks.push(show.next_session!);
+
+          const staleness = computeStaleness(show.ended_at, staleAfter);
           if (staleness?.stale) {
             // The warning copy intentionally uses the threshold (stable per
             // settings) and not the live day count — keeps the hook output
@@ -1410,20 +1442,52 @@ function runHookSessionStart(): void {
 
     // Surface the most recent next_session, if any (helps remember what
     // was being worked on last).
-    let mostRecent: { mod: string; ended_at: string; next: string } | null = null;
+    //
+    // The module is still picked by the most recent CLOSE, which is the
+    // signal for "what was being worked on last" — an automatic close counts
+    // as activity. What changes is the text: if that module's newest close is
+    // machine-written, the handoff a person wrote lives underneath it, and
+    // printing the synthetic one instead tells the user nothing.
+    let mostRecent:
+      | { mod: string; moduleId: number; ended_at: string; sessionId: number }
+      | null = null;
     for (const m of active) {
       const last = ctx.db.sessions.findLastClosedByModule(m.id);
       if (last?.ended_at && last.next_session) {
         if (!mostRecent || last.ended_at > mostRecent.ended_at) {
-          mostRecent = { mod: m.name, ended_at: last.ended_at, next: last.next_session };
+          mostRecent = {
+            mod: m.name,
+            moduleId: m.id,
+            ended_at: last.ended_at,
+            sessionId: last.id,
+          };
         }
       }
     }
     if (mostRecent) {
-      lines.push('', t.resume_label(mostRecent.mod, stableDateLabel(mostRecent.ended_at)));
-      lines.push(mostRecent.next);
+      const last = ctx.db.sessions.findById(mostRecent.sessionId)!;
+      const curated = last.next_session!.startsWith(AUTO_MARKER)
+        ? ctx.db.sessions.findLastCuratedByModule(mostRecent.moduleId)
+        : null;
+      const show = curated?.next_session ? curated : last;
+
+      if (curated?.next_session) {
+        const buried = ctx.db.sessions.countClosedAfterInModule(
+          mostRecent.moduleId,
+          curated.id,
+        );
+        lines.push('', t.curated_note);
+        lines.push(
+          '',
+          t.curated_label(mostRecent.mod, stableDateLabel(curated.ended_at), buried),
+        );
+      } else {
+        lines.push('', t.resume_label(mostRecent.mod, stableDateLabel(mostRecent.ended_at)));
+      }
+      lines.push(show.next_session!);
+
       const staleAfter = readStaleThreshold(ctx.projectPath);
-      const staleness = computeStaleness(mostRecent.ended_at, staleAfter);
+      const staleness = computeStaleness(show.ended_at, staleAfter);
       if (staleness?.stale) {
         lines.push('', t.stale_warning(staleAfter));
       }

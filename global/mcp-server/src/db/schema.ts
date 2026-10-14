@@ -776,6 +776,17 @@ export interface SessionRow {
   next_session: string | null;
 }
 
+/**
+ * Prefix stamped on every machine-written `summary` / `next_session`.
+ *
+ * It lives here rather than beside the code that writes it (tools/autoClose)
+ * because the db layer has to tell a generated resume point from a curated one
+ * in SQL — `sessions.findLastCuratedByModule` filters on it — and the db layer
+ * must not import from tools/. `tools/autoClose.ts` re-exports it, so
+ * `import { AUTO_MARKER } from './autoClose.js'` keeps working.
+ */
+export const AUTO_MARKER = '[auto]';
+
 export type ObservationKind =
   | 'decision'
   | 'gotcha'

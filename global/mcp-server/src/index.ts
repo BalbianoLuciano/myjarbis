@@ -160,7 +160,10 @@ function buildToolRegistry(): RegisteredTool[] {
       description:
         'Opens a session in the given module and loads project_context + ' +
         'module_context + the previous session\'s next_session ("Retomar ' +
-        'aquí"). Returns session_id and the full bootstrap context.',
+        'aquí"). Returns session_id and the full bootstrap context. When ' +
+        'previousSession.nextSession starts with "[auto]" it was machine-' +
+        'written and the real handoff comes back in `curatedResume` — read ' +
+        'that one.',
       inputSchema: startSessionInputSchema,
       handler: (ctx, args) => startSession(ctx, args),
     },
@@ -176,7 +179,9 @@ function buildToolRegistry(): RegisteredTool[] {
       name: 'resume',
       description:
         'Returns the last closed session\'s next_session ("Retomar aquí") ' +
-        'for the active module (or the named one). Read-only.',
+        'for the active module (or the named one). If that one is machine-' +
+        'written ("[auto]"), `curatedResume` carries the last handoff a human ' +
+        'wrote, which the automatic close had buried. Read-only.',
       inputSchema: resumeInputSchema,
       handler: (ctx, args) => resume(ctx, args),
     },

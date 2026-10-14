@@ -30,14 +30,24 @@
  * "resume here" that reads like a curated one is worse than none, because
  * the next session would follow it as an instruction rather than reading it
  * as a trace of what happened.
+ *
+ * And it must never be the ONLY thing the next session can see. A generated
+ * close is the newest close, so it wins every "last closed session" lookup —
+ * which means that without care it buries the curated handoff underneath it,
+ * one level deeper per auto-close. Two in a row is enough to make a real
+ * handoff unreachable. Hence `curatedPointer` here, and `curatedResume` in
+ * start_session / resume.
  */
 
 import { execFileSync } from 'child_process';
 import { ServerContext } from '../context.js';
 import { ObservationRow, SessionRow } from '../db/schema.js';
 
-/** Marks a summary or next_session as machine-written. */
-export const AUTO_MARKER = '[auto]';
+/** Marks a summary or next_session as machine-written. Defined in the db
+ *  layer, which needs it in SQL to tell curated closes from generated ones,
+ *  and re-exported here because this is where it is stamped. */
+export { AUTO_MARKER } from '../db/schema.js';
+import { AUTO_MARKER } from '../db/schema.js';
 
 export interface AutoCloseResult {
   sessionId: number;
@@ -136,17 +146,46 @@ export function composeSummary(params: {
 }
 
 /**
+ * A pointer back to the last handoff a human actually wrote.
+ *
+ * Without it, the synthetic text is a dead end: it is the newest close, so
+ * every "last closed session" lookup returns it, and the curated handoff
+ * underneath becomes unreachable without knowing to go look. Naming the
+ * session id and its date is enough for the next reader to find it, and
+ * stops short of inlining the text, which would blur the line between
+ * generated and curated that the rest of this file works to keep.
+ */
+function curatedPointer(lastCurated: SessionRow | null): string {
+  if (!lastCurated || !lastCurated.next_session) return '';
+  return (
+    `\n\nThe last "Retomar aquí" a human wrote is session #${lastCurated.id} ` +
+    `(closed ${lastCurated.ended_at} UTC). It is older than this note but it was ` +
+    `written on purpose — read it before deciding where things stand. ` +
+    `start_session and resume surface it as \`curatedResume\`.`
+  );
+}
+
+/**
  * Pick the best available "resume here".
  *
  * project_state first: it is the one field whose entire purpose is to say
  * where things stand, and if it is set it was written on purpose. The note
  * fallbacks are a trace, and say so.
+ *
+ * The fallbacks also carry a pointer to the last curated handoff; the
+ * project_state branch deliberately does not. A living state that was set on
+ * purpose is by definition more current than an older session's handoff, and
+ * pointing back at superseded instructions is how an agent ends up following
+ * them.
  */
 export function composeNextSession(params: {
   projectState: string | null;
   observations: ObservationRow[];
+  /** Last session whose next_session a human wrote, if any. */
+  lastCurated?: SessionRow | null;
 }): { text: string; source: AutoCloseResult['nextSessionSource'] } {
   const { projectState, observations } = params;
+  const pointer = curatedPointer(params.lastCurated ?? null);
 
   if (projectState && projectState.trim()) {
     return {
@@ -165,7 +204,8 @@ export function composeNextSession(params: {
         `${truncate(progress.title, 120)}\n\n` +
         `Read observation ${progress.id} in full, and confirm with the user where ` +
         `things actually stand before continuing — this was not written as an ` +
-        `instruction for you.`,
+        `instruction for you.` +
+        pointer,
       source: 'progress_note',
     };
   }
@@ -176,7 +216,8 @@ export function composeNextSession(params: {
       text:
         `${AUTO_MARKER} No living state and no progress note. The last thing ` +
         `recorded was:\n\n${latest.kind}: ${truncate(latest.title, 120)}\n\n` +
-        `Ask the user what they were doing; do not infer a plan from this.`,
+        `Ask the user what they were doing; do not infer a plan from this.` +
+        pointer,
       source: 'latest_note',
     };
   }
@@ -184,7 +225,8 @@ export function composeNextSession(params: {
   return {
     text:
       `${AUTO_MARKER} The previous session closed with nothing recorded. There is ` +
-      `no resume point — ask the user what they want to work on.`,
+      `no resume point — ask the user what they want to work on.` +
+      pointer,
     source: 'none',
   };
 }
@@ -206,6 +248,9 @@ export function autoCloseSession(
   const observations = ctx.db.observations.listBySession(session.id);
   const commits = commitsSince(ctx.projectPath, session.started_at);
   const state = ctx.db.projectState.get(project.id);
+  // The session being closed cannot match this lookup — it still has a NULL
+  // next_session — so it finds the previous human handoff, which is the point.
+  const lastCurated = ctx.db.sessions.findLastCuratedByModule(session.module_id);
 
   const summary = composeSummary({
     moduleName: moduleRow.name,
@@ -216,6 +261,7 @@ export function autoCloseSession(
   const next = composeNextSession({
     projectState: state?.content ?? null,
     observations,
+    lastCurated,
   });
 
   ctx.db.sessions.end(session.id, summary, next.text);

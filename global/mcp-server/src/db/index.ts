@@ -42,6 +42,7 @@ import {
   StepGate,
   ProviderRow,
   ProviderRole,
+  AUTO_MARKER,
 } from './schema.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 
@@ -1060,6 +1061,46 @@ export class MyJarbisDB {
             ORDER BY ended_at DESC, id DESC LIMIT 1`,
         ).get(moduleId) as SessionRow | undefined) ?? null
       );
+    },
+
+    /**
+     * Latest closed session whose next_session a HUMAN wrote — the real
+     * "Retomar aquí", skipping any machine-written ones on top of it.
+     *
+     * Needed because automatic closing competes with the curated handoff
+     * instead of replacing it. Observed in a real module: a curated close
+     * (3538 chars of handoff), then two sessions left open on later days,
+     * each auto-closed with a synthetic next_session of 292 and 124 chars.
+     * `findLastClosedByModule` correctly returns the most recent — which is
+     * the emptiest of the three — and the handoff sits two links down where
+     * nothing surfaces it. Every extra auto-close buries it one level more.
+     *
+     * `substr` rather than `NOT LIKE '[auto]%'`: SQLite does not treat `[` as
+     * a wildcard, but the next reader of this line should not have to know
+     * that to be sure it is right.
+     */
+    findLastCuratedByModule: (moduleId: number): SessionRow | null => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
+      return (
+        (this.prep(
+          `SELECT * FROM sessions
+            WHERE module_id = ? AND ended_at IS NOT NULL AND next_session IS NOT NULL
+              AND substr(next_session, 1, ?) <> ?
+            ORDER BY ended_at DESC, id DESC LIMIT 1`,
+        ).get(moduleId, AUTO_MARKER.length, AUTO_MARKER) as SessionRow | undefined) ?? null
+      );
+    },
+
+    /** How many closed sessions sit on top of `sessionId` in this module —
+     *  i.e. how deep a curated handoff has been buried. */
+    countClosedAfterInModule: (moduleId: number, sessionId: number): number => {
+      this.assertInScope(this.projectIdOfModule(moduleId), 'session lookup');
+      const row = this.prep(
+        `SELECT COUNT(*) AS n FROM sessions
+          WHERE module_id = ? AND id > ? AND ended_at IS NOT NULL
+            AND next_session IS NOT NULL`,
+      ).get(moduleId, sessionId) as { n: number };
+      return row.n;
     },
 
     /** Currently-open session (no ended_at) for a module, if any. */
