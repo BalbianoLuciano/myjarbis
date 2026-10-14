@@ -47,6 +47,21 @@ FAILED=0
 pass() { echo "    ✓ $1"; }
 oops() { echo "    ✗ $1" >&2; FAILED=$((FAILED + 1)); }
 
+# Assertions produced by a node block are read back through a FILE, not a pipe.
+#
+# `cmd | while read ... oops` puts the loop in a subshell, so every
+# FAILED=$((FAILED+1)) inside it is discarded when the subshell exits. The
+# suite printed the ✗ lines and then exited 0 anyway, which means none of the
+# assertions made this way could ever turn the suite red. Found by reverting a
+# real fix and watching six ✗ lines still report "all assertions passed".
+ASSERTS="$WORK/asserts.out"
+read_asserts() {
+  while IFS='|' read -r st msg; do
+    [ "$st" = "PASS" ] && pass "$msg" || oops "$msg"
+  done < "$ASSERTS"
+}
+
+
 newrepo() {
   mkdir -p "$1" && cd "$1" && git init -q .
   git config user.email t@example.com && git config user.name Test
@@ -204,6 +219,64 @@ if [ "$SEEDPATH" = "$SHARED" ]; then
 else
   oops "opened $SEEDPATH, wanted $SHARED"
 fi
+
+# ── [6] the v0.1 bump preserves settings it does not own ──────────
+#
+# `bumpSettingsToV02` took the old settings as an argument and then ignored
+# it, writing a hardcoded template over the file. Anything it did not happen
+# to know about was deleted mid-migration — and what it does not know about
+# is exactly what a person set by hand. On the twin project it removed
+# `language: "es"` (the SessionStart hook started printing in English) and
+# `brain.auto_export_on_session_end` (the NDJSON dump stopped refreshing, so
+# the repo shipped a brain a week stale without a word).
+echo "[6] migrating a v0.1 layout keeps the keys the bump does not own"
+
+V1="$WORK/v1-proj"
+newrepo "$V1"
+mkdir -p "$V1/.myjarbis/config"
+cat > "$V1/.myjarbis/config/settings.json" <<'JSON'
+{
+  "project": { "name": "v1-proj", "framework": "laravel" },
+  "mcp": { "enabled": true },
+  "context": { "autoGenerateCodebase": false, "maxCodebaseSize": "10MB" },
+  "language": "es",
+  "story_pattern": "CUSTOM-\\d+",
+  "brain": { "auto_export_on_session_end": true },
+  "something_invented_later": { "deep": ["a", "b"] }
+}
+JSON
+
+# A genuine v0.1 layout: .myjarbis/ exists and there is no memory.db beside
+# it. That is the only shape that still migrates.
+cd "$V1"
+if node --input-type=module -e "
+import { migrateProject } from '$B/db/migrate.js';
+const r = migrateProject('$V1');
+if (!r.migrated) { console.error('did not migrate:', r.reason); process.exit(1); }
+" >"$WORK/v1.log" 2>&1; then
+  pass "a real v0.1 layout still migrates"
+else
+  oops "the v0.1 layout did not migrate: $(tail -2 "$WORK/v1.log")"
+fi
+
+node -e "
+const s = require('$V1/.myjarbis/config/settings.json');
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+t(s.language === 'es', 'language survives the bump');
+t(s.brain && s.brain.auto_export_on_session_end === true, 'brain.auto_export_on_session_end survives');
+t(s.mcp && s.mcp.enabled === true, 'the v0.1 mcp block survives');
+t(s.context && s.context.maxCodebaseSize === '10MB', 'the v0.1 context block survives');
+t(s.something_invented_later && s.something_invented_later.deep.length === 2,
+  'a key this code has never heard of survives — the spread, not an allow-list');
+t(s.story_pattern === 'CUSTOM-\\\\d+', 'an overridden story_pattern is not reset to the default');
+t(s.version === '0.2.0', 'version IS imposed — that is what a bump is for');
+t(s.project && s.project.name === 'v1-proj', 'project is imposed from the resolved name');
+t(s.skills && s.skills.materialize_on_session_start === true, 'defaults still land for keys that were absent');
+t(s.auto_module_select_when_single === true, 'and for the booleans that were absent');
+console.log(out.join('\n'));
+" > "$ASSERTS"
+read_asserts
 
 echo
 if [ "$FAILED" -eq 0 ]; then

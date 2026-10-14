@@ -936,22 +936,54 @@ function readLegacySettings(myjarbisDir: string): LegacySettings {
   }
 }
 
+/**
+ * Raise settings.json to the v0.2 shape WITHOUT discarding what is there.
+ *
+ * This took `legacy` and then ignored it, building the new object from a
+ * hardcoded template and writing it over the old file. Everything the
+ * function did not happen to know about was deleted, silently, during a
+ * migration — and the keys it does not know about are the ones a person set
+ * on purpose. On this repository's own twin project it removed
+ * `language: "es"`, so the SessionStart hook started printing in English, and
+ * `brain.auto_export_on_session_end`, so the NDJSON dump stopped refreshing
+ * and the repo shipped a brain frozen a week earlier without saying so.
+ *
+ * The shape below is the one `init-project` already uses (cli.ts): spread
+ * what exists, then take ownership of only the fields this bump is actually
+ * about. `version` and `project` are imposed — that is what a bump is for.
+ * Everything else defers to the existing value, and unknown keys survive by
+ * virtue of the spread rather than by being enumerated here, which is the
+ * part that keeps working when the next key is added.
+ */
 function bumpSettingsToV02(
   myjarbisDir: string,
   legacy: LegacySettings,
   projectName: string,
   framework: string | null,
 ): void {
-  const newSettings: V02Settings = {
+  const skills = (legacy.skills ?? {}) as Partial<V02Settings['skills']>;
+  // V02Settings plus an index signature, NOT `LegacySettings & V02Settings`:
+  // the two disagree about `project.framework` (`string` vs `string | null`)
+  // and intersecting them makes null unassignable.
+  const newSettings: V02Settings & Record<string, unknown> = {
+    ...legacy,
     version: '0.2.0',
     project: { name: projectName, framework },
-    shared: false,
-    search_default_scope: 'module',
-    story_pattern: '[A-Z]+-S?\\d+(\\.\\d+)?',
-    auto_module_select_when_single: true,
+    shared: typeof legacy.shared === 'boolean' ? legacy.shared : false,
+    search_default_scope:
+      legacy.search_default_scope === 'project' ? 'project' : 'module',
+    story_pattern:
+      typeof legacy.story_pattern === 'string' && legacy.story_pattern
+        ? legacy.story_pattern
+        : '[A-Z]+-S?\\d+(\\.\\d+)?',
+    auto_module_select_when_single:
+      typeof legacy.auto_module_select_when_single === 'boolean'
+        ? legacy.auto_module_select_when_single
+        : true,
     skills: {
-      materialize_on_session_start: true,
-      cleanup_module_skills_on_session_end: false,
+      materialize_on_session_start: skills.materialize_on_session_start ?? true,
+      cleanup_module_skills_on_session_end:
+        skills.cleanup_module_skills_on_session_end ?? false,
     },
   };
   const configDir = path.join(myjarbisDir, 'config');
