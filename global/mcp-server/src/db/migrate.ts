@@ -25,6 +25,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { homedir } from 'os';
 import { MyJarbisDB } from './index.js';
+import { globalDbPath, siloDbPath } from '../resolve.js';
 import { SCHEMA_VERSION } from './schema.js';
 
 export interface MigrationResult {
@@ -698,8 +699,13 @@ export function migrateProject(projectPath: string): MigrationResult {
   let skills = 0;
 
   db.tx(() => {
-    const project = db.projects.upsertByPath(projectName, projectPath, framework ?? undefined);
+    const project = db.projects.upsertByPath({
+      name: projectName,
+      path: projectPath,
+      framework: framework ?? undefined,
+    });
     projectId = project.id;
+    db.bindScope({ kind: 'project', id: project.id });
 
     const generalModule = db.modules.upsertByName(
       project.id,
@@ -809,25 +815,47 @@ export function migrateProject(projectPath: string): MigrationResult {
 }
 
 /**
- * Seed a brand-new v0.2 project (no v0.1 to migrate). Used by
+ * Seed a brand-new project (no v0.1 to migrate). Used by
  * `myjarbis init` after creating .myjarbis/. Idempotent.
+ *
+ * `isolation` defaults to 'silo' — its own memory.db next to the project.
+ * Callers that want the project to live in the shared brain pass 'shared'
+ * explicitly, so the safe layout is what you get by omission.
  */
 export function seedNewProject(
   projectPath: string,
-  opts: { name?: string; framework?: string },
-): { projectId: number; moduleId: number; skills: number } {
-  const db = MyJarbisDB.open(projectPath);
+  opts: {
+    name?: string;
+    framework?: string;
+    orgId?: number | null;
+    gitRemote?: string | null;
+    isolation?: 'silo' | 'shared';
+  },
+): { projectId: number; moduleId: number; skills: number; dbPath: string } {
+  // 'shared' projects live in the global brain; 'silo' keeps its own file
+  // next to the project, which is what every pre-v0.3 project already has.
+  const isolation = opts.isolation ?? 'silo';
+  const dbPath = isolation === 'shared' ? globalDbPath() : siloDbPath(projectPath);
+  const db = MyJarbisDB.openAtPath(dbPath);
   let projectId = 0;
   let moduleId = 0;
   let skills = 0;
 
   db.tx(() => {
-    const project = db.projects.upsertByPath(
-      opts.name ?? path.basename(projectPath),
-      projectPath,
-      opts.framework,
-    );
+    const project = db.projects.upsertByPath({
+      name: opts.name ?? path.basename(projectPath),
+      path: projectPath,
+      framework: opts.framework,
+      orgId: opts.orgId ?? null,
+      gitRemote: opts.gitRemote ?? null,
+      isolation,
+    });
     projectId = project.id;
+
+    // Everything below writes project-owned rows, which the DB refuses to
+    // do without a bound scope. Seeding is the moment the scope becomes
+    // knowable, so bind it here.
+    db.bindScope({ kind: 'project', id: project.id });
 
     const general = db.modules.upsertByName(project.id, '_general', 'Default cross-cutting module');
     moduleId = general.id;
@@ -845,7 +873,7 @@ export function seedNewProject(
   });
 
   db.close();
-  return { projectId, moduleId, skills };
+  return { projectId, moduleId, skills, dbPath };
 }
 
 // ─────────────────────────────────────────────────────────────────────

@@ -1,74 +1,272 @@
 #!/bin/bash
-
 #
-# MyJarbis Update Script
+# MyJarbis Update
 #
-# Updates the global MyJarbis installation:
-# 1. Pulls latest changes (if git repo)
-# 2. Rebuilds MCP server
-# 3. Optionally updates templates in existing projects
+# WHY THIS WAS REWRITTEN
+# ----------------------
+# The previous version did nothing useful. It ran `git pull` inside
+# $HOME/.myjarbis-global — but install.sh populates that directory with
+# `cp -r`, so it is a COPY, not a clone. There is no remote to pull from, so
+# every run printed "not a git repository, skipping update" and then rebuilt
+# the code that was already there. It also never re-copied bin/ or
+# templates/, which is where hook scripts live, so a new hook could never
+# reach an existing installation.
 #
+# This version:
+#   1. pulls the source checkout (recorded at install time in .source)
+#   2. re-syncs code + templates + bin into the install dir, WITHOUT
+#      touching the project registry
+#   3. reinstalls dependencies and rebuilds
+#   4. reports which registered projects are out of date — hook scripts and
+#      schema version — and refreshes their hooks with --projects
+#
+# It never touches a project's memory.db. Schema changes are
+# `myjarbis migrate`, which backs up first.
 
-set -e
+set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
+RED='\033[38;5;88m'
+BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
-# Paths
-INSTALL_DIR="$HOME/.myjarbis-global"
+INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$HOME/.myjarbis-global}"
+REGISTRY_FILE="${MYJARBIS_REGISTRY:-$INSTALL_DIR/projects-registry.json}"
 
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  MyJarbis Update"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
+step() { echo -e "${RED}[$1/5]${NC}  ${BOLD}$2${NC}"; }
+ok()   { echo "       OK"; }
+note() { echo -e "       ${DIM}$1${NC}"; }
+warn() { echo -e "       ${RED}WARN${NC}  $1"; }
+fail() { echo -e "       ${RED}${BOLD}FAIL${NC}  $1"; }
 
-# Check if installed
+SYNC_PROJECTS=""
+SOURCE_OVERRIDE=""
+SKIP_PULL=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --projects)   SYNC_PROJECTS=1 ;;
+        --no-pull)    SKIP_PULL=1 ;;
+        --from=*)     SOURCE_OVERRIDE="${arg#*=}" ;;
+        --help|-h)
+            echo "Usage: myjarbis update [--projects] [--no-pull] [--from=<path>]"
+            echo
+            echo "  --projects      Also refresh hook scripts + commands in every"
+            echo "                  registered project (never touches memory.db)."
+            echo "  --no-pull       Re-sync from the local checkout without pulling."
+            echo "  --from=<path>   Use this checkout as the source and remember it."
+            exit 0
+            ;;
+        *) echo "Unknown option: $arg (try --help)" >&2; exit 1 ;;
+    esac
+done
+
+echo
+echo -e "${RED}${BOLD}MyJarbis${NC} · update"
+echo
+echo -e "  ${BOLD}Install${NC}  $INSTALL_DIR"
+
 if [ ! -d "$INSTALL_DIR" ]; then
-    echo -e "${RED}Error: MyJarbis is not installed${NC}"
-    echo "Run the installation script first"
+    fail "MyJarbis is not installed at $INSTALL_DIR"
+    note "clone the repo and run ./install.sh first"
     exit 1
 fi
 
-# Navigate to install directory
-cd "$INSTALL_DIR"
-
-# Check if it's a git repository
-if [ -d ".git" ]; then
-    echo -e "${BLUE}[1/3]${NC} Pulling latest changes..."
-    git pull origin main || git pull origin master
-    echo -e "${GREEN}✓${NC} Updated from repository"
-else
-    echo -e "${YELLOW}!${NC} Not a git repository, skipping update"
-    echo "To enable updates, clone MyJarbis instead of copying files"
+# ─── [1/5] locate the source checkout ─────────────────────────────
+step 1 "Locate the source checkout"
+SOURCE=""
+if [ -n "$SOURCE_OVERRIDE" ]; then
+    SOURCE="$SOURCE_OVERRIDE"
+elif [ -f "$INSTALL_DIR/.source" ]; then
+    SOURCE="$(cat "$INSTALL_DIR/.source")"
 fi
 
-# Reinstall dependencies
-echo ""
-echo -e "${BLUE}[2/3]${NC} Updating MCP server dependencies..."
+if [ -z "$SOURCE" ] || [ ! -d "$SOURCE" ]; then
+    fail "no usable source checkout"
+    note "this installation predates update support, or the checkout moved."
+    note "re-point it once and it will be remembered:"
+    note "  myjarbis update --from=/path/to/myjarbis"
+    exit 1
+fi
+SOURCE="$(cd "$SOURCE" && pwd)"
+if [ ! -d "$SOURCE/global" ] || [ ! -f "$SOURCE/install.sh" ]; then
+    fail "$SOURCE does not look like a MyJarbis checkout (no global/ or install.sh)"
+    exit 1
+fi
+printf '%s\n' "$SOURCE" > "$INSTALL_DIR/.source"
+note "$SOURCE"
+ok
+
+# ─── [2/5] pull ───────────────────────────────────────────────────
+step 2 "Pull latest changes"
+if [ -n "$SKIP_PULL" ]; then
+    note "--no-pull given, using the checkout as it is"
+elif [ -d "$SOURCE/.git" ]; then
+    BRANCH="$(git -C "$SOURCE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    if [ -n "$(git -C "$SOURCE" status --porcelain 2>/dev/null)" ]; then
+        warn "the checkout has uncommitted changes — not pulling"
+        note "installing what is in the working tree instead"
+    elif git -C "$SOURCE" pull --ff-only 2>&1 | sed 's/^/       /'; then
+        note "branch: $BRANCH"
+    else
+        warn "pull failed — installing the current checkout instead"
+    fi
+else
+    note "not a git checkout, using the files as they are"
+fi
+ok
+
+# ─── [3/5] sync files ─────────────────────────────────────────────
+step 3 "Sync code, templates and CLI"
+# The registry is state owned by this installation, and a developer's
+# checkout can contain a stale copy of it. Never overwrite it.
+REGISTRY_BACKUP=""
+if [ -f "$REGISTRY_FILE" ]; then
+    REGISTRY_BACKUP="$(mktemp)"
+    cp "$REGISTRY_FILE" "$REGISTRY_BACKUP"
+fi
+
+for item in "$SOURCE"/global/*; do
+    base="$(basename "$item")"
+    [ "$base" = "projects-registry.json" ] && continue
+    rm -rf "$INSTALL_DIR/$base.old" 2>/dev/null || true
+    cp -r "$item" "$INSTALL_DIR/"
+done
+cp -r "$SOURCE/bin" "$INSTALL_DIR/"
+# Stray brains a checkout may have accumulated are not part of the product.
+find "$INSTALL_DIR" -type d -name '.myjarbis' -prune -exec rm -rf {} + 2>/dev/null || true
+
+if [ -n "$REGISTRY_BACKUP" ]; then
+    cp "$REGISTRY_BACKUP" "$REGISTRY_FILE"
+    rm -f "$REGISTRY_BACKUP"
+    COUNT=$(node -e "
+      try {
+        const r = JSON.parse(require('fs').readFileSync('$REGISTRY_FILE','utf8'));
+        console.log(Object.keys(r.projects || {}).length);
+      } catch { console.log('?'); }
+    ")
+    note "registry preserved ($COUNT project(s))"
+fi
+ok
+
+# ─── [4/5] dependencies + build ───────────────────────────────────
+step 4 "Install dependencies and rebuild"
 cd "$INSTALL_DIR/mcp-server"
-npm install --silent
-echo -e "${GREEN}✓${NC} Dependencies updated"
+npm install --silent 2>&1 | grep -v "npm WARN" || true
+if npm run build 2>&1 | tail -1 | sed 's/^/       /'; then
+    if [ -f "build/index.js" ]; then
+        ok
+    else
+        fail "build produced no index.js"
+        exit 1
+    fi
+else
+    fail "build failed"
+    exit 1
+fi
 
-# Rebuild
-echo ""
-echo -e "${BLUE}[3/3]${NC} Rebuilding MCP server..."
-npm run build --silent
-echo -e "${GREEN}✓${NC} MCP server rebuilt"
+VERSION=$(node -e "console.log(require('$INSTALL_DIR/mcp-server/package.json').version)" 2>/dev/null || echo '?')
+SCHEMA=$(node --input-type=module -e "
+  import { SCHEMA_VERSION } from '$INSTALL_DIR/mcp-server/build/db/schema.js';
+  console.log(SCHEMA_VERSION);
+" 2>/dev/null || echo '?')
+note "mcp-server $VERSION · schema v$SCHEMA"
 
-# Success
-echo ""
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo -e "${GREEN}Update completed!${NC}"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-echo "MyJarbis has been updated to the latest version."
-echo ""
-echo "If you have Claude Code running, restart it to use the updated version:"
-echo "  - Close Claude Code"
-echo "  - Run: claude"
-echo ""
+# ─── [5/5] report (and optionally refresh) registered projects ────
+step 5 "Check registered projects"
+if [ ! -f "$REGISTRY_FILE" ]; then
+    note "no registry yet — nothing to check"
+    ok
+else
+    # Per project: are its hook scripts current, and is its brain on the
+    # current schema? Reported separately because they are fixed by
+    # different commands — one is a file copy, the other needs a backup.
+    REPORT=$(node --input-type=module -e "
+import * as fs from 'fs';
+import * as path from 'path';
+import { SCHEMA_VERSION } from '$INSTALL_DIR/mcp-server/build/db/schema.js';
+import { MyJarbisDB } from '$INSTALL_DIR/mcp-server/build/db/index.js';
+
+const reg = JSON.parse(fs.readFileSync('$REGISTRY_FILE', 'utf8'));
+const tmplHooks = '$INSTALL_DIR/templates/.claude-plugin/hooks/hooks.json';
+const wantHooks = fs.existsSync(tmplHooks) ? fs.readFileSync(tmplHooks, 'utf8') : null;
+
+for (const [name, p] of Object.entries(reg.projects || {})) {
+  const dir = p && p.path;
+  if (!dir || !fs.existsSync(dir)) { console.log(['GONE', name, dir || '?'].join('\t')); continue; }
+
+  const hooksPath = path.join(dir, '.claude-plugin', 'hooks', 'hooks.json');
+  let hooks = 'missing';
+  if (fs.existsSync(hooksPath)) {
+    hooks = wantHooks && fs.readFileSync(hooksPath, 'utf8') === wantHooks ? 'current' : 'stale';
+  }
+
+  let schema = 'none';
+  const dbPath = path.join(dir, '.myjarbis', 'memory.db');
+  if (fs.existsSync(dbPath)) {
+    const db = MyJarbisDB.openExisting(dbPath);
+    if (db) {
+      schema = db.schemaVersion === SCHEMA_VERSION ? 'current' : 'v' + db.schemaVersion;
+      db.close();
+    }
+  }
+  console.log(['OK', name, dir, hooks, schema].join('\t'));
+}
+" 2>/dev/null || true)
+
+    STALE_HOOKS=0
+    OLD_SCHEMA=0
+    while IFS=$'\t' read -r status name dir hooks schema; do
+        [ -z "${status:-}" ] && continue
+        if [ "$status" = "GONE" ]; then
+            note "$name — path is gone, skipping ($dir)"
+            continue
+        fi
+        LINE="$name"
+        [ "$hooks" != "current" ] && { LINE="$LINE · hooks $hooks"; STALE_HOOKS=$((STALE_HOOKS+1)); }
+        [ "$schema" != "current" ] && [ "$schema" != "none" ] && { LINE="$LINE · schema $schema"; OLD_SCHEMA=$((OLD_SCHEMA+1)); }
+        # "none" means the project has no brain yet, which is not staleness.
+        if [ "$hooks" = "current" ] && { [ "$schema" = "current" ] || [ "$schema" = "none" ]; }; then
+            LINE="$LINE · up to date"
+            [ "$schema" = "none" ] && LINE="$LINE (no brain yet)"
+        fi
+        note "$LINE"
+    done <<< "$REPORT"
+
+    if [ -n "$SYNC_PROJECTS" ] && [ "$STALE_HOOKS" -gt 0 ]; then
+        echo
+        note "refreshing hooks + commands in $STALE_HOOKS project(s)..."
+        while IFS=$'\t' read -r status name dir hooks schema; do
+            [ "${status:-}" != "OK" ] && continue
+            [ "$hooks" = "current" ] && continue
+            if [ -d "$INSTALL_DIR/templates/.claude-plugin" ]; then
+                rm -rf "$dir/.claude-plugin"
+                cp -r "$INSTALL_DIR/templates/.claude-plugin" "$dir/.claude-plugin"
+                chmod +x "$dir"/.claude-plugin/scripts/*.sh 2>/dev/null || true
+                note "  $name — hooks refreshed"
+            fi
+        done <<< "$REPORT"
+    elif [ "$STALE_HOOKS" -gt 0 ]; then
+        echo
+        warn "$STALE_HOOKS project(s) have out-of-date hooks"
+        note "refresh them with: myjarbis update --projects"
+        note "(it only replaces .claude-plugin/ — memory.db is never touched)"
+    fi
+
+    if [ "$OLD_SCHEMA" -gt 0 ]; then
+        echo
+        warn "$OLD_SCHEMA project(s) are on an older schema"
+        note "they keep working as-is. To upgrade, from inside each project:"
+        note "  myjarbis migrate --dry-run     # report, change nothing"
+        note "  myjarbis migrate               # backs up first, WAL included"
+        note "deliberately NOT automatic: a schema change should be something"
+        note "you chose, with a backup you know about."
+    fi
+    ok
+fi
+
+echo
+echo -e "${RED}${BOLD}Done${NC}"
+echo
+echo -e "  Restart Claude Code to pick up the new server and hooks."
+echo

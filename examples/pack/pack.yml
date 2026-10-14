@@ -1,0 +1,15 @@
+# Example org pack — fictional, and the only pack this repository contains.
+#
+# A real pack belongs in its own private repository: the skills, rules,
+# client names and tool wrappers that describe how one organization works
+# are deliberately NOT part of MyJarbis. This directory exists so the
+# contract is readable without having to read pack.ts.
+#
+# Register and apply it with:
+#   myjarbis org add example-co ./examples/pack
+#   myjarbis init --org=example-co      # new project
+#   myjarbis org sync example-co        # re-apply to every project of the org
+slug: example-co
+name: Example Co
+version: 1.0.0
+compatible_with: ">=0.3"

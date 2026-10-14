@@ -13,7 +13,7 @@ NC='\033[0m'
 
 # Paths
 INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$HOME/.myjarbis-global}"
-REGISTRY_FILE="$INSTALL_DIR/projects-registry.json"
+REGISTRY_FILE="${MYJARBIS_REGISTRY:-$INSTALL_DIR/projects-registry.json}"
 
 show_help() {
     echo
@@ -30,6 +30,14 @@ show_help() {
     echo -e "  ${BOLD}context${NC}    Refresh project context"
     echo -e "  ${BOLD}update${NC}     Update MyJarbis global installation"
     echo -e "  ${BOLD}import${NC}     Import a .md or .json into the project DB"
+    echo -e "  ${BOLD}brain${NC}      Export/import the DB as tracked NDJSON (export|import|status)"
+    echo -e "  ${BOLD}org${NC}        Org packs: add a pack, list orgs, sync it to every project (add|list|sync|diff)"
+    echo -e "  ${BOLD}kinds${NC}      List the allowed context kinds, or fold old labels onto them (list|migrate)"
+    echo -e "  ${BOLD}workflow${NC}   Inspect resolved workflows (list|show)"
+    echo -e "  ${BOLD}provider${NC}   Point tracker/forge/ci at a concrete tool (list|set)"
+    echo -e "  ${BOLD}state${NC}      Read or write the project's living state (get|set)"
+    echo -e "  ${BOLD}migrate${NC}    Upgrade a brain to the current schema, backing it up first"
+    echo -e "  ${BOLD}merge${NC}      Merge a project's brain into the shared one"
     echo -e "  ${BOLD}module${NC}     Manage modules (add/list)"
     echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable)"
     echo -e "  ${BOLD}stats${NC}      Show row counts per table"
@@ -171,16 +179,20 @@ case "${1:-help}" in
         ;;
 
     update)
+        # `shift` then "$@": without it the flags were dropped, so
+        # `myjarbis update --projects` silently ran a plain update.
+        shift
         if [ -f "$INSTALL_DIR/bin/myjarbis-update" ]; then
-            exec "$INSTALL_DIR/bin/myjarbis-update"
+            exec "$INSTALL_DIR/bin/myjarbis-update" "$@"
         elif [ -f "$INSTALL_DIR/../bin/myjarbis-update" ]; then
-            exec "$INSTALL_DIR/../bin/myjarbis-update"
+            exec "$INSTALL_DIR/../bin/myjarbis-update" "$@"
         fi
         echo -e "  ${RED}${BOLD}FAIL${NC}  myjarbis-update not found"
         exit 1
         ;;
 
-    import|module|skill|stats|cost|config|status|timeline|hook)
+    import|brain|module|skill|stats|cost|config|status|timeline|diagram|hook|\
+    org|kinds|workflow|provider|state|migrate|merge)
         # v0.2 subcommands delegated to the node CLI helper
         CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
         if [ ! -f "$CLI_JS" ]; then
@@ -196,7 +208,7 @@ case "${1:-help}" in
         ;;
 
     --version|-v)
-        echo "MyJarbis v0.2.0"
+        echo "MyJarbis v0.3.0"
         ;;
 
     *)

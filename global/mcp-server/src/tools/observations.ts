@@ -43,9 +43,29 @@ export const saveObservationInputSchema = {
       type: 'string' as const,
       description: 'Optional comma-separated tags for grouping in search.',
     },
+    topic_key: {
+      type: 'string' as const,
+      description:
+        'Optional stable identity for the SUBJECT of this note, shaped like a ' +
+        'path: "tracker/time-logging", "architecture/auth-model". Saving again ' +
+        'with the same topic_key UPDATES that note instead of adding a rival ' +
+        'one — use it for anything that has a current value rather than a ' +
+        'history. Call suggest_topic_key first to reuse an existing key.',
+    },
+    keep_history: {
+      type: 'boolean' as const,
+      description:
+        'With topic_key set, keep the previous note and link it via supersedes ' +
+        'instead of overwriting it. Default false.',
+    },
   },
   required: ['kind', 'title', 'content'],
 };
+
+/** A topic key is a slash-separated path of lowercase slugs. Enforced so
+ *  keys stay comparable; free-form keys drift into near-duplicates the same
+ *  way free-form context kinds did. */
+export const TOPIC_KEY_RE = /^[a-z0-9]+(?:[-_][a-z0-9]+)*(?:\/[a-z0-9]+(?:[-_][a-z0-9]+)*)*$/;
 
 const saveObservationArgsZ = z
   .object({
@@ -55,6 +75,16 @@ const saveObservationArgsZ = z
     story_local_id: z.string().min(1).max(50).optional(),
     files: z.string().min(1).optional(),
     tags: z.string().min(1).optional(),
+    topic_key: z
+      .string()
+      .min(1)
+      .max(120)
+      .regex(
+        TOPIC_KEY_RE,
+        'topic_key must be lowercase slugs separated by "/" (e.g. "tracker/time-logging")',
+      )
+      .optional(),
+    keep_history: z.boolean().optional(),
   })
   .strict();
 
@@ -65,6 +95,9 @@ export interface SaveObservationResult {
   kind: ObservationKind;
   title: string;
   createdAt: string;
+  /** 'updated' when an existing topic row was rewritten. */
+  status: 'inserted' | 'updated';
+  topicKey?: string;
   hint?: string;
 }
 
@@ -75,7 +108,7 @@ export function saveObservation(
   const args = saveObservationArgsZ.parse(rawArgs);
   const { sessionId, moduleId } = ctx.requireActiveSession();
 
-  const obs = ctx.db.observations.add({
+  const { row: obs, status } = ctx.db.observations.add({
     sessionId,
     kind: args.kind,
     title: args.title,
@@ -83,6 +116,8 @@ export function saveObservation(
     storyLocalId: args.story_local_id,
     files: args.files,
     tags: args.tags,
+    topicKey: args.topic_key ?? null,
+    keepHistory: args.keep_history,
   });
 
   const module = ctx.db.modules.findById(moduleId)!;
@@ -97,10 +132,122 @@ export function saveObservation(
     kind: obs.kind,
     title: obs.title,
     createdAt: obs.created_at,
+    status,
+    topicKey: obs.topic_key ?? undefined,
     hint:
-      args.kind === 'progress'
-        ? 'Tip: pair this with end_session if the story is done.'
-        : undefined,
+      status === 'updated'
+        ? `Updated the existing note for topic "${obs.topic_key}" instead of adding a second one.`
+        : args.kind === 'progress'
+          ? 'Tip: pair this with end_session if the story is done.'
+          : undefined,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// suggest_topic_key
+//
+// Offers the topic keys already in use before a new one is invented.
+// Without this step every session coins its own key for the same subject
+// and the update-in-place behaviour never actually triggers — the same
+// drift that made free-text context kinds useless.
+// ─────────────────────────────────────────────────────────────────────
+
+export const suggestTopicKeyInputSchema = {
+  type: 'object' as const,
+  properties: {
+    title: {
+      type: 'string' as const,
+      description: 'The title you were about to save.',
+    },
+    content: {
+      type: 'string' as const,
+      description: 'Optional body, used to improve the match.',
+    },
+  },
+  required: ['title'],
+};
+
+const suggestTopicKeyArgsZ = z
+  .object({ title: z.string().min(1), content: z.string().optional() })
+  .strict();
+
+export interface TopicSuggestion {
+  topicKey: string;
+  title: string;
+  updatedAt: string | null;
+  score: number;
+}
+
+export interface SuggestTopicKeyResult {
+  existing: TopicSuggestion[];
+  proposed: string;
+  hint: string;
+}
+
+/** Word-overlap score in [0,1] between a query and a candidate string. */
+function overlapScore(query: string, candidate: string): number {
+  const norm = (s: string) =>
+    s
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length > 2);
+  const q = new Set(norm(query));
+  const c = new Set(norm(candidate));
+  if (q.size === 0 || c.size === 0) return 0;
+  let shared = 0;
+  for (const w of q) if (c.has(w)) shared++;
+  return shared / Math.min(q.size, c.size);
+}
+
+/** Derive a plausible key from a title, as a starting point for the agent. */
+export function proposeTopicKey(title: string): string {
+  const slug = title
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .split('-')
+    .filter((w) => w.length > 2)
+    .slice(0, 4)
+    .join('-');
+  return slug || 'misc';
+}
+
+export function suggestTopicKey(
+  ctx: ServerContext,
+  rawArgs: unknown,
+): SuggestTopicKeyResult {
+  const args = suggestTopicKeyArgsZ.parse(rawArgs);
+  const project = ctx.requireProject();
+  const haystack = `${args.title} ${args.content ?? ''}`;
+
+  const existing = ctx.db.observations
+    .listTopicKeys(project.id)
+    .map((r) => ({
+      topicKey: r.topic_key,
+      title: r.title,
+      updatedAt: r.updated_at,
+      score: Math.max(
+        overlapScore(haystack, r.title),
+        overlapScore(haystack, r.topic_key.replace(/[/_-]/g, ' ')),
+      ),
+    }))
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+
+  return {
+    existing,
+    proposed: proposeTopicKey(args.title),
+    hint:
+      existing.length > 0
+        ? `Reuse "${existing[0].topicKey}" if this note is about the same subject; ` +
+          'saving with an existing key updates that note instead of competing with it.'
+        : 'No existing topic covers this. Use `proposed`, or omit topic_key if the ' +
+          'note is a one-off event rather than a subject with a current value.',
   };
 }
 

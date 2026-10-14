@@ -1,73 +1,105 @@
 #!/bin/bash
 #
-# E2E test: bootstrap of the prolicht project (12 .md + 1 JSON).
+# E2E test: bootstrapping a project from a tree of markdown + JSON docs.
 #
 # Verifies that `myjarbis import` correctly populates project_context,
-# module_context, and module_context-as-stories from a real-world
-# fixture (the user's actual prolicht/agents tree). Asserts:
-#   1. All imports succeed with status=inserted on first run.
-#   2. Stats show expected counts (152 stories from MM_Jira_Bulk.json,
-#      N project_context, N module_context).
+# module_context, and module_context-as-stories. Asserts:
+#   1. All imports succeed on the first run.
+#   2. Stats show the expected counts (project_context, module_context,
+#      and one story per entry in the JSON bulk file).
 #   3. Re-importing the same files yields status=unchanged (hash idempotency).
 #
-# Sources:
-#   - $PROLICHT_AGENTS (default /home/braianaxeltroncosodeveloper/dev/prolicht/agents)
-#   - The MyJarbis MCP server build at $MYJARBIS_INSTALL_DIR (default
-#     ../global from the repo root).
+# The fixture is generated here rather than read from a checkout on disk.
+# It used to point at a private project on one specific machine, which made
+# the test unrunnable anywhere else and leaked client names into the repo.
+#
+# Inputs:
+#   $MYJARBIS_INSTALL_DIR  MyJarbis install to test (default: ../global).
 #
 # Exits 0 on success, non-zero on any assertion failure.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROLICHT_AGENTS="${PROLICHT_AGENTS:-/home/braianaxeltroncosodeveloper/dev/prolicht/agents}"
 export MYJARBIS_INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$REPO_ROOT/global}"
 MJ="$REPO_ROOT/bin/myjarbis"
 CLI="$MYJARBIS_INSTALL_DIR/mcp-server/build/cli.js"
 SEED_HELPER="$MYJARBIS_INSTALL_DIR/mcp-server/build/db/migrate.js"
 
+STORY_COUNT=40
+
 # ─── preflight ───
-if [ ! -d "$PROLICHT_AGENTS/backend/prolicht" ]; then
-  echo "✗ Fixture not found at $PROLICHT_AGENTS/backend/prolicht"
-  echo "  Set PROLICHT_AGENTS=<path> to override."
-  exit 1
-fi
 if [ ! -f "$CLI" ]; then
   echo "✗ MyJarbis MCP build not found at $CLI — run: cd $MYJARBIS_INSTALL_DIR/mcp-server && npm run build"
   exit 1
 fi
 
 # ─── setup tmp project ───
-WORK="$(mktemp -d -t myjarbis-prolicht-test-XXXXXX)"
+WORK="$(mktemp -d -t myjarbis-import-test-XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 echo "→ work dir: $WORK"
 
-# Copy the relevant fixtures into the tmp project, preserving the
-# directory layout the user has in real life.
-mkdir -p "$WORK/agents/backend/prolicht/MM"
-SRC="$PROLICHT_AGENTS/backend/prolicht"
+DOCS="$WORK/agents/example-project"
+mkdir -p "$DOCS/Catalog"
 
-# Project-level docs
-for f in WORKFLOW.md PLAN.md REPORT-JIRA.md ERRORS.md DEFINICION_FUNCIONAL_APP.md CURRENT.md; do
-  if [ -f "$SRC/$f" ]; then
-    cp "$SRC/$f" "$WORK/agents/backend/prolicht/$f"
-  fi
-done
+# ─── generate the fixture ───
+# Six project-level docs and five module-level ones, sized like real docs so
+# the import path is exercised with multi-KB content rather than one-liners.
+write_doc() {
+  local path="$1" title="$2" body="$3"
+  {
+    echo "# $title"
+    echo
+    echo "$body"
+    echo
+    for i in $(seq 1 30); do
+      echo "## Section $i"
+      echo
+      echo "Paragraph $i of $title. It describes a rule the agent has to honour"
+      echo "when working on this area, with enough prose to be worth indexing."
+      echo
+    done
+  } > "$path"
+}
 
-# Module-level docs (MM)
-for f in WORKFLOW.md PLAN.md PROGRESS.md MM_Functional_Document.md MM_Use_Cases.md MM_Jira_Bulk.json; do
-  if [ -f "$SRC/MM/$f" ]; then
-    cp "$SRC/MM/$f" "$WORK/agents/backend/prolicht/MM/$f"
-  fi
-done
+write_doc "$DOCS/WORKFLOW.md"    "Workflow"              "How work flows through this project."
+write_doc "$DOCS/PLAN.md"        "Plan"                  "The current roadmap."
+write_doc "$DOCS/TRACKING.md"    "Tracking rules"        "How issues are tracked and reported."
+write_doc "$DOCS/ERRORS.md"      "Error log"             "Known failures and their resolutions."
+write_doc "$DOCS/SPEC.md"        "Functional spec"       "What the product is supposed to do."
+write_doc "$DOCS/CURRENT.md"     "Current state"         "Where the work stands today."
 
-# ─── seed project + module via seedNewProject (no init CLI yet in v0.2) ───
+write_doc "$DOCS/Catalog/WORKFLOW.md" "Catalog workflow" "Workflow specific to the Catalog module."
+write_doc "$DOCS/Catalog/PLAN.md"     "Catalog plan"     "Roadmap for the Catalog module."
+write_doc "$DOCS/Catalog/PROGRESS.md" "Catalog progress" "Story-by-story status for Catalog."
+write_doc "$DOCS/Catalog/FUNCTIONAL.md" "Catalog functional document" "Catalog behaviour in detail."
+write_doc "$DOCS/Catalog/USE_CASES.md"  "Catalog use cases"           "Catalog use cases, one per screen."
+
+# A bulk story export, shaped like what a tracker emits.
+node --input-type=module -e "
+  import { writeFileSync } from 'fs';
+  const stories = [];
+  for (let i = 1; i <= $STORY_COUNT; i++) {
+    stories.push({
+      id: 'CAT-' + i,
+      title: 'Story ' + i + ': catalog behaviour',
+      description: 'As a user I want behaviour ' + i + ' so that the catalog is usable.\n\nAcceptance criteria:\n- Given state A\n- When action ' + i + '\n- Then result ' + i,
+      status: i % 3 === 0 ? 'done' : 'todo',
+    });
+  }
+  writeFileSync('$DOCS/Catalog/stories.json', JSON.stringify({ stories }, null, 2));
+"
+echo "  ✓ fixture generated: 11 docs + $STORY_COUNT stories"
+
+# ─── seed project + module ───
 node --input-type=module -e "
 import { seedNewProject } from '$SEED_HELPER';
 import { MyJarbisDB } from '$MYJARBIS_INSTALL_DIR/mcp-server/build/db/index.js';
-const r = seedNewProject('$WORK', { name: 'prolicht-test', framework: 'laravel' });
+const r = seedNewProject('$WORK', { name: 'import-test', framework: 'generic' });
 const db = MyJarbisDB.open('$WORK');
-db.modules.create(r.projectId, 'MM', 'Media Manager');
+// Writes need a bound tenant scope; there is no implicit 'current project'.
+db.bindScope({ kind: 'project', id: r.projectId });
+db.modules.create(r.projectId, 'Catalog', 'Catalog vertical');
 db.close();
 console.log('seeded:', JSON.stringify(r));
 "
@@ -76,91 +108,84 @@ console.log('seeded:', JSON.stringify(r));
 cd "$WORK"
 import_md() {
   local path="$1" target="$2" kind="$3"
-  if [ -f "$path" ]; then
-    echo "  import_md $path → $target [$kind]"
-    "$MJ" import "$path" --target="$target" --kind="$kind" >/dev/null
-  fi
+  echo "  import_md $path → $target [$kind]"
+  "$MJ" import "$path" --target="$target" --kind="$kind" >/dev/null
 }
 import_json() {
   local path="$1" target="$2" kind="$3" mapping="$4"
-  if [ -f "$path" ]; then
-    echo "  import_json $path → $target [$kind] mapping=$mapping"
-    "$MJ" import "$path" --target="$target" --kind="$kind" --mapping="$mapping" >/dev/null
-  fi
+  echo "  import_json $path → $target [$kind] mapping=$mapping"
+  "$MJ" import "$path" --target="$target" --kind="$kind" --mapping="$mapping" >/dev/null
 }
 
 echo "→ first-pass imports"
-import_md  agents/backend/prolicht/WORKFLOW.md             project        workflow
-import_md  agents/backend/prolicht/PLAN.md                 project        plan
-import_md  agents/backend/prolicht/REPORT-JIRA.md          project        jira_rules
-import_md  agents/backend/prolicht/ERRORS.md               project        error_log
-import_md  agents/backend/prolicht/DEFINICION_FUNCIONAL_APP.md project    functional_spec
-import_md  agents/backend/prolicht/CURRENT.md              project        other
-import_md  agents/backend/prolicht/MM/WORKFLOW.md          module:MM      workflow
-import_md  agents/backend/prolicht/MM/PLAN.md              module:MM      plan
-import_md  agents/backend/prolicht/MM/PROGRESS.md          module:MM      workflow
-import_md  agents/backend/prolicht/MM/MM_Functional_Document.md module:MM functional_doc
-import_md  agents/backend/prolicht/MM/MM_Use_Cases.md      module:MM      use_cases
-import_json agents/backend/prolicht/MM/MM_Jira_Bulk.json   module:MM      story        'stories[]'
+import_md  agents/example-project/WORKFLOW.md            project    workflow
+import_md  agents/example-project/PLAN.md                project    plan
+import_md  agents/example-project/TRACKING.md            project    tracker_rules
+import_md  agents/example-project/ERRORS.md              project    error_log
+import_md  agents/example-project/SPEC.md                project    functional_spec
+import_md  agents/example-project/CURRENT.md             project    other
+import_md  agents/example-project/Catalog/WORKFLOW.md    module:Catalog  workflow
+import_md  agents/example-project/Catalog/PLAN.md        module:Catalog  plan
+import_md  agents/example-project/Catalog/PROGRESS.md    module:Catalog  workflow
+import_md  agents/example-project/Catalog/FUNCTIONAL.md  module:Catalog  functional_doc
+import_md  agents/example-project/Catalog/USE_CASES.md   module:Catalog  use_cases
+import_json agents/example-project/Catalog/stories.json  module:Catalog  story  'stories[]'
 
 # ─── stats assertions ───
-# Use node for JSON parsing (jq not guaranteed to be available).
+# Use node for JSON parsing (jq is not guaranteed to be available).
 echo "→ stats after first pass"
 STATS_FILE="$WORK/stats.json"
 "$MJ" stats > "$STATS_FILE"
 
-assert_stats() {
-  node --input-type=module -e "
-    import { readFileSync } from 'fs';
-    const s = JSON.parse(readFileSync('$STATS_FILE', 'utf-8'));
-    const stories = s.module_context.by_kind.story ?? 0;
-    const projectCtxTotal = s.project_context.total ?? 0;
-    const mmCount = s.module_context.by_module.MM ?? 0;
-    console.log(JSON.stringify({
-      project: s.project.name,
-      modules: s.modules.total,
-      project_context: projectCtxTotal,
-      module_context: s.module_context.total,
-      by_module: s.module_context.by_module,
-      stories,
-    }, null, 2));
-    if (stories !== 152) {
-      console.error('✗ Expected 152 stories from MM_Jira_Bulk.json, got ' + stories);
-      process.exit(1);
-    }
-    if (projectCtxTotal < 4) {
-      console.error('✗ Expected ≥4 project_context entries, got ' + projectCtxTotal);
-      process.exit(1);
-    }
-    if (mmCount < 5) {
-      console.error('✗ Expected ≥5 module_context entries on MM, got ' + mmCount);
-      process.exit(1);
-    }
-  "
-}
-assert_stats
+node --input-type=module -e "
+  import { readFileSync } from 'fs';
+  const s = JSON.parse(readFileSync('$STATS_FILE', 'utf-8'));
+  const stories = s.module_context.by_kind.story ?? 0;
+  const projectCtxTotal = s.project_context.total ?? 0;
+  const modCount = s.module_context.by_module.Catalog ?? 0;
+  console.log(JSON.stringify({
+    project: s.project.name,
+    modules: s.modules.total,
+    project_context: projectCtxTotal,
+    module_context: s.module_context.total,
+    by_module: s.module_context.by_module,
+    stories,
+  }, null, 2));
+  if (stories !== $STORY_COUNT) {
+    console.error('✗ Expected $STORY_COUNT stories from stories.json, got ' + stories);
+    process.exit(1);
+  }
+  if (projectCtxTotal < 6) {
+    console.error('✗ Expected ≥6 project_context entries, got ' + projectCtxTotal);
+    process.exit(1);
+  }
+  if (modCount < 5) {
+    console.error('✗ Expected ≥5 module_context entries on Catalog, got ' + modCount);
+    process.exit(1);
+  }
+"
 
 # ─── re-import idempotency ───
 echo "→ re-importing files (expect status=unchanged)"
-RE_OUT="$("$MJ" import agents/backend/prolicht/WORKFLOW.md --target=project --kind=workflow)"
+RE_OUT="$("$MJ" import agents/example-project/WORKFLOW.md --target=project --kind=workflow)"
 if ! echo "$RE_OUT" | grep -q '"unchanged"'; then
   echo "✗ Re-import did not return unchanged. Output:"
   echo "$RE_OUT"
   exit 1
 fi
 
-# Re-import JSON should yield 0 inserted, 0 updated, 152 unchanged.
+# Re-importing the bulk file should yield 0 inserted, 0 updated, all unchanged.
 RE_JSON_FILE="$WORK/reimport.json"
-"$MJ" import agents/backend/prolicht/MM/MM_Jira_Bulk.json --target=module:MM --kind=story --mapping='stories[]' > "$RE_JSON_FILE"
+"$MJ" import agents/example-project/Catalog/stories.json --target=module:Catalog --kind=story --mapping='stories[]' > "$RE_JSON_FILE"
 
 node --input-type=module -e "
   import { readFileSync } from 'fs';
   const r = JSON.parse(readFileSync('$RE_JSON_FILE', 'utf-8'));
   console.log('  re-import JSON: inserted=' + r.inserted + ' updated=' + r.updated + ' unchanged=' + r.unchanged);
-  if (r.inserted !== 0 || r.updated !== 0 || r.unchanged !== 152) {
-    console.error('✗ Expected re-import: 0/0/152, got ' + r.inserted + '/' + r.updated + '/' + r.unchanged);
+  if (r.inserted !== 0 || r.updated !== 0 || r.unchanged !== $STORY_COUNT) {
+    console.error('✗ Expected re-import: 0/0/$STORY_COUNT, got ' + r.inserted + '/' + r.updated + '/' + r.unchanged);
     process.exit(1);
   }
 "
 
-echo "✓ bootstrap-prolicht E2E PASSED"
+echo "✓ bootstrap-import E2E PASSED"

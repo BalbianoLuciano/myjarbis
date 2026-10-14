@@ -1,0 +1,19 @@
+# Provider templates. A project that already names a provider for a role
+# keeps its own — the pack supplies the default, the project decides.
+#
+# NEVER put a credential here. providers.config is included in
+# `myjarbis brain export`, which is meant to be committed, and a write-time
+# guard rejects anything that looks like a token. Store the LOCATION of a
+# secret instead.
+providers:
+  - role: tracker
+    kind: generic-tracker
+    config:
+      base_url: https://tracker.example.com
+      wrapper: example-tracker-cli
+      token_file: ~/.config/example-co/tracker-token
+
+  - role: forge
+    kind: generic-forge
+    config:
+      base_url: https://forge.example.com

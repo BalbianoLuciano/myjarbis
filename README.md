@@ -30,6 +30,43 @@ Every read/write goes through standard MCP tools + a local SQLite DB, so
 **any MCP-compatible client** (Cursor, OpenClaw, future agents) can sit
 on the same memory.
 
+MyJarbis is installed *on top of* Claude Code, and `/jarbis` is an
+explicit override, not a suggestion: what the project says outranks the
+agent's defaults, and a workflow gate is a stop rather than a hint.
+It does **not** override safety — no workflow authorises deleting
+without a backup or skipping a confirmation you'd want.
+
+---
+
+## What's new in v0.3
+
+v0.2 gave the memory a schema. v0.3 is about what the memory was
+*still* doing in prose — and the three habits that proves.
+
+| The habit that formed | Why it formed | v0.3 |
+|---|---|---|
+| A new note titled *"CORRECTS note 80"* | nothing could say "this replaces that" | `topic_key` — saving again **updates** the note |
+| *"Don't repeat: comments 4-29337–41"* written into a paragraph | the brain was being used as an idempotency ledger with no structure to be one | `find_by_ref` — a boolean, not a re-read |
+| A fresh *"RESUME HERE"* note every session | the current state had no home | `project_state` — one row, with an expiring lock |
+
+Plus the four structural ones:
+
+- **Org packs** — load how your team works instead of teaching it to each
+  project. `overrides/` replaces a baseline skill; `org sync` re-applies
+  to every project in one command.
+- **Workflows as data** — process as rows with org → project → user
+  inheritance, addressed by abstract capability (`tracker.comment`), so
+  the core never learns a vendor's name.
+- **A fixed taxonomy** — `kind` comes from a catalogue. Three real
+  projects had invented three vocabularies for the same seven ideas.
+- **Sessions that close themselves** — `summary` was NULL on 2 of 2
+  sessions in one real project. Now the harness closes them, in two
+  places, so it survives a killed terminal.
+
+Everything is additive. Existing projects keep working on their current
+schema until you run `myjarbis migrate`, which backs up first.
+[Full details below](#org-packs--load-how-your-team-works-dont-teach-it).
+
 ---
 
 ## Start in 30 seconds
@@ -107,15 +144,21 @@ vertical has its own workflow, plan, stories, and skills.
 MyJarbis models that explicitly — and **only loads the vertical you're in**:
 
 ```
-project
+org (optional — owns the pack: skills, workflows, taxonomy)
+ └ project
   ├── project_context (practices, deps, conventions — always loaded)
+  ├── project_state   (★ the living "resume here" — one row, not N notes)
+  ├── providers       (★ which tracker / forge / ci this project talks to)
+  ├── workflows       (★ process as rows, inherited org → project → user)
   ├── modules (verticals — you create them)
   │     ├── module_context (workflow, plan, stories, AC)
   │     │     └── progress  (★ per-row state, like a "Smoke/Commit" column)
-  │     ├── sessions (start → save observations → end)
+  │     ├── sessions (start → save observations → end, closed automatically)
   │     │     └── observations (decisions, gotchas, progress)
+  │     │           ├── topic_key (★ identity — saving again updates it)
+  │     │           └── refs      (★ links to commits / MRs / tickets)
   │     └── skills (module-level — only when this module is active)
-  └── skills (project-level — always loaded, the 10 baselines)
+  └── skills (project-level — always loaded: 10 baselines + any org pack)
 ```
 
 When you open Claude, the SessionStart hook asks which vertical you want.
@@ -177,6 +220,132 @@ myjarbis config persona mentor    # change how the agent talks back
 With an active module set, opening `claude` auto-resumes it and prints
 the curated "Resume here" — `/jarbis` then only acknowledges and
 continues (no tool calls, no menu render).
+
+> `search` is an **MCP tool**, not a CLI verb — the agent calls it; there
+> is no `myjarbis search`. Use `myjarbis status` and `myjarbis timeline`
+> from the shell.
+
+---
+
+## Org packs — load how your team works, don't teach it
+
+`myjarbis init` seeds ten generic skills. Everything specific to *your
+organization* — review rules, release checklist, how tickets get closed —
+used to be taught to each project by hand, which means it reliably wasn't.
+
+An **org pack** is a directory you keep in your own (private) repo:
+
+```
+<pack>/
+├── pack.yml            slug, name, compatible_with
+├── skills/*.md         skills to add
+├── overrides/*.md      skills that REPLACE a baseline of the same name
+├── context-kinds.yml   extra taxonomy labels
+├── workflows/*.yml     workflows at org scope
+└── providers.yml       tracker / forge / ci templates — never credentials
+```
+
+```bash
+myjarbis org add acme ~/work/acme-pack     # register + apply here
+myjarbis init --org=acme                   # new project, pack included
+myjarbis org sync acme                     # re-apply to EVERY project of the org
+myjarbis org diff acme                     # what sync would change (dry run)
+```
+
+<p align="center">
+  <img src="docs/media/06-org-sync.png" width="620" alt="myjarbis org sync — one rule change applied to every project">
+</p>
+
+Applying is idempotent (`created | updated | unchanged` per item) and ends
+by writing skills to `.claude/skills/` — the database alone configures
+nothing the agent can see. A project whose brain predates v0.3 is reported
+as skipped rather than silently missed.
+
+**MyJarbis ships no pack.** `examples/pack/` holds a fictional one so the
+contract is readable. Your rules, client names and tool wrappers stay out
+of this repo.
+
+---
+
+## Workflows as data, not prose
+
+Process written as prose gets duplicated and then contradicted. Workflows
+are rows, resolved **org → project → user** into one ordered list:
+
+```bash
+myjarbis workflow show ticket-close
+```
+
+<p align="center">
+  <img src="docs/media/05-workflow-resolved.png" width="620" alt="myjarbis workflow show — org, project and user layers resolved into one list">
+</p>
+
+A step names an **abstract capability** (`tracker.comment`), never a
+product. Which tool that means comes from the project's provider row — so
+one org workflow serves a client on one tracker and a client on another,
+and MyJarbis never learns a vendor's name.
+
+`gate=approve` means *stop and ask*. Conditions are decidable
+(`branch ~= release/*`, `framework in [laravel, express]`), not free text
+for the agent to interpret differently each session.
+
+```bash
+myjarbis provider set tracker acme-tracker --config='{"base_url":"https://..."}'
+```
+
+> Never put a credential in `--config`. It's rejected on write *and* on
+> export, because the brain dump is meant to be committed. Store the
+> location instead: `{"token_file": "~/.config/acme/token"}`.
+
+---
+
+## Notes that have identity
+
+Three habits formed in v0.2 because nothing better existed. v0.3 gives
+each one a column:
+
+| The habit | What replaces it |
+|---|---|
+| A new note titled *"CORRECTS note 80"* | `topic_key` — saving again **updates** that note |
+| *"Do not repeat: comments 4-29337–41"* in prose | `find_by_ref` — a boolean, not a paragraph |
+| A new *"RESUME HERE"* note every session | `project_state` — one row, with an expiring lock |
+
+```bash
+myjarbis state get          # the living state
+myjarbis kinds list         # the allowed context kinds
+```
+
+`kind` is a catalogue now, not free text — three projects once invented
+three vocabularies for the same seven ideas. An unknown kind is rejected
+*with the nearest match*; a pack can add its own.
+
+---
+
+## One brain or many
+
+Pre-v0.3 there was one `memory.db` per project. That still works and is
+still the default (`isolation = silo`). v0.3 adds a **shared brain** at
+`~/.myjarbis/memory.db` so a cross-cutting change is one action.
+
+The isolation that the filesystem used to provide is now enforced in code,
+and it is not optional:
+
+- scope is bound to the **connection**, not passed per query
+- a read with no scope **fails** rather than returning every project
+- passing another project's id is **refused**, not honoured
+- crossing projects needs an explicit scope **and a stated reason**
+
+`tests/v03-isolation.sh` asserts all four. Migration is opt-in and backs
+up first:
+
+```bash
+myjarbis migrate --dry-run              # report, touch nothing
+myjarbis migrate                        # upgrade this project's brain
+myjarbis merge --from <proj>/.myjarbis/memory.db --as acme-portal
+```
+
+Opening a brain never migrates it — merely *looking* for a project would
+otherwise rewrite the schema of files you never named.
 
 ---
 
@@ -251,7 +420,7 @@ myjarbis module add frontend
 
 myjarbis import agents/WORKFLOW.md         --target=project        --kind=workflow
 myjarbis import agents/backend/PLAN.md     --target=module:backend --kind=plan
-myjarbis import agents/backend/Jira.json   --target=module:backend --kind=story --mapping='stories[]'
+myjarbis import agents/backend/tickets.json --target=module:backend --kind=story --mapping='stories[]'
 ```
 
 Re-imports are **idempotent** (SHA-256 on content): unchanged → no-op,
@@ -354,7 +523,12 @@ into one call.
 <summary><b>The 10 baseline skills</b></summary>
 
 Materialized to `.claude/skills/myjarbis-<name>/SKILL.md` and loaded at
-session start:
+session start.
+
+> Claude Code identifies a skill by its **directory name**, not by the
+> `name:` in its frontmatter. So these appear as `myjarbis-<name>` — the
+> prefix is what makes them safe to clean up without touching skills you
+> wrote yourself.
 
 | Skill                  | What it teaches the agent                                    |
 |------------------------|--------------------------------------------------------------|
@@ -384,8 +558,8 @@ with `myjarbis skill edit interaction-style`.
 
 ```bash
 # project-level (always active here)
-myjarbis skill add jira-rules --content-from=docs/jira-rules.md \
-  --description="JIRA tracking rules for this project"
+myjarbis skill add tracker-rules --content-from=docs/tracker-rules.md \
+  --description="Issue-tracking rules for this project"
 
 # module-level (only active when working on MM)
 myjarbis skill add mm-pixel-perfect --module=MM \
@@ -426,25 +600,46 @@ context still applies before the agent proceeds.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  CLAUDE CODE (harness)                                           │
-│  • hooks  • /jarbis (only one)  • skills loaded from .claude/    │
+│  CLAUDE CODE (harness)                                          │
+│  hooks: SessionStart · UserPromptSubmit · Stop · SessionEnd     │
+│  /jarbis (the only slash command)  ·  skills read from .claude/ │
 └────────────────────────────────┬────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  MCP SERVER (Node/TS, ~/.myjarbis-global/mcp-server/)            │
-│  Always-loaded: current_project, list_modules, start/end_session,│
-│    resume, load_project_core, load_module, search,               │
-│    save_observation, update_progress                             │
-│  Deferred (ToolSearch): create_module, *_skills, import_*,       │
-│    set_interaction_style, search_code, get_context, update_memory│
+│  MCP SERVER (Node/TS, ~/.myjarbis-global/mcp-server/)           │
+│  Always-loaded (20):                                            │
+│    current_project · list_modules · start/end_session · resume  │
+│    load_project_core · load_module · search                     │
+│    save_observation · update_progress · suggest_topic_key       │
+│    update_observation · find_by_ref · add_ref                   │
+│    get/set_project_state · get_workflow · list_workflows        │
+│  Deferred, loaded on demand (12):                               │
+│    create_module · *_skills · import_* · set_interaction_style  │
+│    set_workflow_step · list_context_kinds · list/set_provider   │
+│    search_code · get_context · update_memory      (v0.1 aliases)│
 └────────────────────────────────┬────────────────────────────────┘
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  SQLite (.myjarbis/memory.db) — better-sqlite3 + FTS5            │
-│  projects → project_context · modules · skills                   │
-│  modules → module_context · sessions → observations              │
+│  SCOPE — bound to the connection, not passed per query          │
+│  {kind:'project', id} | {kind:'all', reason}                    │
+│  A read with no scope FAILS. Another project's id is REFUSED.   │
+└────────────────────────────────┬────────────────────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  SQLite — better-sqlite3 + FTS5                   (schema v4)   │
+│    <project>/.myjarbis/memory.db     isolation = silo (default) │
+│    ~/.myjarbis/memory.db             isolation = shared         │
+│                                                                 │
+│  orgs → projects → project_context · modules · skills           │
+│                  → project_state · providers · workflows        │
+│  modules → module_context · sessions → observations → refs      │
+│  context_kinds (the taxonomy)  ·  workflow_steps                │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+Resolution order for "which project is this?": an explicit `--project`,
+then the normalised **git remote**, then the nearest enclosing registered
+path — then failure. It never creates a brain; only `myjarbis init` does.
 
 Each project has its own `memory.db`. `shared: true` commits it to the
 repo (whole team loads the same context — `init --shared=true` warns that

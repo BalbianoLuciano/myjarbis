@@ -14,6 +14,7 @@ import { z } from 'zod';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ServerContext } from '../context.js';
+import { autoCloseStaleInModule, AUTO_MARKER } from './autoClose.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 import {
   ProjectContextRow,
@@ -130,6 +131,15 @@ export interface StartSessionResult {
      *  in the tool response. */
     staleAfterDays: number;
   } | null;
+  /** Set when a session left open in this module was closed retroactively
+   *  on the way in. Surfaced so the agent can say so rather than silently
+   *  presenting a machine-written resume point as if it were curated. */
+  autoClosedPrevious?: {
+    sessionId: number;
+    observations: number;
+    durationMinutes: number;
+    nextSessionSource: string;
+  };
   hint?: string;
 }
 
@@ -140,6 +150,15 @@ export function startSession(
   const args = startSessionArgsZ.parse(rawArgs);
   const project = ctx.requireProject();
   const module = ctx.requireModule(args.module);
+
+  // Close a session left open in this module before opening a new one.
+  //
+  // The SessionEnd hook normally handles this on exit, but no hook fires for
+  // a killed terminal, a crashed process or a reboot — and a guarantee that
+  // depends on a clean exit is not a guarantee. Closing retroactively here
+  // means `resume` and `list_modules` always have something to report, which
+  // is the whole reason the close matters.
+  const autoClosed = autoCloseStaleInModule(ctx, module.id);
 
   const session = ctx.db.sessions.start(module.id);
   ctx.setActiveSession(session.id, module.id);
@@ -212,7 +231,24 @@ export function startSession(
           staleAfterDays,
         }
       : null,
-    hint: previousClosed?.next_session
+    autoClosedPrevious: autoClosed
+      ? {
+          sessionId: autoClosed.sessionId,
+          observations: autoClosed.observations,
+          durationMinutes: autoClosed.durationMinutes,
+          nextSessionSource: autoClosed.nextSessionSource,
+        }
+      : undefined,
+    hint: autoClosed
+      ? `The previous session in "${module.name}" was left open and has just been ` +
+        `closed automatically, so previousSession.nextSession is MACHINE-WRITTEN ` +
+        `(it starts with "${AUTO_MARKER}"). Read it as a record of what happened, ` +
+        `not as an instruction: tell the user it was auto-closed and confirm where ` +
+        `things stand before acting on it.` +
+        (autoClosed.nextSessionSource === 'project_state'
+          ? ' It came from the project living state, which was set deliberately, so it is the most trustworthy source available.'
+          : ' It was derived from the last notes, so it may be incomplete.')
+      : previousClosed?.next_session
       ? (staleness?.stale
           ? `⚠ STALE RESUME — previousSession.nextSession is ${staleness.days} day(s) old (closed ${previousClosed.ended_at} UTC, threshold ${staleAfterDays}d). Before assuming it still applies, ask the user: branch state, open PRs, anything that moved since. THEN continue from previousSession.nextSession.`
           : `READ previousSession.nextSession FIRST — that is the canonical "Retomar aquí". Use it to greet the user. The catalog (projectContext, moduleContext, stories) is for on-demand lookup via search/load_module.`)

@@ -14,9 +14,36 @@ NC='\033[0m'
 # Paths
 INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$HOME/.myjarbis-global}"
 TEMPLATES_DIR="$INSTALL_DIR/templates"
-REGISTRY_FILE="$INSTALL_DIR/projects-registry.json"
+REGISTRY_FILE="${MYJARBIS_REGISTRY:-$INSTALL_DIR/projects-registry.json}"
 CURRENT_DIR="$(pwd)"
 PROJECT_NAME="$(basename "$CURRENT_DIR")"
+
+# ─── flags ────────────────────────────────────────────────────────
+# Kept parseable from scripts: init has to run unattended in CI and in the
+# test suite, where every `read` is a hang or an immediate `set -e` exit.
+ASSUME_YES="${MYJARBIS_ASSUME_YES:-}"
+SKIP_MEMORY=""
+ORG_SLUG="${MYJARBIS_ORG:-}"
+
+for arg in "$@"; do
+    case "$arg" in
+        --yes|-y)        ASSUME_YES=1 ;;
+        --skip-memory)   SKIP_MEMORY=1 ;;
+        --org=*)         ORG_SLUG="${arg#*=}" ;;
+        --help|-h)
+            echo "Usage: myjarbis init [--yes] [--skip-memory] [--org=<slug>]"
+            echo
+            echo "  --yes, -y       Do not prompt; accept reinitialization."
+            echo "  --skip-memory   Leave Claude Code's MEMORY.md untouched."
+            echo "  --org=<slug>    Seed this project from a registered org pack."
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $arg (try --help)" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # ─── helpers ──────────────────────────────────────────────────────
 section() { echo; echo -e "${RED}${BOLD}$1${NC}"; }
@@ -35,11 +62,18 @@ echo
 # ─── reinit guard ─────────────────────────────────────────────────
 if [ -d ".myjarbis" ]; then
     echo -e "${RED}WARN${NC}  .myjarbis/ already exists"
-    read -p "      Reinitialize and overwrite? (y/n) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "      Cancelled"
-        exit 0
+    if [ -n "$ASSUME_YES" ]; then
+        echo "      --yes given, reinitializing"
+    elif [ -t 0 ]; then
+        read -p "      Reinitialize and overwrite? (y/n) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            echo "      Cancelled"
+            exit 0
+        fi
+    else
+        echo "      Refusing to reinitialize without a terminal. Pass --yes to confirm."
+        exit 1
     fi
 fi
 
@@ -291,18 +325,35 @@ CLAUDE_PROJECT_SLUG=$(echo "$CURRENT_DIR" | sed 's|/|-|g')
 CLAUDE_MEMORY_DIR="$HOME/.claude/projects/$CLAUDE_PROJECT_SLUG/memory"
 TEMPLATE_SRC="$INSTALL_DIR/templates/auto-memory/MEMORY.md"
 
-mkdir -p "$CLAUDE_MEMORY_DIR"
+MEMORY_FILE="$CLAUDE_MEMORY_DIR/MEMORY.md"
 
-if [ ! -f "$TEMPLATE_SRC" ]; then
+if [ -n "$SKIP_MEMORY" ]; then
+    note "--skip-memory given, leaving MEMORY.md alone"
+elif [ ! -f "$TEMPLATE_SRC" ]; then
     warn "auto-memory template not found at $TEMPLATE_SRC — skipping"
-elif [ -f "$CLAUDE_MEMORY_DIR/MEMORY.md" ]; then
-    BACKUP="$CLAUDE_MEMORY_DIR/MEMORY.md.bak.$(date +%s)"
-    cp "$CLAUDE_MEMORY_DIR/MEMORY.md" "$BACKUP"
-    cp "$TEMPLATE_SRC" "$CLAUDE_MEMORY_DIR/MEMORY.md"
-    note "auto-memory replaced (backup: $(basename "$BACKUP"))"
 else
-    cp "$TEMPLATE_SRC" "$CLAUDE_MEMORY_DIR/MEMORY.md"
-    note "auto-memory pointer written under ~/.claude/projects/<slug>/memory/"
+    mkdir -p "$CLAUDE_MEMORY_DIR"
+
+    if [ ! -f "$MEMORY_FILE" ] || [ ! -s "$MEMORY_FILE" ]; then
+        cp "$TEMPLATE_SRC" "$MEMORY_FILE"
+        note "auto-memory pointer written under ~/.claude/projects/<slug>/memory/"
+    else
+        # MEMORY.md is Claude Code's index of its own memories, and it is
+        # shared with whatever session is running right now. Overwriting it
+        # destroys that index live, so we only ever append our pointer and
+        # leave the existing content as the file's head.
+        if grep -q "MyJarbis" "$MEMORY_FILE"; then
+            note "auto-memory pointer already present, left as is"
+        else
+            BACKUP="$MEMORY_FILE.bak.$(date +%s)"
+            cp "$MEMORY_FILE" "$BACKUP"
+            {
+                echo
+                cat "$TEMPLATE_SRC"
+            } >> "$MEMORY_FILE"
+            note "auto-memory pointer appended (backup: $(basename "$BACKUP"))"
+        fi
+    fi
 fi
 ok
 
@@ -329,10 +380,17 @@ note "persona:  $PERSONA_CHOICE"
 
 CLI_JS="$INSTALL_DIR/mcp-server/build/cli.js"
 if [ -f "$CLI_JS" ]; then
-    if node "$CLI_JS" init-project \
-        --name="$PROJECT_NAME" --framework="$FRAMEWORK" \
-        --language="$LANG_CHOICE" --persona="$PERSONA_CHOICE" >/dev/null; then
+    INIT_ARGS=(init-project
+        --name="$PROJECT_NAME" --framework="$FRAMEWORK"
+        --language="$LANG_CHOICE" --persona="$PERSONA_CHOICE")
+    if [ -n "$ORG_SLUG" ]; then
+        INIT_ARGS+=(--org="$ORG_SLUG")
+    fi
+    if node "$CLI_JS" "${INIT_ARGS[@]}" >/dev/null; then
         note "memory.db + 10 baseline skills + interaction-style"
+        if [ -n "$ORG_SLUG" ]; then
+            note "org pack: $ORG_SLUG"
+        fi
         ok
     else
         warn "init-project failed (DB will be created on first session)"

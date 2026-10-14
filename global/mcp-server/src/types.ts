@@ -118,6 +118,22 @@ export enum ErrorType {
   SESSION_NOT_ACTIVE = 'SESSION_NOT_ACTIVE',
   INVALID_INPUT = 'INVALID_INPUT',
   DB_ERROR = 'DB_ERROR',
+  // v0.3 additions
+  /** A read or write was attempted before a scope was bound. With a shared
+   *  DB this is the boundary between tenants, so it fails instead of
+   *  defaulting to "everything". */
+  SCOPE_NOT_RESOLVED = 'SCOPE_NOT_RESOLVED',
+  /** A row was requested that exists but belongs to another project. */
+  OUT_OF_SCOPE = 'OUT_OF_SCOPE',
+  /** The working directory maps to more than one registered project. */
+  AMBIGUOUS_PROJECT = 'AMBIGUOUS_PROJECT',
+  ORG_NOT_FOUND = 'ORG_NOT_FOUND',
+  PACK_ERROR = 'PACK_ERROR',
+  /** A providers.config payload carried something that looks like a secret. */
+  SECRET_IN_CONFIG = 'SECRET_IN_CONFIG',
+  INVALID_CONTEXT_KIND = 'INVALID_CONTEXT_KIND',
+  STATE_LOCKED = 'STATE_LOCKED',
+  WORKFLOW_NOT_FOUND = 'WORKFLOW_NOT_FOUND',
 }
 
 /**

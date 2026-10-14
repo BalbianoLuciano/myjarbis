@@ -16,6 +16,7 @@
 
 import * as path from 'path';
 import { ServerContext } from './context.js';
+import { MyJarbisDB } from './db/index.js';
 import { MyJarbisError } from './types.js';
 import { importMd, importJson } from './tools/import.js';
 import { listModules, createModule } from './tools/discovery.js';
@@ -32,6 +33,22 @@ import {
 } from './personas.js';
 import { computeCost, formatTable } from './tools/cost.js';
 import { generateModuleDiagram, isDiagramAuto } from './diagram/generate.js';
+import { exportBrain, importBrain, brainStatus } from './tools/brain.js';
+import { autoCloseAll } from './tools/autoClose.js';
+import { readPack, applyPack, PackApplyReport } from './org/pack.js';
+import { syncOrg } from './org/sync.js';
+import { readRegistry } from './org/registry.js';
+import { listContextKinds, migrateKinds } from './tools/kinds.js';
+import {
+  listWorkflowsTool,
+  getWorkflow,
+  listProviders,
+  setProvider,
+} from './tools/workflows.js';
+import { getProjectState, setProjectState } from './tools/state.js';
+import { upgradeBrain } from './db/upgrade.js';
+import { mergeBrain } from './db/merge.js';
+import { globalDbPath, siloDbPath, detectRemote } from './resolve.js';
 import { openInVscode } from './diagram/open.js';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -462,9 +479,11 @@ function runStatus(argv: string[]): void {
     ).get(project.id) as { n: number }).n;
     const skillsCount = (ctx.db.db.prepare('SELECT COUNT(*) AS n FROM skills WHERE project_id=?').get(project.id) as { n: number }).n;
     const sessAgg = ctx.db.db.prepare(
-      `SELECT COUNT(*) AS total, SUM(CASE WHEN ended_at IS NOT NULL THEN 1 ELSE 0 END) AS closed
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(CASE WHEN ended_at IS NOT NULL THEN 1 ELSE 0 END), 0) AS closed,
+              COALESCE(SUM(CASE WHEN ended_at IS NULL THEN 1 ELSE 0 END), 0) AS open
        FROM sessions s JOIN modules m ON m.id=s.module_id WHERE m.project_id=?`,
-    ).get(project.id) as { total: number; closed: number };
+    ).get(project.id) as { total: number; closed: number; open: number };
 
     let git: { branch: string | null; ahead: number | null } = { branch: null, ahead: null };
     try {
@@ -480,8 +499,25 @@ function runStatus(argv: string[]): void {
       // Not a git repo
     }
 
+    const org = project.org_id === null ? null : ctx.db.orgs.findById(project.org_id);
+    const brain = {
+      path: ctx.db.dbPath,
+      isolation: project.isolation,
+      schema_version: ctx.db.schemaVersion,
+      expected_schema_version: SCHEMA_VERSION,
+      needs_migration: ctx.db.needsMigration,
+    };
+
     const data = {
-      project: { name: project.name, path: project.path, framework: project.framework },
+      project: {
+        name: project.name,
+        path: project.path,
+        framework: project.framework,
+        git_remote: project.git_remote,
+        resolved_via: ctx.resolvedVia,
+      },
+      org: org ? { slug: org.slug, name: org.name, pack_rev: org.pack_rev } : null,
+      brain,
       active_module: active,
       active_module_status: activeMod?.status ?? null,
       active_module_description: activeMod?.description ?? null,
@@ -516,6 +552,24 @@ function runStatus(argv: string[]): void {
       const aheadStr = git.ahead === null ? '' : git.ahead > 0 ? ` ${red('· ' + git.ahead + ' ahead of origin')}` : ' · in sync';
       ptyKV('Branch', bold(git.branch) + aheadStr);
     }
+    if (ctx.resolvedVia) {
+      // Worth printing: "resolved by remote" vs "by path" is the difference
+      // between a project that follows the repo and one pinned to a path.
+      ptyKV('Resolved', dim('by ' + ctx.resolvedVia));
+    }
+    if (org) {
+      ptyKV('Org', red(bold(org.slug)) + dim(org.pack_rev ? ` · pack ${org.pack_rev}` : ''));
+    }
+    ptyKV('Brain', dim(brain.path) + dim(` · ${brain.isolation}`));
+    if (brain.needs_migration) {
+      ptyKV(
+        'Schema',
+        red(bold(`v${brain.schema_version}`)) +
+          red(` · expected v${brain.expected_schema_version} — run \`myjarbis migrate\``),
+      );
+    } else {
+      ptyKV('Schema', dim(`v${brain.schema_version}`));
+    }
 
     ptySection('Active module');
     if (active && activeMod) {
@@ -545,8 +599,15 @@ function runStatus(argv: string[]): void {
     ptyKV('Project ctx', String(projCtxCount) + dim(' entries'));
     ptyKV('Module ctx', `${modCtxCounts.reduce((a, m) => a + m.total, 0)} entries · ${totalStories} stories ${dim(`(${storiesWithProgress} with progress)`)}`);
     ptyKV('Observations', String(obsCount));
-    ptyKV('Skills', String(skillsCount) + dim(' baselines materialized'));
-    ptyKV('Sessions', `${sessAgg.closed} closed · ${sessAgg.total} total`);
+    ptyKV('Skills', String(skillsCount) + dim(' in the brain'));
+    ptyKV(
+      'Sessions',
+      `${sessAgg.closed} closed · ${sessAgg.total} total` +
+        (sessAgg.open > 0
+          ? dim(` · ${sessAgg.open} open`) +
+            (sessAgg.open > 1 ? red(' (auto-closed on exit)') : '')
+          : ''),
+    );
 
     console.log('');
   } finally {
@@ -618,7 +679,9 @@ function runSkill(argv: string[]): void {
       case 'edit': {
         const { positional, flags } = parseFlags(rest);
         const name = positional[0];
-        if (!name) fail('Usage: myjarbis skill edit <name> [--module=NAME]');
+        if (!name) {
+          fail('Usage: myjarbis skill edit <name> [--module=NAME] [--content-from=FILE]');
+        }
         const project = ctx.requireProject();
         const moduleName = flags.module as string | undefined;
         const moduleId = moduleName ? ctx.requireModule(moduleName).id : null;
@@ -626,16 +689,34 @@ function runSkill(argv: string[]): void {
         const skill = ctx.db.skills.findByName(project.id, moduleId, name);
         if (!skill) fail(`Skill "${name}" not found${moduleName ? ` in module "${moduleName}"` : ' (project-level)'}`);
 
-        const editor = process.env.EDITOR || process.env.VISUAL || 'nano';
-        const tmp = path.join(os.tmpdir(), `myjarbis-skill-${name}-${Date.now()}.md`);
-        fs.writeFileSync(tmp, skill.content, 'utf-8');
-        try {
-          execSync(`${editor} "${tmp}"`, { stdio: 'inherit' });
-        } catch {
-          fail(`Editor "${editor}" failed`);
+        // Non-interactive path. Without it `skill edit` always spawns $EDITOR,
+        // which makes it unusable from a script or a provisioning run: the
+        // editor inherits a non-tty stdin and dies with "Standard input is
+        // not a terminal".
+        const contentFrom = flags['content-from'] as string | undefined;
+        let newContent: string;
+
+        if (contentFrom) {
+          if (!fs.existsSync(contentFrom)) fail(`File not found: ${contentFrom}`);
+          newContent = fs.readFileSync(contentFrom, 'utf-8');
+        } else {
+          if (!process.stdin.isTTY) {
+            fail(
+              'skill edit needs a terminal to open $EDITOR. ' +
+                'Pass --content-from=FILE to edit without one.',
+            );
+          }
+          const editor = process.env.EDITOR || process.env.VISUAL || 'nano';
+          const tmp = path.join(os.tmpdir(), `myjarbis-skill-${name}-${Date.now()}.md`);
+          fs.writeFileSync(tmp, skill.content, 'utf-8');
+          try {
+            execSync(`${editor} "${tmp}"`, { stdio: 'inherit' });
+          } catch {
+            fail(`Editor "${editor}" failed`);
+          }
+          newContent = fs.readFileSync(tmp, 'utf-8');
+          fs.unlinkSync(tmp);
         }
-        const newContent = fs.readFileSync(tmp, 'utf-8');
-        fs.unlinkSync(tmp);
 
         if (newContent === skill.content) {
           console.error('No changes — skill not updated.');
@@ -836,11 +917,48 @@ function runCost(argv: string[]): void {
 // to .claude/skills/. Idempotent.
 // ─────────────────────────────────────────────────────────────────────
 
+
+/**
+ * Find the pack directory recorded for an org slug.
+ *
+ * `init --org=x` is normally run in a project that has never seen the pack,
+ * so the path has to come from somewhere else: the brain being seeded, then
+ * the shared brain, then any registered project. Returns null when the slug
+ * is unknown, and the caller warns rather than failing — a project created
+ * without its org layer is recoverable, a failed init is not.
+ */
+function resolvePackPath(ctx: ServerContext, slug: string): string | null {
+  const local = ctx.db.orgs.findBySlug(slug);
+  if (local?.pack_path && fs.existsSync(local.pack_path)) return local.pack_path;
+
+  const candidates = [globalDbPath(), ...readRegistry().map((e) => siloDbPath(e.path))];
+  for (const dbPath of candidates) {
+    if (!fs.existsSync(dbPath)) continue;
+    const db = MyJarbisDB.openExisting(dbPath);
+    if (!db) continue;
+    try {
+      if (db.schemaVersion < 4) continue;
+      const org = db.orgs.findBySlug(slug);
+      if (org?.pack_path && fs.existsSync(org.pack_path)) return org.pack_path;
+    } finally {
+      db.close();
+    }
+  }
+  return null;
+}
+
 function runInitProject(argv: string[]): void {
   const { flags } = parseFlags(argv);
   const name = flags.name as string | undefined;
   const framework = flags.framework as string | undefined;
-  if (!name) fail('Usage: cli.js init-project --name=<project> [--framework=<fw>] [--shared=true|false] [--language=EN|ES|PT] [--persona=concise|pair|mentor|reviewer]');
+  if (!name) {
+    fail(
+      'Usage: cli.js init-project --name=<project> [--framework=<fw>] ' +
+        '[--shared=true|false] [--language=EN|ES|PT] ' +
+        '[--persona=concise|pair|mentor|reviewer] [--org=<slug>] [--pack-path=<dir>] ' +
+        '[--isolation=silo|shared]',
+    );
+  }
 
   // Validate language + persona early (before any DB write)
   const language = parseLanguage(flags.language as string | undefined);
@@ -848,9 +966,31 @@ function runInitProject(argv: string[]): void {
 
   const projectPath = process.cwd();
 
+  const isolationRaw = (flags.isolation as string | undefined) ?? 'silo';
+  if (isolationRaw !== 'silo' && isolationRaw !== 'shared') {
+    fail(`--isolation must be "silo" or "shared" (got "${isolationRaw}")`);
+  }
+  const isolationMode = isolationRaw as 'silo' | 'shared';
+
   // 1. seedNewProject (creates memory.db + project + _general module +
   //    10 baseline skills, idempotent)
-  const seed = seedNewProject(projectPath, { name, framework });
+  //
+  // Record the git remote here. Without it `projects.git_remote` stays NULL
+  // and the whole resolve-by-remote chain is inert for every new project —
+  // it would only ever match projects whose remote some other command had
+  // happened to set. The remote is what lets the same repo resolve from a
+  // different path on a second machine, which is the case the portable brain
+  // dump exists for.
+  const detectedRemote = detectRemote(projectPath);
+  const seed = seedNewProject(projectPath, {
+    name,
+    framework,
+    gitRemote: detectedRemote,
+    // NOTE: distinct from --shared, which decides whether memory.db is
+    // git-ignored. This decides WHERE the rows live: its own file, or the
+    // global brain. Defaults to 'silo', the pre-v0.3 layout.
+    isolation: isolationMode,
+  });
 
   // 2. Write settings.json v0.2 schema (preserve existing fields if any)
   const myjarbisDir = path.join(projectPath, '.myjarbis');
@@ -899,8 +1039,9 @@ function runInitProject(argv: string[]): void {
 
   // 3. Compose interaction-style with the chosen language + persona
   //    (overwrites the placeholder default seeded by seedNewProject).
-  const ctx = ServerContext.initialize();
+  const ctx = ServerContext.initializeForSeed(projectPath);
   let materialized;
+  let packReport: PackApplyReport | undefined;
   try {
     addSkill(ctx, {
       name: 'interaction-style',
@@ -909,9 +1050,29 @@ function runInitProject(argv: string[]): void {
       trigger_pattern: 'always loaded; modulates tone, language, brevity',
     });
 
+    // 3b. Apply the org pack, if one was named. This is the whole point of
+    //     --org: the organization's skills, taxonomy, workflows and provider
+    //     defaults arrive with the project instead of being taught to it
+    //     afterwards, which is how two of three real projects ended up
+    //     without that layer at all.
+    const orgSlug = flags.org as string | undefined;
+    if (orgSlug) {
+      const packPath = (flags['pack-path'] as string | undefined) ?? resolvePackPath(ctx, orgSlug);
+      if (!packPath) {
+        console.error(
+          `[MyJarbis] WARNING: --org=${orgSlug} given but no pack is registered ` +
+            `under that slug and --pack-path was not passed. Project created ` +
+            `WITHOUT the org layer; run \`myjarbis org add ${orgSlug} <path>\` to add it.`,
+        );
+      } else {
+        packReport = applyPack(ctx, readPack(packPath), { skipMaterialize: true });
+      }
+    }
+
     // 4. Materialize project-level skills (no active session yet) so
     //    .claude/skills/myjarbis-interaction-style/SKILL.md reflects the
-    //    composed content immediately.
+    //    composed content immediately. Runs after the pack so overrides
+    //    reach disk, not just the database.
     materialized = materializeSkills(ctx, {});
   } finally {
     ctx.close();
@@ -933,7 +1094,15 @@ function runInitProject(argv: string[]): void {
   }
 
   printJson({
-    project: { id: seed.projectId, name, framework: framework ?? null, path: projectPath },
+    project: {
+      id: seed.projectId,
+      name,
+      framework: framework ?? null,
+      path: projectPath,
+      git_remote: detectedRemote,
+      isolation: isolationMode,
+    },
+    brain_path: seed.dbPath,
     schema_version: SCHEMA_VERSION,
     seeded: { module_id: seed.moduleId, baseline_skills: seed.skills },
     interaction_style: { language, persona, label: personaLabel(persona) },
@@ -942,7 +1111,20 @@ function runInitProject(argv: string[]): void {
       written: materialized.written.length,
       unchanged: materialized.unchanged.length,
       removed: materialized.removed.length,
+      // What matters is how many the agent can actually see on disk.
+      on_disk: materialized.written.length + materialized.unchanged.length,
     },
+    org: packReport
+      ? {
+          slug: packReport.org.slug,
+          rev: packReport.org.rev,
+          skills: packReport.skills.length,
+          context_kinds: packReport.contextKinds.length,
+          workflows: packReport.workflows.length,
+          providers: packReport.providers.length,
+          warnings: packReport.warnings,
+        }
+      : null,
     shared: settings.shared,
   });
 }
@@ -990,6 +1172,8 @@ function runHook(argv: string[]): void {
       return runHookPostCompaction();
     case 'session-stop':
       return runHookSessionStop();
+    case 'session-end':
+      return runHookSessionEnd();
     case 'user-prompt-submit':
       return runHookUserPromptSubmit(rest);
     case 'git-post-commit':
@@ -1297,6 +1481,73 @@ function runHookPostCompaction(): void {
   }
 }
 
+/**
+ * SessionEnd hook — close any open session, by default, without being asked.
+ *
+ * This is the SessionEnd event, NOT Stop. Stop fires after every single
+ * agent turn, so closing there would end the session after the first
+ * response. SessionEnd fires when the session actually ends.
+ *
+ * MyJarbis is installed on top of Claude Code so that this bookkeeping does
+ * not depend on the agent having remembered. Opt out with
+ * settings.session.auto_close_on_exit = false; it is on by default, because
+ * the failure it prevents (a session with no summary, so `resume` returns
+ * nothing and module listings lose their ordering signal) is silent.
+ */
+function runHookSessionEnd(): void {
+  const init = safeContext();
+  if (!init) return;
+  const { ctx } = init;
+  try {
+    const project = ctx.project;
+    if (!project) return;
+
+    const settings = readSettingsJson(ctx.projectPath);
+    const enabled = settings.session?.auto_close_on_exit !== false;
+
+    if (enabled) {
+      const closed = autoCloseAll(ctx);
+      for (const c of closed) {
+        console.error(
+          `[MyJarbis hook] auto-closed session #${c.sessionId} in "${c.module}" ` +
+            `(${c.observations} observation(s), ${c.durationMinutes}m, ` +
+            `resume point from ${c.nextSessionSource}).`,
+        );
+      }
+      if (closed.length === 0) {
+        console.error('[MyJarbis hook] no open session to close.');
+      }
+    }
+
+    // The dump has to be refreshed AFTER the close, or it ships a brain
+    // whose newest session still looks open.
+    if (settings.brain?.auto_export_on_session_end) {
+      try {
+        const res = exportBrain(ctx);
+        if (res.changed) {
+          console.error(`[MyJarbis hook] brain dump updated (${res.filesWritten.length} file(s)).`);
+        }
+      } catch (err) {
+        console.error(
+          `[MyJarbis hook] brain export failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    if (settings.skills?.cleanup_module_skills_on_session_end) {
+      const m = materializeSkills(ctx, {});
+      console.error(`[MyJarbis hook] cleanup removed ${m.removed.length} module skill(s).`);
+    }
+  } catch (err) {
+    // A hook must never be the reason a user cannot close their editor.
+    console.error(
+      `[MyJarbis hook] session-end failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  } finally {
+    ctx.close();
+  }
+}
+
 function runHookSessionStop(): void {
   const init = safeContext();
   if (!init) return;
@@ -1310,6 +1561,23 @@ function runHookSessionStop(): void {
       generateModuleDiagram(ctx);
     }
 
+    // Refresh the NDJSON dump before the open-session check below returns
+    // early: even an unclosed session should leave a dump that matches the
+    // DB, otherwise the next `git commit` ships a stale brain.
+    if (readSettingsJson(ctx.projectPath).brain?.auto_export_on_session_end) {
+      try {
+        const res = exportBrain(ctx);
+        if (res.changed) {
+          console.error(`[MyJarbis hook] brain dump updated (${res.filesWritten.length} file(s)).`);
+        }
+      } catch (err) {
+        // Never let a dump failure block the user from closing Claude.
+        console.error(
+          `[MyJarbis hook] brain export failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
     // If there's an open session, remind the agent to close it.
     const modules = ctx.db.modules.listByProject(project.id);
     for (const m of modules) {
@@ -1317,10 +1585,13 @@ function runHookSessionStop(): void {
       if (open) {
         const obs = ctx.db.observations.listBySession(open.id).length;
         console.log(
-          `═══ MyJarbis · session ending ═══\n` +
-          `Open session #${open.id} in module "${m.name}" (${obs} observations).\n` +
-          `Run \`/complete\` or call \`end_session(summary, next_session)\` before exiting\n` +
-          `so the next session can resume coherently.`,
+          `═══ MyJarbis · open session ═══\n` +
+          `Session #${open.id} in module "${m.name}" (${obs} observation(s)).\n` +
+          `It WILL be closed automatically on exit with a generated summary, so ` +
+          `nothing is lost either way.\n` +
+          `Calling \`end_session(summary, next_session)\` yourself is still better: ` +
+          `the generated one records what happened, it cannot say what you meant ` +
+          `to do next.`,
         );
         return;
       }
@@ -1671,6 +1942,15 @@ interface ProjectSettings {
      *  if none has landed in the last N+ minutes (bucketed per hour). */
     save_reminder_minutes?: number;
   };
+  /** NDJSON brain dump (see tools/brain.ts). Off unless opted in, because
+   *  it only makes sense for projects that version the dump instead of
+   *  the binary memory.db. */
+  brain?: {
+    /** Refresh `.myjarbis/brain/*.ndjson` when the Stop hook fires, so the
+     *  dump on disk always reflects the DB and `git status` shows real work
+     *  to commit without anyone remembering to export by hand. */
+    auto_export_on_session_end?: boolean;
+  };
   /** Session-related knobs. */
   session?: {
     /** Days after which a previous next_session is considered stale and
@@ -1678,6 +1958,20 @@ interface ProjectSettings {
      *  Default 7. Disable by setting a very large number; 0/negative are
      *  ignored (fall back to default). */
     stale_after_days?: number;
+    /**
+     * Close an open session automatically when the session ends, writing a
+     * generated summary and resume point.
+     *
+     * Default TRUE — the only setting here that defaults on. The failure it
+     * prevents is silent: a session that never closes leaves `resume` with
+     * nothing to return and strips `hasNextSession` / `lastSessionEndedAt`
+     * from every module, which is the signal used to pick up where you left
+     * off and to choose a module. Real projects had summary NULL on 2 of 2
+     * and 2 of 10 sessions, and nobody noticed until the data was counted.
+     *
+     * Set to false to go back to being reminded instead.
+     */
+    auto_close_on_exit?: boolean;
   };
   /** Living draw.io diagram. `auto` (default false — opt-in) regenerates the
    *  active module's diagram on save_observation/update_progress and on session
@@ -1819,13 +2113,327 @@ function runDiagram(argv: string[]): void {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Subcommand: brain (export / import / status)
+// ─────────────────────────────────────────────────────────────────────
+
+function runBrain(argv: string[]): void {
+  const { positional, flags } = parseFlags(argv);
+  const sub = positional[0];
+  if (!sub || !['export', 'import', 'status'].includes(sub)) {
+    fail('Usage: myjarbis brain <export|import|status> [--dir=<path>] [--yes] [--json]');
+  }
+
+  const dir = flags.dir as string | undefined;
+  const json = wantsJson(flags);
+  const ctx = ServerContext.initialize();
+
+  try {
+    if (sub === 'export') {
+      const res = exportBrain(ctx, { dir });
+      if (json) return printJson(res);
+      ptySection('MyJarbis · brain export');
+      ptyKV('Dir', res.dir);
+      ptyKV('Rows', Object.entries(res.counts).map(([t, n]) => `${t}=${n}`).join('  '));
+      ptyKV('Size', `${(res.bytes / 1024).toFixed(1)} KB`);
+      ptyKV('Status', res.changed ? `updated (${res.filesWritten.join(', ')})` : 'unchanged');
+      console.log('');
+      return;
+    }
+
+    if (sub === 'status') {
+      const res = brainStatus(ctx, { dir });
+      if (json) return printJson(res);
+      ptySection('MyJarbis · brain status');
+      ptyKV('Dir', res.dir);
+      ptyKV('Dump', res.dumpExists ? 'present' : 'missing');
+      ptyKV('Status', res.inSync ? 'in sync' : 'DRIFT');
+      for (const d of res.drift) ptyDim(d);
+      console.log('');
+      if (!res.inSync) process.exit(3);
+      return;
+    }
+
+    // import — destructive: it replaces every row of every tracked table.
+    // Requiring --yes keeps a mistyped command from wiping a brain that was
+    // never exported, while staying non-interactive for git hooks.
+    if (flags.yes !== true) {
+      fail(
+        "brain import REPLACES the contents of memory.db with the dump. Re-run with --yes if that is what you want.",
+      );
+    }
+    const res = importBrain(ctx, { dir });
+    if (json) return printJson(res);
+    ptySection('MyJarbis · brain import');
+    ptyKV('Dir', res.dir);
+    ptyKV('From', `${res.exportedAt} (schema v${res.schemaVersion})`);
+    ptyKV('Rows', Object.entries(res.counts).map(([t, n]) => `${t}=${n}`).join('  '));
+    if (res.rebasedFrom) ptyKV('Rebased', `${res.rebasedFrom} → ${ctx.projectPath}`);
+    console.log('');
+  } finally {
+    ctx.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.3 subcommands
+// ─────────────────────────────────────────────────────────────────────
+
+/** myjarbis org <add|list|sync|diff> */
+function runOrg(argv: string[]): void {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+
+  switch (sub) {
+    case 'add': {
+      const { positional } = parseFlags(rest);
+      const [slug, packPath] = positional;
+      if (!slug || !packPath) {
+        fail('Usage: myjarbis org add <slug> <path-to-pack>');
+      }
+      const pack = readPack(packPath);
+      if (pack.slug !== slug) {
+        fail(
+          `Pack at ${packPath} declares slug "${pack.slug}", not "${slug}". ` +
+            'Use the slug from pack.yml so the two cannot drift apart.',
+        );
+      }
+      const ctx = ServerContext.initialize();
+      try {
+        printJson(applyPack(ctx, pack));
+      } finally {
+        ctx.close();
+      }
+      return;
+    }
+
+    case 'list': {
+      const ctx = ServerContext.initialize();
+      try {
+        printJson({
+          orgs: ctx.db.orgs.list().map((o) => ({
+            slug: o.slug,
+            name: o.name,
+            packPath: o.pack_path,
+            packRev: o.pack_rev,
+            projects: ctx.db.orgs.projectsOf(o.id).map((p) => p.name),
+          })),
+        });
+      } finally {
+        ctx.close();
+      }
+      return;
+    }
+
+    case 'sync':
+    case 'diff': {
+      const { positional, flags } = parseFlags(rest);
+      const slug = positional[0];
+      let packPath = positional[1] ?? (flags.pack as string | undefined);
+      if (!slug && !packPath) {
+        fail('Usage: myjarbis org sync <slug> [path-to-pack]   (diff = dry run)');
+      }
+      if (!packPath) {
+        // Fall back to the pack path recorded when the org was added.
+        const ctx = ServerContext.initialize();
+        try {
+          const org = ctx.db.orgs.findBySlug(slug);
+          if (!org?.pack_path) {
+            fail(
+              `Org "${slug}" has no recorded pack path. Pass it explicitly: ` +
+                `myjarbis org ${sub} ${slug} <path-to-pack>`,
+            );
+          }
+          packPath = org!.pack_path!;
+        } finally {
+          ctx.close();
+        }
+      }
+      printJson(syncOrg(packPath!, { dryRun: sub === 'diff' }));
+      return;
+    }
+
+    default:
+      fail('Usage: myjarbis org <add|list|sync|diff>');
+  }
+}
+
+/** myjarbis kinds [list|migrate] */
+function runKinds(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listContextKinds(ctx));
+      return;
+    }
+    if (sub === 'migrate') {
+      printJson(migrateKinds(ctx, { dry_run: truthy(flags['dry-run']) }));
+      return;
+    }
+    fail('Usage: myjarbis kinds <list|migrate> [--dry-run]');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis workflow <list|show> [slug] */
+function runWorkflow(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listWorkflowsTool(ctx));
+      return;
+    }
+    if (sub === 'show') {
+      const slug = positional[0];
+      if (!slug) fail('Usage: myjarbis workflow show <slug> [--no-evaluate]');
+      printJson(getWorkflow(ctx, { slug, evaluate: !truthy(flags['no-evaluate']) }));
+      return;
+    }
+    fail('Usage: myjarbis workflow <list|show>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis provider <list|set> */
+function runProvider(argv: string[]): void {
+  const sub = argv[0] ?? 'list';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'list') {
+      printJson(listProviders(ctx));
+      return;
+    }
+    if (sub === 'set') {
+      const [role, kind] = positional;
+      if (!role || !kind) {
+        fail('Usage: myjarbis provider set <tracker|forge|ci> <kind> [--config=JSON]');
+      }
+      printJson(setProvider(ctx, { role, kind, config: flags.config as string | undefined }));
+      return;
+    }
+    fail('Usage: myjarbis provider <list|set>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis state <get|set> */
+function runState(argv: string[]): void {
+  const sub = argv[0] ?? 'get';
+  const { positional, flags } = parseFlags(argv.slice(1));
+  const ctx = ServerContext.initialize();
+  try {
+    if (sub === 'get') {
+      printJson(getProjectState(ctx));
+      return;
+    }
+    if (sub === 'set') {
+      // Accept the body inline, from a file, or on stdin — the last being how
+      // a hook or an editor hands over multi-line text.
+      let content = positional.join(' ');
+      const fromFile = flags['from-file'] as string | undefined;
+      if (fromFile) content = fs.readFileSync(fromFile, 'utf-8');
+      else if (!content && !process.stdin.isTTY) content = fs.readFileSync(0, 'utf-8');
+      if (!content.trim()) {
+        fail('Usage: myjarbis state set "<text>" | --from-file=FILE | (text on stdin)');
+      }
+      printJson(
+        setProjectState(ctx, {
+          content: content.trim(),
+          session_tag: flags.tag as string | undefined,
+          force: truthy(flags.force),
+        }),
+      );
+      return;
+    }
+    fail('Usage: myjarbis state <get|set>');
+  } finally {
+    ctx.close();
+  }
+}
+
+/** myjarbis migrate [--dry-run] [--db=PATH] [--all] */
+function runMigrate(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const dryRun = truthy(flags['dry-run']);
+
+  // An explicit path wins. Otherwise migrate the brain this directory
+  // resolves to, and never more than one unless --all says so: upgrading a
+  // file the user did not name is exactly what openExisting stopped doing.
+  const targets: string[] = [];
+  const explicit = flags.db as string | undefined;
+
+  if (explicit) {
+    targets.push(path.resolve(explicit));
+  } else if (truthy(flags.all)) {
+    if (fs.existsSync(globalDbPath())) targets.push(globalDbPath());
+    for (const entry of readRegistry()) {
+      const p = siloDbPath(entry.path);
+      if (fs.existsSync(p)) targets.push(p);
+    }
+    if (targets.length === 0) fail('No brains found to migrate.');
+  } else {
+    const ctx = ServerContext.initialize();
+    const p = ctx.db.dbPath;
+    ctx.close();
+    if (p === ':memory:') {
+      fail(
+        'No project resolved here, so there is nothing to migrate. Pass --db=PATH ' +
+          'for a specific brain, or --all for every registered one.',
+      );
+    }
+    targets.push(p);
+  }
+
+  const reports = targets.map((t) => upgradeBrain(t, { dryRun }));
+  printJson({
+    dryRun,
+    migrated: reports.filter((r) => !r.alreadyCurrent).length,
+    alreadyCurrent: reports.filter((r) => r.alreadyCurrent).length,
+    reports,
+  });
+}
+
+/** myjarbis merge --from=PATH [--into=PATH] [--as=NAME] [--dry-run] */
+function runMerge(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const from = flags.from as string | undefined;
+  if (!from) {
+    fail(
+      'Usage: myjarbis merge --from=<project>/.myjarbis/memory.db [--into=PATH] ' +
+        '[--as=NAME] [--source-project=NAME] [--dry-run]',
+    );
+  }
+  printJson(
+    mergeBrain({
+      from: path.resolve(from!),
+      into: flags.into ? path.resolve(flags.into as string) : globalDbPath(),
+      asName: flags.as as string | undefined,
+      sourceProject: flags['source-project'] as string | undefined,
+      dryRun: truthy(flags['dry-run']),
+    }),
+  );
+}
+
+/** parseFlags yields `true` for a bare flag and a string for --k=v. */
+function truthy(v: string | boolean | undefined): boolean {
+  return v === true || v === 'true' || v === '1';
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Dispatcher
 // ─────────────────────────────────────────────────────────────────────
 
 export function main(argv: string[]): void {
   const [cmd, ...rest] = argv;
   if (!cmd) {
-    fail('Usage: cli.js <import|module|skill|stats|cost|hook|init-project|timeline> [args...]');
+    fail('Usage: cli.js <import|brain|module|skill|stats|cost|hook|init-project|timeline> [args...]');
   }
   try {
     switch (cmd) {
@@ -1847,10 +2455,26 @@ export function main(argv: string[]): void {
         return runTimeline(rest);
       case 'diagram':
         return runDiagram(rest);
+      case 'brain':
+        return runBrain(rest);
       case 'hook':
         return runHook(rest);
       case 'init-project':
         return runInitProject(rest);
+      case 'org':
+        return runOrg(rest);
+      case 'kinds':
+        return runKinds(rest);
+      case 'workflow':
+        return runWorkflow(rest);
+      case 'provider':
+        return runProvider(rest);
+      case 'state':
+        return runState(rest);
+      case 'migrate':
+        return runMigrate(rest);
+      case 'merge':
+        return runMerge(rest);
       default:
         fail(`Unknown subcommand: ${cmd}`);
     }
