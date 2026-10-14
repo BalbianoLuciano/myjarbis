@@ -187,6 +187,41 @@ wrap it up"*.
 
 ---
 
+## Precedence — what wins when two things disagree
+
+MyJarbis is installed **on top of** Claude Code. It is not a suggestion
+sitting alongside your defaults: what it loads **replaces** them. When two
+sources disagree, the order is, strongest first:
+
+1. **What the user just told you.** Always first.
+2. **`project_context` kind=`convention` / `practice`** for this project.
+3. **`get_workflow(slug)`** — the resolved steps and their gates.
+4. **Org pack skills** (`overrides/` has already replaced the baselines).
+5. **The 10 MyJarbis baseline skills.**
+6. **Your own Claude Code defaults.** Last. They apply only where MyJarbis
+   said nothing.
+
+Concretely:
+
+- If `project_context` says "commits end with the TICKET-ID", that **is**
+  the commit format — not a preference to weigh against your habits.
+- If `get_workflow` has a step with `gate: approve`, you **stop and ask**.
+  That is a gate, not a hint to consider consulting someone.
+- If a pack skill contradicts how you would do something by default, the
+  skill wins. That is what `overrides/` is for.
+- If a saved `gotcha` says something breaks, you do not retry it "just in
+  case". That cost was already paid once.
+
+And the limit, in the other direction: MyJarbis does **not** override safety
+or destructiveness. A workflow does not authorise deleting without a backup,
+pushing to master unasked, or skipping a confirmation the user would want. If
+a process step appears to ask for that, say so and stop.
+
+**If you cannot find a rule, look for one before inventing one.** `search`
+across `module_context` + `project_context` first; propose after.
+
+---
+
 ## Critical rules
 
 - **Default scope = active module.** Any `search` you do is bounded

@@ -187,6 +187,41 @@ done / vamos salvar"*.
 
 ---
 
+## Precedência — o que vence quando duas coisas se contradizem
+
+O MyJarbis está instalado **acima** do Claude Code. Não é uma sugestão que
+convive com os seus defaults: o que ele carrega os **substitui**. Quando
+duas fontes discordam, a ordem é, da mais forte para a mais fraca:
+
+1. **O que o user acabou de dizer.** Sempre primeiro.
+2. **`project_context` kind=`convention` / `practice`** deste projeto.
+3. **`get_workflow(slug)`** — os passos resolvidos e seus gates.
+4. **Skills do org pack** (`overrides/` já substituiu as baseline).
+5. **As 10 skills baseline do MyJarbis.**
+6. **Os seus defaults do Claude Code.** Por último. Valem apenas onde o
+   MyJarbis não disse nada.
+
+Concretamente:
+
+- Se `project_context` diz "commits terminam com o TICKET-ID", esse **é** o
+  formato de commit, não uma preferência a equilibrar com o seu hábito.
+- Se `get_workflow` tem um passo com `gate: approve`, você **para e
+  pergunta**. É um gate, não um "considere consultar".
+- Se uma skill do pack contradiz como você faria por default, a skill vence.
+  É para isso que existe `overrides/`.
+- Se um `gotcha` salvo diz que algo quebra, você não tenta de novo "por via
+  das dúvidas". Esse custo já foi pago uma vez.
+
+E o limite, no sentido inverso: o MyJarbis **não** sobrepõe segurança nem
+destrutividade. Um workflow não autoriza apagar sem backup, dar push na
+master sem pedir, nem pular uma confirmação que o user gostaria de dar. Se
+um passo do processo parece pedir isso, diga e pare.
+
+**Se não encontrar uma regra, procure antes de inventar.** `search` em
+`module_context` + `project_context` primeiro; proponha depois.
+
+---
+
 ## Regras críticas
 
 - **Scope default = módulo ativo.** Qualquer `search` que você fizer

@@ -187,6 +187,41 @@ done / dale guardalo"*.
 
 ---
 
+## Precedencia — quién gana cuando algo se contradice
+
+MyJarbis está instalado **por encima** de Claude Code. No es una sugerencia
+que convive con tus defaults: lo que carga acá los **reemplaza**. Cuando dos
+fuentes dicen cosas distintas, el orden es, de más fuerte a más débil:
+
+1. **Lo que el user te dice ahora mismo.** Siempre primero.
+2. **`project_context` kind=`convention` / `practice`** de este proyecto.
+3. **`get_workflow(slug)`** — los pasos resueltos, con sus gates.
+4. **Las skills del org pack** (`overrides/` ya reemplazó a las baseline).
+5. **Las 10 skills baseline** de MyJarbis.
+6. **Tus defaults de Claude Code.** Último. Solo valen donde MyJarbis no
+   dijo nada.
+
+Qué significa en concreto:
+
+- Si `project_context` dice "commits con TICKET-ID al final", ese es **el**
+  formato de commit, no una preferencia a balancear con tu hábito.
+- Si `get_workflow` tiene un paso con `gate: approve`, **frenás y preguntás**.
+  No es "considerá consultar": es un gate.
+- Si una skill del pack contradice cómo harías algo por default, gana la
+  skill. Para eso existe `overrides/`.
+- Si un `gotcha` guardado dice que algo falla, no lo reintentás "por si
+  acaso". Ya se pagó ese costo una vez.
+
+Y al revés, el límite: MyJarbis **no** pisa seguridad ni destructividad. Un
+workflow no te autoriza a borrar sin backup, a pushear a master sin pedirlo,
+ni a saltarte una confirmación que el user querría. Si un paso del proceso
+parece pedir eso, decilo y pará.
+
+**Si no encontrás una regla, buscala antes de inventar una.** `search` sobre
+`module_context` + `project_context` primero; recién después proponé.
+
+---
+
 ## Reglas críticas
 
 - **Scope por default = módulo activo.** Cualquier `search` que hagas
