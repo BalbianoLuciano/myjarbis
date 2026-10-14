@@ -1,0 +1,316 @@
+# Upgrading MyJarbis on an existing machine
+
+Written for an agent doing the upgrade on a machine it has not seen before.
+Every case below was hit for real on 2026-10-14 while taking one machine from
+v0.2 to v0.4.2; none of them are hypothetical.
+
+**Read the whole file before running anything.** Several steps are ordered
+because doing them in the wrong order makes things worse, not just slower.
+
+---
+
+## 0. Find out where you are
+
+```bash
+myjarbis --version                 # installed CLI
+myjarbis status                    # schema + brain of the current project
+cat ~/.myjarbis-global/mcp-server/package.json | grep version
+```
+
+Three numbers that are often different and all matter:
+
+| | what it is | how to change it |
+|---|---|---|
+| CLI version | the installed copy under `~/.myjarbis-global` | `myjarbis update` |
+| schema version | the shape of each `memory.db` | `myjarbis migrate` |
+| skill content | rows inside each brain, not files | `myjarbis skill reseed` |
+
+Updating the code does **not** update the schema, and neither of them updates
+the skills. Three separate steps, deliberately.
+
+---
+
+## 1. Before anything: back up
+
+The update itself does not touch a `memory.db`, but you are about to run
+commands that can. Take a backup you control.
+
+```bash
+BK=~/myjarbis-backup-$(date +%Y%m%d)
+mkdir -p "$BK/brains"
+find ~ -name memory.db -path '*/.myjarbis/*' 2>/dev/null | while read -r db; do
+  rel="${db#$HOME/}"; mkdir -p "$BK/brains/$(dirname "$rel")"
+  for ext in "" "-wal" "-shm"; do
+    [ -f "$db$ext" ] && cp -p "$db$ext" "$BK/brains/$rel$ext"
+  done
+done
+cp -r ~/.myjarbis-global "$BK/global"
+du -sh "$BK"
+```
+
+**Copy the `-wal` file. It is not optional.** SQLite in WAL mode keeps recent
+writes outside the `.db`. On the machine this was written from, 9.6 MB of data
+lived in `-wal` files, and on four projects the `-wal` was *larger than the
+database it belonged to*. A backup of `memory.db` alone silently loses them.
+
+Verify the copy rather than trusting it:
+
+```bash
+find "$BK/brains" -name 'memory.db' | while read -r c; do
+  o="$HOME/${c#$BK/brains/}"
+  [ "$(sha256sum "$c" | cut -d' ' -f1)" = "$(sha256sum "$o" | cut -d' ' -f1)" ] \
+    || echo "MISMATCH $o"
+done; echo "checked"
+```
+
+---
+
+## 2. Update the code
+
+```bash
+cd <checkout> && git pull
+myjarbis update
+```
+
+### Case: the install is v0.2 — `update` cannot work
+
+**Symptom:** `myjarbis update` prints something about not being a git
+repository, reports success, and `myjarbis --version` is unchanged.
+
+**Cause:** the v0.2 updater ran `git pull` inside `~/.myjarbis-global`, which
+`install.sh` populates by *copying*. There is no remote there, so it rebuilt
+the code already present. It also never re-copied `bin/`, which is why it
+could never replace itself.
+
+**Fix — run the updater from the checkout, once:**
+
+```bash
+bash <checkout>/bin/myjarbis-update --from=<checkout>
+```
+
+From then on `myjarbis update` works normally; the `--from` path is recorded
+in `~/.myjarbis-global/.source`.
+
+### Case: `cannot find the source checkout`
+
+`~/.myjarbis-global/.source` does not exist (installs older than v0.3 never
+wrote it). Same fix: pass `--from=<checkout>` once.
+
+### Case: `the checkout has uncommitted changes — not pulling`
+
+Not an error. The updater installs the working tree as-is instead of pulling.
+That is usually what you want. If you wanted the remote, commit or stash first.
+
+### Do NOT run `install.sh` to upgrade
+
+It is for first installs. On older versions re-running it un-registered every
+project, because the registry lives in the directory it removes. `update` is
+the supported path and preserves the registry explicitly.
+
+### Verify
+
+```bash
+myjarbis --version
+myjarbis update --no-pull          # step 5 lists every project's state
+```
+
+Expect every live project to read `up to date`. Entries saying `path is gone`
+are dead registry rows — see §6.
+
+---
+
+## 3. Refresh the hooks
+
+```bash
+myjarbis update --projects
+```
+
+File copy only; it never opens a database. This installs the `SessionEnd` hook,
+which is what makes sessions close themselves. **Worth doing even if you
+migrate nothing.**
+
+It replaces `<project>/.claude-plugin/` wholesale. If a project has hand-edited
+hook scripts, copy them aside first.
+
+---
+
+## 4. The schema (v3 → v4)
+
+Not automatic, and that is deliberate: a schema change should be something you
+chose, with a backup you know about.
+
+```bash
+myjarbis migrate --all --dry-run > /tmp/dry.json
+```
+
+`--dry-run` upgrades a throwaway copy of each file, so the report comes from
+the real code path rather than a prediction. Check per project:
+
+- `fromVersion: 3` → `toVersion: 4`
+- `integrity: "ok"` and `foreignKeyViolations: 0`
+- `changed` holds only `context_kinds 0 → 24` (the new catalogue seeding)
+
+Then one small project first, then the rest:
+
+```bash
+cd <small project> && myjarbis migrate && myjarbis status   # expect Schema v4
+myjarbis migrate --all
+```
+
+Each run leaves `memory.db.pre-v4.<timestamp>` next to the brain, WAL included.
+To roll back, rename it to `memory.db`.
+
+### Case: the brain is on an older CLI
+
+`migrate` refuses to run across versions it does not understand. Do §2 first.
+
+### Case: more brains than the registry knows about
+
+`migrate --all` covers the global brain plus every registered project. Stray
+brains elsewhere — left by the pre-v0.3 bug where any command created a
+database wherever it ran — are not covered and usually hold zero rows. Find
+them, and check before deleting:
+
+```bash
+find ~ -name memory.db -path '*/.myjarbis/*' 2>/dev/null
+```
+
+---
+
+## 5. Skills live in the database, not in files
+
+This is the step most likely to be forgotten. `update` copies **code**. Skills
+are rows inside each project's brain, seeded at `init`, so a newer baseline
+reaches new projects and nothing else.
+
+```bash
+myjarbis skill reseed --all          # report
+myjarbis skill reseed --all --apply  # write
+```
+
+It refuses to touch `interaction-style`, which is composed per project from the
+user's language and persona. Every project legitimately differs from that
+baseline, so a hash comparison flags all of them — applying it would replace
+the user's configuration with a placeholder everywhere at once.
+`--include-owned` overrides, only if that is genuinely meant.
+
+Then open Claude in a project so `.claude/skills/` re-materialises from the DB.
+
+---
+
+## 6. Clean up what previous versions left behind
+
+```bash
+myjarbis gc                 # report
+myjarbis gc --apply         # remove
+```
+
+Collects dead registry rows, `mcpServers.myjarbis` entries in `~/.claude.json`
+for directories that no longer exist, superseded brain backups older than
+`--older-than` (30 days), and Claude Code project directories holding nothing
+but a generated `MEMORY.md`.
+
+Never collects rollback copies (`.silo-retired-`, `.merged-`) or any directory
+containing a session transcript. Backs up the registry and `~/.claude.json`
+before editing either.
+
+Expect a lot on a machine that has run the test suite: 198 dead MCP
+registrations and 122 project directories on the one this was written from,
+both caused by `--skip-memory` being dropped before v0.3.1.
+
+```bash
+myjarbis backfill-remotes --apply
+```
+
+Records the git remote on projects that predate the field, so resolution
+survives a clone to a different path. Pre-v0.3 projects all lack it.
+
+---
+
+## 7. Two leaks worth checking on any machine that ran an older version
+
+**A brain may be sitting un-ignored in a repo.** Before v0.3.1, `migrate` wrote
+`memory.db.<label>.<timestamp>` and none of the patterns `init` adds to
+`.gitignore` matched it. A full, readable brain — session summaries, notes,
+client names — could be committed by one `git add -A`.
+
+```bash
+git log --all -- '*memory.db.pre-v4*'     # in each repo
+```
+
+If anything comes back, the history needs rewriting, not just a delete.
+
+**`~/.myjarbis-global/backups/` may already be gone.** Before v0.3.1, `update`
+swept every `.myjarbis` directory under the install dir, and each snapshot
+under `backups/` contains one by design. Fixed, but the deletion is not
+recoverable.
+
+---
+
+## 8. The shared brain is opt-in, and has a second half
+
+Migrating does **not** move anything into `~/.myjarbis/memory.db`. Every
+project stays `isolation = silo` unless merged deliberately.
+
+```bash
+myjarbis merge --from=<project>/.myjarbis/memory.db --dry-run
+myjarbis merge --from=<project>/.myjarbis/memory.db --retire-source
+```
+
+**`--retire-source` is the part that makes it take effect.** Resolution prefers
+a silo over the shared brain unconditionally, so without it the rows land, the
+old file keeps winning, and the copy goes stale immediately. The flag renames
+the source aside only after counts, integrity and foreign keys check out —
+rename it back to roll the project back to its own brain.
+
+Project names are unique per brain. Check for collisions before merging several
+machines' worth of projects into one; `--as <name>` renames on the way in.
+
+---
+
+## 9. Restart Claude Code
+
+Replacing the server's code under a live session kills the MCP connection — the
+running process keeps the old code in memory and the tools stop responding.
+Expected, and the updater says so.
+
+**Close any MyJarbis session before updating, not after.** If you forget,
+nothing is lost, but observations from that session cannot be saved until a
+restart. Write them to a file in the meantime.
+
+---
+
+## 10. Verify the whole machine
+
+```bash
+myjarbis health
+```
+
+One view of every project: brain, schema, activity, modules nobody opened, and
+how many projects actually use each shipped feature. After a clean upgrade
+expect all projects on the current schema and no `hooks stale`.
+
+A feature sitting at `0/N` adoption is worth a look — on the machine this was
+written from, three of them were at zero because they were unreachable from the
+CLI, not because nobody wanted them.
+
+---
+
+## Order, in one block
+
+```bash
+# 1 back up (see §1, include -wal)
+cd <checkout> && git pull
+myjarbis update              # or: bash <checkout>/bin/myjarbis-update --from=<checkout>
+myjarbis update --projects
+myjarbis migrate --all --dry-run    # read it
+myjarbis migrate --all
+myjarbis skill reseed --all --apply
+myjarbis backfill-remotes --apply
+myjarbis gc                  # read it, then --apply
+myjarbis health              # verify
+# restart Claude Code
+```
+
+Steps 4–8 are each independently optional. Code and hooks are the only ones
+that matter for simply being current.
