@@ -554,11 +554,11 @@ que cambió de opinión y **ofrecé actualizar el interaction-style**:
   },
   {
     name: 'commit-hygiene',
-    description: 'Format and rules for git commits in any MyJarbis project — descriptive, signed only by the user, with WHY and FOR-WHAT in the body',
+    description: 'Format and rules for git commits in any MyJarbis project — descriptive, signed only by the user, with WHY, FOR-WHAT and WHERE in the body',
     triggerPattern: 'about to git commit, /complete, end of phase, before pushing',
     content: `---
 name: commit-hygiene
-description: Commits descriptivos sin firma de Claude, con "Por qué" y "Para qué" en el body
+description: Commits descriptivos sin firma de Claude, con "Por qué", "Para qué" y "Dónde" en el body
 ---
 
 # Commit hygiene
@@ -580,7 +580,17 @@ este cambio. Si hay un ticket/story, citalo>
 Para qué:
 <2-4 líneas explicando qué cambia / habilita después de este
 commit. Efecto observable o invariante nuevo>
+
+Dónde:
+<1-2 líneas: la costura del sistema donde cae el cambio, y
+dónde se ve el efecto si no es el mismo lugar>
 \`\`\`
+
+**"Dónde" no es la lista de archivos** — eso ya lo dice el diff, y
+repetirlo es ruido que envejece mal cuando el archivo se renombra.
+Sirve cuando el cambio y su consecuencia viven en lugares distintos:
+"se toca en el resolver, se nota en todo comando que abra un brain".
+Si el cambio es local y obvio, omitilo antes que escribir relleno.
 
 - **tipo**: \`feat\` | \`fix\` | \`refactor\` | \`chore\` | \`docs\` | \`test\` | \`perf\` | \`style\`
 - **scope**: subsistema o módulo (\`auth\`, \`mm\`, \`checkout\`, \`db\`, \`hooks\`, etc.)
@@ -614,7 +624,7 @@ git log --since="2 weeks ago"    # cambios recientes
 git log -p <commit>              # diff completo de un commit
 \`\`\`
 
-Si el commit hygiene es bueno (descripción + Por qué + Para qué),
+Si el commit hygiene es bueno (descripción + Por qué + Para qué + Dónde),
 el git log responde la mayoría de las preguntas históricas sin
 gastar tokens del user.
 
@@ -635,7 +645,7 @@ Antes de \`git commit\`:
    lo que querés commitear)
 3. Stage por nombre los archivos faltantes (si los hay)
 4. Construí el message en el formato canónico (tipo + scope +
-   descripción + Por qué + Para qué)
+   descripción + Por qué + Para qué + Dónde)
 5. Mostrale el message al user en una línea: "Voy a commitear:
    <type>(<scope>): <desc>" antes de ejecutar
 6. \`git commit -m "$(cat <<'EOF' ... EOF)"\` con el message
