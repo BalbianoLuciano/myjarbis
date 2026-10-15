@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.4.5
+
+Three defects in `myjarbis update`, all found by running it on a real machine
+rather than in the suite. Two were silent, which is the worst kind in a tool
+whose job is to tell you what is out of date.
+
+### Fixed
+
+- **The fleet report could not see a shared brain.** It looked for
+  `<project>/.myjarbis/memory.db` with `existsSync`, and the v4 migration
+  retired those local files. On this machine that meant printing "no brain
+  yet" for all 23 projects, every one of which has a brain. The real cost was
+  downstream: the "N project(s) are on an older schema" warning became dead
+  code on exactly the configuration the project recommends, so a pending
+  `migrate` would never be announced again. The report now asks
+  `health --json`, because `collectHealth()` already resolves each project the
+  way the rest of the system does and already returns schema, isolation and
+  hook staleness — the 30 lines of node embedded in bash were a worse copy of
+  tested code. Each line also names where the brain lives now (`shared` or
+  `silo`), which is the field whose absence hid the bug: everything read "no
+  brain yet" and looked fine.
+- **Updating broke a running Claude session with no warning.** The rebuild
+  replaces `mcp-server/build` in place, which is the exact build an open
+  session is attached to, so every `mcp__myjarbis__*` call starts failing with
+  "Connection closed" mid-session. There is now a preflight check before step
+  1 — nothing has been touched yet, so declining leaves the installation
+  untouched. It asks when there is a terminal (the same `[ -t 0 ]` idiom
+  `myjarbis init` uses) and warns and proceeds when there is not, because
+  blocking non-interactive callers would make updating impossible from inside
+  Claude, which is where it is most often requested. `--yes` skips the
+  question but never the warning.
+- **The log claimed more than it did:** "refreshing hooks + commands" while
+  the loop only copies `.claude-plugin/`. Commands have their own propagation
+  path, `myjarbis commands sync`, which the report now points at.
+
+### Testing
+
+Fifteen suites, 248 assertions — unchanged, and stated plainly: `myjarbis
+update` has no suite coverage and still does not. It is a bash installer that
+runs `npm install` and a build, so putting it in `run-all.sh` would make the
+suite slow and network-dependent. What is covered is the calculation it now
+shares with `health`.
+
+Verified by hand instead, on the machine where the false negative appeared: all
+23 projects moved from "no brain yet" to `shared · up to date`, and a
+deliberately downgraded fixture on schema 3 reports `silo · schema v3` with the
+older-schema warning firing — something it could not do for anyone before. The
+interactive prompt itself was not verified: the agent that wrote this has no
+TTY, so only the no-terminal and `--yes` branches were exercised.
+
 ## v0.4.4
 
 A patch for one bug, found by walking the conversational surface instead of
