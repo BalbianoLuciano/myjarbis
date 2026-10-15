@@ -1,5 +1,44 @@
 # Changelog
 
+## v0.4.4
+
+A patch for one bug, found by walking the conversational surface instead of
+the CLI. v0.4.3 was tested from two seats — the developer's and the new
+user's — but both typed commands. Nobody had tried *talking* to it.
+
+### Fixed
+
+- **Changing the language by asking for it only half-applied.** The language
+  lives in two places: the `interaction-style` skill, which the agent reads,
+  and `settings.json`, which the SessionStart hook reads because it runs
+  before any agent exists and cannot ask anyone. Persisting to
+  `settings.json` was bolted onto the CLI path only, so the documented
+  conversational route — the user says "settings, switch me to English" —
+  changed the agent and left the terminal printing the old language
+  permanently. It was also unrepairable: once the skill matches the request,
+  the upsert reports `unchanged` and the function returned early, so asking
+  again did nothing either. The write now lives inside
+  `applyInteractionStyle`, ahead of that branch, so both doors behave the
+  same and a drifted `settings.json` is repaired rather than skipped.
+- The naming rule for slash commands is now written down and asserted:
+  every shipped command starts with `jarbis`, because the slash menu is a
+  flat namespace shared with every other plugin and the prefix is the only
+  thing marking a command as ours.
+
+### Testing
+
+Fifteen suites, 248 assertions. The new `v04-chat-triggers` covers the
+conversational surface, which had none: `set_interaction_style` and
+`myjarbis config language` were not touched by any suite, so the
+best-documented trigger in the command file was the least tested thing in
+the project.
+
+Validated by reverting the fix — five assertions go red. The first draft of
+that suite had one assertion that passed anyway: it checked for ES after
+asking for ES, when the previous case had already left the file at es, so it
+was reading the fixture rather than the behaviour. The teeth check is what
+exposed it; it now forces a third language before measuring.
+
 ## v0.4.3
 
 The 0.4 line is about the gap between shipping a mechanism and anyone
