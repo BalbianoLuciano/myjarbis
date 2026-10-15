@@ -38,7 +38,7 @@ show_help() {
     echo -e "  ${BOLD}state${NC}      Read or write the project's living state (get|set)"
     echo -e "  ${BOLD}migrate${NC}    Upgrade a brain to the current schema, backing it up first"
     echo -e "  ${BOLD}merge${NC}      Merge a project's brain into the shared one"
-    echo -e "  ${BOLD}module${NC}     Manage modules (add/list)"
+    echo -e "  ${BOLD}module${NC}     Manage modules (list/use/current/unset/add)"
     echo -e "  ${BOLD}skill${NC}      Manage skills (add/list/edit/delete/enable/disable/reseed)"
     echo -e "  ${BOLD}commands${NC}   Propagate the slash commands to existing projects (sync)"
     echo -e "  ${BOLD}stats${NC}      Show row counts per table"

@@ -501,5 +501,6 @@ echo
 section "Next"
 echo
 echo -e "  ${RED}\$${NC} claude"
-echo -e "  ${RED}>${NC} /jarbis"
+echo -e "  ${RED}>${NC} /jarbis          ${DIM}open the session${NC}"
+echo -e "  ${RED}>${NC} /jarbis-close    ${DIM}when you stop, so the next one resumes here${NC}"
 echo

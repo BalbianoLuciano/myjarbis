@@ -174,6 +174,21 @@ else
   oops "command lists drifted — TS has [$TS_LIST], myjarbis-init has [$SH_LIST]"
 fi
 
+# ── [7] init ignores what it generates in the user's repo ─────────
+echo "[7] the .gitignore init writes for the user"
+# Found by walking the newcomer path: the block covered the brain, `active`
+# and the materialised skills, but not the generated command files, so every
+# project showed .claude/ as untracked and one `git add -A` committed this
+# machine's copy. settings.local.json is worse — it carries absolute paths.
+cd "$WORK/proj"
+for p in .claude/commands/jarbis.md .claude/commands/jarbis-close.md .claude/settings.local.json .myjarbis/active; do
+  if git check-ignore -q "$p"; then
+    pass "ignored: $p"
+  else
+    oops "not ignored by the block init writes: $p"
+  fi
+done
+
 echo
 if [ "$FAILED" -eq 0 ]; then
   echo "✓ v04-commands-sync: all assertions passed"

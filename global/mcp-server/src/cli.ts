@@ -1101,7 +1101,11 @@ function runInitProject(argv: string[]): void {
   //    when shared === false. (When true, the user wants them committed.)
   //    .myjarbis/active is ALWAYS ignored — even with shared=true, it's
   //    per-user state (each developer picks their own active module).
-  appendToGitignore(projectPath, ['.myjarbis/active']);
+  //    settings.local.json is the same kind of thing one level out: it is
+  //    the local-override half of Claude Code's settings pair, and it
+  //    accumulates absolute paths from this machine. Leaving it untracked
+  //    was how a project could commit one developer's allow-list.
+  appendToGitignore(projectPath, ['.myjarbis/active', '.claude/settings.local.json']);
   if (settings.shared === false) {
     appendToGitignore(projectPath, [
       '.myjarbis/memory.db',
@@ -1113,6 +1117,12 @@ function runInitProject(argv: string[]): void {
       // exactly, so none of them match a backup.
       '.myjarbis/memory.db.*',
       '.claude/skills/myjarbis-*/',
+      // Generated from templates/.claude/commands/<name>.<lang>.md, so they
+      // belong with the materialised skills: with shared=true the user is
+      // asking for MyJarbis's output to be committed and teammates get the
+      // command; with shared=false it is this machine's copy and showed up
+      // as untracked noise in every project.
+      '.claude/commands/jarbis*.md',
     ]);
   }
 
@@ -1166,9 +1176,13 @@ function appendToGitignore(projectPath: string, patterns: string[]): void {
     if (!lines.some((l) => l.trim() === p)) toAdd.push(p);
   }
   if (toAdd.length === 0) return;
+  // The header used to carry a version ("# MyJarbis (v0.2)") and went stale
+  // the moment it shipped. Matching on the prefix recognises the old header
+  // too, so a project initialised before this keeps one block instead of
+  // growing a second one.
   const block =
     (existing && !existing.endsWith('\n') ? '\n' : '') +
-    (existing.includes('# MyJarbis (v0.2)') ? '' : '\n# MyJarbis (v0.2)\n') +
+    (existing.includes('# MyJarbis') ? '' : '\n# MyJarbis — generated, per-developer state\n') +
     toAdd.join('\n') +
     '\n';
   fs.writeFileSync(gi, existing + block, 'utf-8');
