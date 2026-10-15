@@ -1,5 +1,125 @@
 # Changelog
 
+## v0.4.3
+
+The 0.4 line is about the gap between shipping a mechanism and anyone
+receiving it. v0.3 added `topic_key`, `supersedes` and baseline skills;
+on a real machine of 23 projects and 1,470 notes, `topic_key` was at 0%
+and an improved baseline reached new projects only. Code that nobody can
+receive is code that does not exist.
+
+v0.4.0 through v0.4.2 shipped without a changelog entry. This one covers
+the line.
+
+### Added
+
+**`myjarbis review`** (v0.4.0). Groups notes that are successive versions
+of one topic: the newest gets a `topic_key`, the older ones chain behind
+it through `supersedes`. Nothing is deleted and nothing is merged — the
+destructive reading of the word is not on offer. Clustering is title
+overlap within one module and one kind, blunt on purpose, because a wrong
+grouping costs a key that can be rewritten while inferring intent from
+note content is the kind of cleverness that makes a cleanup tool
+untrustworthy.
+
+**`myjarbis skill reseed`** (v0.4.0). Propagates baseline skills to
+projects that already exist, which is what makes editing a baseline worth
+doing. Refuses `interaction-style`, which is composed per project from the
+user's language and persona — every project legitimately differs from that
+baseline, so a hash comparison flags all of them and applying it would
+replace the user's configuration with a placeholder everywhere at once.
+`--include-owned` overrides, only if that is genuinely meant.
+
+**`/jarbis-close`** (v0.4.3). The second and last slash command. Closing a
+session well used to be a sentence typed every time; the `SessionEnd` hook
+already closes it for you, but with a synthetic summary that records
+activity instead of handing off — it says three commits happened, not what
+to do tomorrow. The command runs the whole ritual without asking, because
+typing it is the confirmation: check the tree and state whether tests ran,
+save pending observations, rewrite `project_state`, then `end_session`
+with both texts written by the agent rather than requested from the user.
+
+**`myjarbis commands sync`** (v0.4.3). The propagation path for slash
+commands, which are files in each project's `.claude/commands/` written
+only by `init`. Classifies before writing: `new`, `current`,
+`other-language` (ours, with a stale language, corrected without asking)
+and `diverged` — matching nothing shipped, so either hand-edited or from
+an older version. Nothing distinguishes those two, so `diverged` stops and
+requires `--force` rather than guessing. On the machine this was written
+from: 23 of 23 projects were missing `/jarbis-close` and 21 carried a
+`/jarbis` from an older version, including this repo, which was dogfooding
+the v0.2 copy.
+
+**`myjarbis health`, `gc`, `backfill-remotes`** (v0.4.0). The fleet seen at
+once — schema, activity, what is going cold — plus collection of the litter
+previous versions left, and the git remote recorded on projects that
+predate the field.
+
+### Fixed
+
+- **A hand-written handoff could be buried by an automatic one.** The
+  synthetic close is always the newest close, so it won every "last closed
+  session" lookup and pushed the real note one level down each time it
+  happened. `start_session` and `resume` now return `curatedResume` when
+  the newest close is synthetic, with its own staleness clock and the
+  burial count. Found in the wild: a 3,546-char handoff where the agent
+  read a 124-char synthetic one and told the user there was no resume point.
+- **The burial count ordered by id.** Session ids are not in close order —
+  a session started months ago and auto-closed today has a low id and a
+  recent `ended_at`. Recency is `(ended_at, id)` everywhere now.
+- **`migrate` deleted settings keys it did not know about.** The v0.2 bump
+  rebuilt the settings object from a hardcoded template, so anything a user
+  had added by hand vanished mid-migration. One project lost `language=es`
+  and `brain.auto_export_on_session_end`, which silently froze its
+  committed brain dump for a week. Unknown keys now survive through a
+  spread, not an allow-list, so the next key added is already covered.
+- **`init` left generated files untracked in the user's repo.** The
+  `.gitignore` block covered the brain, `active` and the materialised
+  skills but not the generated command files or
+  `.claude/settings.local.json` — the local-override half of Claude Code's
+  settings pair, which accumulates absolute paths from one machine. Found
+  by walking the newcomer path rather than the developer one. The block's
+  header also no longer carries a version that goes stale.
+- **A raw NUL byte made `review.ts` binary to git.** A composite map key
+  used a literal control character instead of its escape; one byte is
+  enough for git to stop diffing an 8 KB source file, so v0.4's first
+  feature entered the repo unreadable as a diff.
+- `myjarbis status` suggested `module use`, which `myjarbis help`
+  described as existing only in `add/list`.
+
+### Testing
+
+Fourteen E2E suites, 237 assertions, each generating its own fixture —
+`tests/run-all.sh`.
+
+**The suite could not fail.** Thirteen assertions across three suites used
+`node -e "..." | while read`, and the pipe put the counter in a subshell,
+so every increment was discarded: the suites printed their ✗ lines and
+exited 0 anyway. That was 104 of the project's checks at the time, none of
+which could turn the build red. Found by reverting a fix on purpose to see
+whether its new test had teeth. Assertions are read through a helper that
+runs in the current shell now, and reverting the fix is how both of this
+release's new suites were validated.
+
+New suites: `v04-review-reseed` (weighted toward what those commands must
+NOT do — the note count is unchanged after `--apply`, a hand-edited
+`interaction-style` survives), `v04-commands-sync` (a hand-edited command
+file survives `--apply`; a drift guard asserts the command list in
+TypeScript and the install loop in `bin/myjarbis-init` name the same set),
+and `v04-close-ritual` (what `/jarbis-close` writes, read back by a fresh
+session: the handoff verbatim with no `[auto]` marker, `project_state`
+replacing rather than accumulating, one `topic_key` updating in place,
+`keep_history` chaining instead, the hook printing the handoff, and a close
+with nothing open failing cleanly without leaving a phantom row).
+
+### Known / deliberate
+
+- `review` and `skill reseed` ship built but unapplied; both are dry-run by
+  default and neither has been run against a real brain yet.
+- `commands sync` writes files, so `diverged` needs `--force` by design.
+- A dev checkout must set `MYJARBIS_INSTALL_DIR` and `MYJARBIS_REGISTRY`
+  together: the registry otherwise resolves next to the install.
+
 ## v0.3.0
 
 v0.2 gave the memory a schema. v0.3 is about what the memory was *still*
