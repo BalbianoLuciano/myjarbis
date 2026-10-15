@@ -22,6 +22,11 @@
 #
 # It never touches a project's memory.db. Schema changes are
 # `myjarbis migrate`, which backs up first.
+#
+# The report asks `health --json` rather than inspecting each project itself;
+# see the comment at step 5 for why that mattered. And because updating swaps
+# the MCP server build out from under a running Claude session, there is a
+# preflight check before step 1 — nothing is touched until it passes.
 
 set -euo pipefail
 
@@ -42,18 +47,21 @@ fail() { echo -e "       ${RED}${BOLD}FAIL${NC}  $1"; }
 SYNC_PROJECTS=""
 SOURCE_OVERRIDE=""
 SKIP_PULL=""
+ASSUME_YES=""
 
 for arg in "$@"; do
     case "$arg" in
         --projects)   SYNC_PROJECTS=1 ;;
         --no-pull)    SKIP_PULL=1 ;;
+        --yes|-y)     ASSUME_YES=1 ;;
         --from=*)     SOURCE_OVERRIDE="${arg#*=}" ;;
         --help|-h)
-            echo "Usage: myjarbis update [--projects] [--no-pull] [--from=<path>]"
+            echo "Usage: myjarbis update [--projects] [--no-pull] [--yes] [--from=<path>]"
             echo
-            echo "  --projects      Also refresh hook scripts + commands in every"
-            echo "                  registered project (never touches memory.db)."
+            echo "  --projects      Also refresh hook scripts in every registered"
+            echo "                  project (never touches memory.db)."
             echo "  --no-pull       Re-sync from the local checkout without pulling."
+            echo "  --yes, -y       Do not ask anything, even with Claude Code running."
             echo "  --from=<path>   Use this checkout as the source and remember it."
             exit 0
             ;;
@@ -70,6 +78,58 @@ if [ ! -d "$INSTALL_DIR" ]; then
     fail "MyJarbis is not installed at $INSTALL_DIR"
     note "clone the repo and run ./install.sh first"
     exit 1
+fi
+
+# ─── preflight: a running Claude session is about to lose its tools ──
+#
+# Updating rebuilds mcp-server/build in place, and that is the exact build a
+# running Claude session is attached to. The old process keeps running against
+# files that changed underneath it, so every mcp__myjarbis__* call starts
+# failing with "Connection closed" — mid-session, with no explanation. The
+# closing message already says to restart Claude Code; what it never said is
+# that the session open RIGHT NOW is the one being broken, and by then it is
+# too late to choose.
+#
+# This runs before step 1 on purpose: nothing has been touched yet, so
+# answering "no" leaves the installation exactly as it was.
+#
+# `pgrep -x` matches the process name exactly, which is what keeps this from
+# matching the shell running the update, or the grep itself. Absent pgrep
+# (unlikely on Linux/macOS, possible in a bare container), the check is
+# skipped rather than guessed at.
+if command -v pgrep >/dev/null 2>&1; then
+    CLAUDE_PIDS="$(pgrep -x claude 2>/dev/null | tr '\n' ' ' | sed 's/ $//')" || CLAUDE_PIDS=""
+    if [ -n "$CLAUDE_PIDS" ]; then
+        # The warning prints even with --yes. That flag says "do not ask me",
+        # not "do not tell me" — someone running this from a script still
+        # needs to know a session is about to lose its tools.
+        warn "Claude Code is running (PID ${CLAUDE_PIDS})"
+        note "updating replaces the MCP server build that session is attached"
+        note "to: it will lose every myjarbis tool and has to be restarted."
+        if [ -z "$ASSUME_YES" ] && [ -t 0 ]; then
+            # Same idiom as bin/myjarbis-init: ask only when someone is there
+            # to answer. Non-interactive callers — the agent running this from
+            # inside Claude, a script, CI — get the warning and proceed, which
+            # is the behaviour that was chosen deliberately: blocking them
+            # would make the update impossible from the place it is most often
+            # requested.
+            printf '       Update anyway? [y/N]: '
+            read -r REPLY_UPDATE
+            case "$REPLY_UPDATE" in
+                y|Y|s|S|yes|YES|si|SI|sí|Sí) ;;
+                *)
+                    note "nothing was changed. Close Claude Code and re-run."
+                    echo
+                    exit 0
+                    ;;
+            esac
+        elif [ -n "$ASSUME_YES" ]; then
+            note "--yes given — continuing. Restart Claude when done."
+        else
+            note "no terminal to ask — continuing. Restart Claude when done."
+        fi
+        echo
+    fi
 fi
 
 # ─── [1/5] locate the source checkout ─────────────────────────────
@@ -186,51 +246,51 @@ else
     # Per project: are its hook scripts current, and is its brain on the
     # current schema? Reported separately because they are fixed by
     # different commands — one is a file copy, the other needs a backup.
-    REPORT=$(node --input-type=module -e "
-import * as fs from 'fs';
-import * as path from 'path';
-import { SCHEMA_VERSION } from '$INSTALL_DIR/mcp-server/build/db/schema.js';
-import { MyJarbisDB } from '$INSTALL_DIR/mcp-server/build/db/index.js';
-
-const reg = JSON.parse(fs.readFileSync('$REGISTRY_FILE', 'utf8'));
-const tmplHooks = '$INSTALL_DIR/templates/.claude-plugin/hooks/hooks.json';
-const wantHooks = fs.existsSync(tmplHooks) ? fs.readFileSync(tmplHooks, 'utf8') : null;
-
-for (const [name, p] of Object.entries(reg.projects || {})) {
-  const dir = p && p.path;
-  if (!dir || !fs.existsSync(dir)) { console.log(['GONE', name, dir || '?'].join('\t')); continue; }
-
-  const hooksPath = path.join(dir, '.claude-plugin', 'hooks', 'hooks.json');
-  let hooks = 'missing';
-  if (fs.existsSync(hooksPath)) {
-    hooks = wantHooks && fs.readFileSync(hooksPath, 'utf8') === wantHooks ? 'current' : 'stale';
-  }
-
-  let schema = 'none';
-  const dbPath = path.join(dir, '.myjarbis', 'memory.db');
-  if (fs.existsSync(dbPath)) {
-    const db = MyJarbisDB.openExisting(dbPath);
-    if (db) {
-      schema = db.schemaVersion === SCHEMA_VERSION ? 'current' : 'v' + db.schemaVersion;
-      db.close();
+    #
+    # This asks `health --json` instead of working it out here. The previous
+    # version looked for `<project>/.myjarbis/memory.db` with existsSync, and
+    # the v4 shared-brain migration retired those files — so on any machine
+    # that moved to the shared brain it reported "no brain yet" for EVERY
+    # project and the "older schema" warning below could never fire. It was
+    # also a worse copy of resolution logic that already exists: collectHealth
+    # (global/mcp-server/src/health.ts) resolves each project the way the rest
+    # of the system does and already returns schema, isolation and hook
+    # staleness. One source of truth, and it has test coverage.
+    REPORT=$(node "$INSTALL_DIR/mcp-server/build/cli.js" health --json 2>/dev/null | node -e "
+let raw = '';
+process.stdin.on('data', (d) => (raw += d));
+process.stdin.on('end', () => {
+  let report;
+  try { report = JSON.parse(raw); } catch { process.exit(0); }
+  for (const p of report.projects || []) {
+    if (!p.pathExists) {
+      console.log(['GONE', p.name, p.path || '?'].join('\t'));
+      continue;
     }
+    // schema === null now genuinely means 'this project has no brain',
+    // rather than 'no brain file sits next to it'.
+    const schema = p.schema === null ? 'none' : p.schemaCurrent ? 'current' : 'v' + p.schema;
+    console.log(['OK', p.name, p.path, p.hooks, schema, p.isolation || '?'].join('\t'));
   }
-  console.log(['OK', name, dir, hooks, schema].join('\t'));
-}
+});
 " 2>/dev/null || true)
 
     STALE_HOOKS=0
     OLD_SCHEMA=0
-    while IFS=$'\t' read -r status name dir hooks schema; do
+    while IFS=$'\t' read -r status name dir hooks schema isolation; do
         [ -z "${status:-}" ] && continue
         if [ "$status" = "GONE" ]; then
             note "$name — path is gone, skipping ($dir)"
             continue
         fi
         LINE="$name"
+        # Where the brain lives, so a wrong schema reading is visible at a
+        # glance instead of having to be trusted. This is the field whose
+        # absence hid the bug: everything read "no brain yet" and looked fine.
+        [ -n "${isolation:-}" ] && [ "$isolation" != "?" ] && LINE="$LINE · $isolation"
         [ "$hooks" != "current" ] && { LINE="$LINE · hooks $hooks"; STALE_HOOKS=$((STALE_HOOKS+1)); }
         [ "$schema" != "current" ] && [ "$schema" != "none" ] && { LINE="$LINE · schema $schema"; OLD_SCHEMA=$((OLD_SCHEMA+1)); }
-        # "none" means the project has no brain yet, which is not staleness.
+        # "none" means the project has no brain at all, which is not staleness.
         if [ "$hooks" = "current" ] && { [ "$schema" = "current" ] || [ "$schema" = "none" ]; }; then
             LINE="$LINE · up to date"
             [ "$schema" = "none" ] && LINE="$LINE (no brain yet)"
@@ -240,8 +300,12 @@ for (const [name, p] of Object.entries(reg.projects || {})) {
 
     if [ -n "$SYNC_PROJECTS" ] && [ "$STALE_HOOKS" -gt 0 ]; then
         echo
-        note "refreshing hooks + commands in $STALE_HOOKS project(s)..."
-        while IFS=$'\t' read -r status name dir hooks schema; do
+        # Hooks only. This used to say "hooks + commands", which was never
+        # true: the loop below copies .claude-plugin/ and nothing else.
+        # Commands are files in .claude/commands/ and have their own
+        # propagation path, `myjarbis commands sync`.
+        note "refreshing hooks in $STALE_HOOKS project(s)..."
+        while IFS=$'\t' read -r status name dir hooks schema isolation; do
             [ "${status:-}" != "OK" ] && continue
             [ "$hooks" = "current" ] && continue
             if [ -d "$INSTALL_DIR/templates/.claude-plugin" ]; then
@@ -257,6 +321,8 @@ for (const [name, p] of Object.entries(reg.projects || {})) {
         note "refresh them with: myjarbis update --projects"
         note "(it only replaces .claude-plugin/ — memory.db is never touched)"
     fi
+
+    note "slash commands are not part of this: myjarbis commands sync --all"
 
     if [ "$OLD_SCHEMA" -gt 0 ]; then
         echo
