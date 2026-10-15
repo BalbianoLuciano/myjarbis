@@ -174,6 +174,19 @@ else
   oops "command lists drifted — TS has [$TS_LIST], myjarbis-init has [$SH_LIST]"
 fi
 
+# Every command must carry the prefix: the slash menu is a flat namespace
+# shared with every other plugin, so the prefix is the only thing that marks
+# a command as ours at a glance. A bare `close` would ship loose.
+if node -e "
+  import('$B/commands.js').then(m => {
+    const bad = m.SHIPPED_COMMANDS.filter(c => !c.startsWith(m.COMMAND_PREFIX));
+    if (bad.length) { console.error(bad.join(',')); process.exit(1); }
+  })"; then
+  pass "every shipped command starts with the MyJarbis prefix"
+else
+  oops "a command ships without the prefix, so nothing marks it as ours"
+fi
+
 # ── [7] init ignores what it generates in the user's repo ─────────
 echo "[7] the .gitignore init writes for the user"
 # Found by walking the newcomer path: the block covered the brain, `active`

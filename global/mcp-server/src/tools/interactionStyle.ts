@@ -10,6 +10,8 @@
  * skills are loaded by Claude Code at startup).
  */
 
+import * as fs from 'fs';
+import * as path from 'path';
 import { z } from 'zod';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
@@ -91,6 +93,36 @@ export function inferCurrent(content: string | null): {
   return { language, persona };
 }
 
+/**
+ * The SessionStart hook renders the module menu from
+ * `.myjarbis/config/settings.json`, not from the skill, because it runs
+ * before the agent exists and cannot ask anyone. So the language lives in
+ * two places and both have to be written.
+ *
+ * This used to be bolted onto the CLI path only (`myjarbis config
+ * language`), which meant changing the language by TALKING to the agent —
+ * the documented way — updated the skill and left the hook printing the
+ * old language forever. Writing it here covers every caller.
+ *
+ * Unknown keys survive through the spread rather than an allow-list: the
+ * v0.2 settings bump ate `language` and `brain.auto_export_on_session_end`
+ * by rebuilding the object from a template, and that is not repeated here.
+ */
+function persistLanguageToSettings(projectPath: string, language: Language): void {
+  const settingsPath = path.join(projectPath, '.myjarbis', 'config', 'settings.json');
+  let existing: Record<string, unknown>;
+  try {
+    existing = JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) as Record<string, unknown>;
+  } catch {
+    // No settings file (or unreadable) — the hook has nothing to read from,
+    // so there is nothing to keep in step. Not an error worth failing a
+    // language change over.
+    return;
+  }
+  const next = { ...existing, language: language.toLowerCase() };
+  fs.writeFileSync(settingsPath, JSON.stringify(next, null, 2) + '\n', 'utf-8');
+}
+
 /** Shared core: compose new interaction-style content + upsert into DB
  *  + re-materialize to disk. Used by the MCP tool AND the CLI
  *  `myjarbis config language|persona` command. */
@@ -109,6 +141,12 @@ export function applyInteractionStyle(
   const persona: Persona = args.persona
     ? parsePersona(args.persona)
     : current.persona;
+
+  // Before the `unchanged` branch on purpose: the drift this fixes is a
+  // skill that already says EN while settings.json still says es, which is
+  // exactly the case where the skill upsert reports no change. Writing the
+  // same value twice is harmless; skipping it leaves the hook wrong.
+  persistLanguageToSettings(ctx.projectPath, language);
 
   const content = composeInteractionStyle(language, persona);
 

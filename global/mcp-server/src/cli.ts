@@ -395,16 +395,11 @@ function runConfig(argv: string[]): void {
       const args: { language?: string; persona?: string } = {};
       if (sub === 'language') args.language = value;
       else args.persona = value;
+      // applyInteractionStyle persists the language to settings.json itself
+      // now, so the hook stays in step for every caller. It used to be done
+      // here, which is why changing the language from inside Claude only
+      // half-applied.
       const result = applyInteractionStyle(ctx, args);
-      // Also persist language to settings.json for the hook to read
-      if (sub === 'language') {
-        const settingsPath = path.join(ctx.projectPath, '.myjarbis', 'config', 'settings.json');
-        if (fs.existsSync(settingsPath)) {
-          const settings = readSettingsJson(ctx.projectPath);
-          settings.language = result.language.toLowerCase();
-          fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', 'utf-8');
-        }
-      }
       if (wantsJson(flags)) { printJson(result); return; }
       const verb = result.status === 'unchanged' ? 'unchanged' : 'updated';
       ptySection(`MyJarbis · config ${sub} ${verb}`);

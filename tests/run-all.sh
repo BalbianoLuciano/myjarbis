@@ -27,6 +27,7 @@ SUITES=(
   v04-review-reseed
   v04-commands-sync
   v04-close-ritual
+  v04-chat-triggers
 )
 
 PASS=0; FAIL=0; FAILED_NAMES=()
