@@ -23,12 +23,23 @@ import { readRegistry } from './org/registry.js';
 /**
  * The commands that ship with MyJarbis.
  *
+ * NAMING RULE: every one of them starts with `jarbis`. The slash menu is a
+ * flat namespace shared with every other plugin the user has installed, so
+ * the prefix is the only thing that says "this one is ours" at a glance —
+ * the same job the `myjarbis-` prefix does for materialised skill folders.
+ * A command called `close` would be indistinguishable from someone else's.
+ * `tests/v04-commands-sync.sh` asserts the prefix, so a new command that
+ * forgets it turns the suite red rather than shipping loose.
+ *
  * Kept in step by hand with the `for cmd in ...` loop in bin/myjarbis-init
- * (step 4), which installs the same list at init time. `tests/
- * v04-commands-sync.sh` asserts the two lists name the same commands, so
- * adding one here and forgetting there turns the suite red.
+ * (step 4), which installs the same list at init time. The same test
+ * asserts the two lists name the same commands, so adding one here and
+ * forgetting there is caught too.
  */
 export const SHIPPED_COMMANDS = ['jarbis', 'jarbis-close'];
+
+/** The prefix every shipped command must carry. See SHIPPED_COMMANDS. */
+export const COMMAND_PREFIX = 'jarbis';
 
 /** Languages each command ships in. */
 export const COMMAND_LANGUAGES = ['es', 'en', 'pt'];
