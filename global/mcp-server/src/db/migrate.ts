@@ -591,108 +591,129 @@ que cambió de opinión y **ofrecé actualizar el interaction-style**:
     triggerPattern: 'about to git commit, /complete, end of phase, before pushing',
     content: `---
 name: commit-hygiene
-description: Commits descriptivos sin firma de Claude, con "Por qué", "Para qué" y "Dónde" en el body
+description: Descriptive commits with no Claude signature, carrying Why / What for / Where in the body
 ---
 
 # Commit hygiene
 
-Los commits son **memoria persistente consultable** — vos los escribís,
-pero los van a leer el user, otros devs, y vos mismo (Claude) en
-sesiones futuras vía \`git log\`. Por eso tienen que ser densos,
-descriptivos y autoexplicativos.
+Commits are **queryable persistent memory** — you write them, but the
+user, other devs, and you yourself (Claude) in later sessions are the
+ones who read them, through \`git log\`. So they have to be dense,
+descriptive and self-explanatory.
 
-## Format obligatorio
+## Which language to write them in
+
+**This skill does not decide that. The project does.**
+
+Take the first of these that gives an answer:
+
+1. \`project_context\` with \`kind=convention\` — if it states a language
+   for commits, that is the answer, and it outranks this skill.
+2. The repository's existing \`git log\` — match what is there.
+3. Ask the user. Do not settle it by inference.
+
+And do **not** read the most recent commits as a licence to continue in
+whatever language they happen to be in. That is exactly how a repository
+whose convention says English ends up with a log in another one: each
+session samples the last ten subjects, generalises, and the drift
+compounds until the rule is the thing that looks wrong. The convention is
+the authority; the log is only evidence of what was done, including what
+was done by mistake.
+
+The headers below are written as \`Why:\` / \`What for:\` / \`Where:\`.
+Translate them to the project's language if that is not English — but
+keep all three.
+
+## Mandatory format
 
 \`\`\`
-<tipo>(<scope>): <descripción imperativa, ≤72 chars>
+<type>(<scope>): <imperative description, ≤72 chars>
 
-Por qué:
-<2-4 líneas explicando el problema o motivación que dispara
-este cambio. Si hay un ticket/story, citalo>
+Why:
+<2-4 lines on the problem or motivation that triggers this change.
+If there is a ticket or story, cite it>
 
-Para qué:
-<2-4 líneas explicando qué cambia / habilita después de este
-commit. Efecto observable o invariante nuevo>
+What for:
+<2-4 lines on what changes or becomes possible after this commit.
+An observable effect, or a new invariant>
 
-Dónde:
-<1-2 líneas: la costura del sistema donde cae el cambio, y
-dónde se ve el efecto si no es el mismo lugar>
+Where:
+<1-2 lines: the seam of the system the change lands in, and where the
+effect shows up if that is somewhere else>
 \`\`\`
 
-**"Dónde" no es la lista de archivos** — eso ya lo dice el diff, y
-repetirlo es ruido que envejece mal cuando el archivo se renombra.
-Sirve cuando el cambio y su consecuencia viven en lugares distintos:
-"se toca en el resolver, se nota en todo comando que abra un brain".
-Si el cambio es local y obvio, omitilo antes que escribir relleno.
+**\`Where:\` is not the file list** — the diff already says that, and
+repeating it is noise that ages badly the moment a file gets renamed. It
+earns its place when the change and its consequence live apart: "written
+in the resolver, visible in every command that opens a brain". If the
+change is local and obvious, omit it rather than write filler.
 
-- **tipo**: \`feat\` | \`fix\` | \`refactor\` | \`chore\` | \`docs\` | \`test\` | \`perf\` | \`style\`
-- **scope**: subsistema o módulo (\`auth\`, \`mm\`, \`checkout\`, \`db\`, \`hooks\`, etc.)
-- **descripción**: imperativa, sin punto final, ≤72 chars (regla
-  estándar git)
+- **type**: \`feat\` | \`fix\` | \`refactor\` | \`chore\` | \`docs\` | \`test\` | \`perf\` | \`style\`
+- **scope**: the subsystem or module (\`auth\`, \`mm\`, \`checkout\`, \`db\`, \`hooks\`, …)
+- **description**: imperative, no trailing period, ≤72 chars (standard
+  git rule)
 
-## Reglas duras
+## Hard rules
 
-- **NUNCA \`Co-Authored-By: Claude\`** ni cualquier firma de Claude
-  en el commit message. El autor es el user, vos sos un tool.
-- **NUNCA \`--no-verify\`** ni \`--no-gpg-sign\`. Si pre-commit hooks
-  fallan, fixá el problema; no salteás el hook.
-- **NUNCA \`git add -A\` ni \`git add .\`**. Stage por nombre,
-  archivo por archivo. Reduce el riesgo de commitear .env, secrets,
-  o cosas no relacionadas.
-- **NUNCA \`git commit --amend\` después de push**. Después de un
-  push, los amends reescriben historia y rompen otros clones.
-- **Un commit = un cambio lógico**. Si tu task tiene 3 cosas
-  independientes, son 3 commits. La regla del plan v0.2 fue
-  "1 task = 1 commit" y vale en general.
+- **Never \`Co-Authored-By: Claude\`**, or any Claude signature in the
+  commit message. The author is the user; you are a tool.
+- **Never \`--no-verify\`** or \`--no-gpg-sign\`. If a pre-commit hook
+  fails, fix the cause; you do not skip the hook.
+- **Never \`git add -A\` or \`git add .\`**. Stage by name, file by file.
+  It cuts the risk of committing .env, secrets, or unrelated work.
+- **Never \`git commit --amend\` after a push**. Past a push, amends
+  rewrite history and break other clones.
+- **One commit = one logical change**. If your task has 3 independent
+  things in it, that is 3 commits.
 
-## El git log es contexto consultable
+## The git log is context you can query
 
-Antes de preguntarle al user "¿por qué se hizo X?" o "¿quién decidió
-Y?", **mirá el git log primero**:
+Before asking the user "why was X done?" or "who decided Y?", **read the
+git log first**:
 
 \`\`\`bash
 git log --grep="<keyword>" --all --oneline
-git log -- <file-path>           # historia de un archivo
-git log --since="2 weeks ago"    # cambios recientes
-git log -p <commit>              # diff completo de un commit
+git log -- <file-path>           # history of one file
+git log --since="2 weeks ago"    # recent changes
+git log -p <commit>              # full diff of one commit
 \`\`\`
 
-Si el commit hygiene es bueno (descripción + Por qué + Para qué + Dónde),
-el git log responde la mayoría de las preguntas históricas sin
-gastar tokens del user.
+If the commit hygiene is good (description + Why + What for + Where), the
+git log answers most historical questions without spending the user's
+tokens.
 
-## Triggers conversacionales
+## Conversational triggers
 
-Cuando el user dice algo de esto, asumí que vas a commitear:
+When the user says any of this, assume you are about to commit:
 
-- "commiteá esto" / "guardalo en git" / "armá el commit"
-- "/complete" (ya cubierto por session-protocol — el cierre de
-  fase típicamente incluye un commit)
-- Después de cada chunk lógico durante la fase de Implementación
-  (story-driven skill instruye a auto-commitear por chunk)
+- "commit this" / "save it in git" / "put together the commit"
+- "/complete" (already covered by session-protocol — closing a phase
+  typically includes a commit)
+- After each logical chunk during the Implementation phase (the
+  story-driven skill instructs auto-committing per chunk)
 
-Antes de \`git commit\`:
+Before \`git commit\`:
 
-1. \`git status\` para confirmar qué hay staged
-2. \`git diff --cached\` para releer el cambio (verificar que es
-   lo que querés commitear)
-3. Stage por nombre los archivos faltantes (si los hay)
-4. Construí el message en el formato canónico (tipo + scope +
-   descripción + Por qué + Para qué + Dónde)
-5. Mostrale el message al user en una línea: "Voy a commitear:
-   <type>(<scope>): <desc>" antes de ejecutar
-6. \`git commit -m "$(cat <<'EOF' ... EOF)"\` con el message
+1. \`git status\` to confirm what is staged
+2. \`git diff --cached\` to re-read the change (verify it is what you
+   mean to commit)
+3. Stage the missing files by name, if any
+4. Build the message in the canonical format (type + scope +
+   description + Why + What for + Where), in the project's language
+5. Show the user the subject in one line: "About to commit:
+   <type>(<scope>): <desc>" before running it
+6. \`git commit -m "$(cat <<'EOF' ... EOF)"\` with the message
 
 ## Anti-patterns
 
-- Commits con título "fix bug" / "wip" / "updates" → rechazás vos
-  mismo y reescribís
-- Body vacío → si el cambio es trivial el body puede ser corto
-  pero "Por qué" SIEMPRE existe
-- Múltiples scopes en un solo commit → es señal de que tenés que
-  partirlo en N commits
-- Imperativo conjugado mal: "Added X" / "Adds X" → es "Add X"
-  (acción presente imperativa)
+- Commits titled "fix bug" / "wip" / "updates" → reject your own and
+  rewrite them
+- An empty body → if the change is trivial the body can be short, but
+  "Why" ALWAYS exists
+- Several scopes in one commit → a sign you have to split it into N
+- The imperative conjugated wrong: "Added X" / "Adds X" → it is "Add X"
+- Switching the log's language mid-repository because the last commits
+  did → see the language section; the convention decides, not the log
 `,
   },
 ];

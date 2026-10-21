@@ -609,8 +609,10 @@ session start.
 | `commit-hygiene`       | Commit format + git log as queryable context                 |
 
 **`commit-hygiene`** — every commit follows `type(scope): description`
-with a `Por qué:` / `Para qué:` body, no `Co-Authored-By: Claude`, no
-`--no-verify`, no `git add -A`. The git log becomes queryable memory.
+with a `Why:` / `What for:` / `Where:` body, no `Co-Authored-By: Claude`,
+no `--no-verify`, no `git add -A`. The git log becomes queryable memory.
+The language is not the skill's call: it comes from your project's
+`convention`, or from the existing log if there is none.
 
 **`interaction-style`** — composed from your language + 1 of 4 personas
 (Concise / Pair programmer / Mentor / Critical reviewer). Re-edit anytime
