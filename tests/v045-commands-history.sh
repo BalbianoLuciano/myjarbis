@@ -50,18 +50,33 @@ TEMPLATE_REL="global/templates/.claude/commands/jarbis.es.md"
 # A version of the template this repository really shipped, taken from its own
 # history rather than fabricated — a fabricated "old version" would not have a
 # matching object name, so it would prove nothing.
-OLD_SHA="$(git -C "$REPO_ROOT" log --all --format=%H -- "$TEMPLATE_REL" | sed -n '2p')"
+#
+# Walk the commits that touched it and take the first whose blob actually
+# DIFFERS from what is checked out, instead of assuming the second commit does.
+# `--all` spans every ref, and a ref can carry a parallel copy of the same
+# change: a stale feature branch, a `refs/original/*` left by filter-branch, or
+# a rewritten history alongside the one it replaced. In any of those the second
+# entry is the same content under another SHA, and the fixture proves nothing
+# while looking like a repo problem.
+CURRENT_TEMPLATE="$REPO_ROOT/$TEMPLATE_REL"
+CURRENT_BLOB="$(git -C "$REPO_ROOT" hash-object "$CURRENT_TEMPLATE")"
+OLD_SHA=""
+while read -r sha; do
+    [ -z "$sha" ] && continue
+    blob="$(git -C "$REPO_ROOT" rev-parse --quiet --verify "$sha:$TEMPLATE_REL" || true)"
+    if [ -n "$blob" ] && [ "$blob" != "$CURRENT_BLOB" ]; then
+        OLD_SHA="$sha"
+        break
+    fi
+done <<EOF
+$(git -C "$REPO_ROOT" log --all --format=%H -- "$TEMPLATE_REL")
+EOF
 if [ -z "$OLD_SHA" ]; then
-    echo "✗ $TEMPLATE_REL has fewer than two commits in this checkout — cannot test history matching"
+    echo "✗ no commit in this checkout ships a different $TEMPLATE_REL — cannot test history matching"
     exit 1
 fi
 OLD_TEMPLATE="$WORK/old-template.md"
 git -C "$REPO_ROOT" show "$OLD_SHA:$TEMPLATE_REL" > "$OLD_TEMPLATE"
-CURRENT_TEMPLATE="$REPO_ROOT/$TEMPLATE_REL"
-if cmp -s "$OLD_TEMPLATE" "$CURRENT_TEMPLATE"; then
-    echo "✗ the previous commit's template is identical to the current one — pick another fixture"
-    exit 1
-fi
 echo "    · fixture: $TEMPLATE_REL as of ${OLD_SHA:0:8}"
 
 mkdir -p "$WORK/proj" && cd "$WORK/proj" && git init -q .
