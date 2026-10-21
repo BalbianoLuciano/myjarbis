@@ -175,14 +175,20 @@ else
   oops "reseed overwrote the user's interaction-style"
 fi
 
+# Assert the row EQUALS the baseline, not that it contains some phrase.
+# This used to grep for 'Dónde:', which made the assertion depend on the
+# baseline's wording — editing the skill turned the test red without
+# anything being broken.
 if node --input-type=module -e "
 import { MyJarbisDB } from '$B/db/index.js';
+import { BASELINE_SKILLS } from '$B/db/migrate.js';
 const db = MyJarbisDB.openExisting('$DB');
 const p = db.projects.findByPath('$WORK/proj');
 db.bindScope({ kind: 'project', id: p.id });
 const c = db.skills.findByName(p.id, null, 'commit-hygiene').content;
 db.close();
-process.exit(c !== 'STALE COPY' && c.includes('Dónde:') ? 0 : 1);
+const baseline = BASELINE_SKILLS.find((s) => s.name === 'commit-hygiene').content;
+process.exit(c !== 'STALE COPY' && c === baseline ? 0 : 1);
 "; then
   pass "commit-hygiene was refreshed from the baseline"
 else
