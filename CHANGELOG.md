@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.6
 
 ### Added
 
@@ -89,6 +89,36 @@
   every future open.
 
 ### Fixed
+
+- **The `commit-hygiene` skills decided the commit language, and decided it
+  wrong.** `docs/CONVENTIONS.md` has said since v0.4.5 that everything written
+  in this repository is in English. Fourteen Spanish commits landed after that
+  anyway — not because an agent generalised from recent history, but because
+  the project-level `myjarbis-commit-hygiene` skill said in writing that the
+  body goes «en español, como el resto del historial», and the baseline
+  `commit-hygiene` was itself written in Spanish with
+  `Por qué:` / `Para qué:` / `Dónde:` headers. The agent followed the skills,
+  which is the correct precedence; the defect was that a skill held an opinion
+  about something a convention owns.
+
+  The baseline no longer decides. It defers, in order, to `project_context
+  kind=convention`, then the repository's existing log, then the user — and
+  says explicitly that recent commits are evidence of what was done, not
+  permission to keep doing it. Its own prose and body headers are now English
+  (`Why:` / `What for:` / `Where:`), to be translated into whatever language
+  the project's convention sets.
+
+  This reaches **new projects only**: `BASELINE_SKILLS` is read by `init` and
+  the v0.1 migration, so existing brains keep what they have. Run
+  `myjarbis skill reseed --all --apply` to take it, or let `myjarbis update`
+  do it. Projects that legitimately commit in another language are unaffected
+  either way — the skill now asks the project instead of imposing an answer.
+
+  This repository's own log was rewritten at the same time: the nineteen
+  non-English messages after `v0.4.5` are now English, with trees and topology
+  verified byte-identical and no tag moved (`v0.4.5` is the only tag in the
+  range, and it is the base). Clones from before 2026-10-21 need a
+  `git fetch --prune && git reset --hard origin/master`.
 
 - **The `module-orchestration` baseline skill told the agent to call
   `list_modules` at session start** — the exact thing the `/jarbis` command
