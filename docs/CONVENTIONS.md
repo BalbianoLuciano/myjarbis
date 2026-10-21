@@ -13,16 +13,31 @@ commit bodies, code comments, documentation, test names, CLI output, CHANGELOG
 entries. No exceptions.
 
 This is not a style preference. The repository is public, and the `git log` is
-the part of it that cannot be rewritten later — 182 commits deep, rewriting
-subjects would move every SHA and invalidate every tag.
+the first thing a stranger reads.
 
-The convention was broken once, in a single session on 2026-10-14, which left
-18 consecutive Spanish commits plus two isolated earlier ones. They stay as
-they are, for the same reason: rewriting them is not worth moving 62 SHAs and
-eight tags. **Do not read them as precedent.** An agent that samples the most
-recent commits and generalises will conclude the opposite of this rule — that
-is exactly how the drift happened, and why the rule is written here instead of
-left to inference.
+**The log is English from v0.4.5 onwards.** Everything before that tag is mixed
+and stays mixed: rewriting it would move SHAs that eight tags point at, which
+is a real cost for no reader's benefit. **Do not read the older commits as
+precedent** — an agent that samples the most recent subjects and generalises
+will eventually conclude the opposite of this rule.
+
+That is not a hypothetical. It happened twice.
+
+The first breach was one session on 2026-10-14. The second was worse: fourteen
+Spanish commits between 2026-10-20 and 2026-10-21, with this rule already
+written. The cause was not inference — it was that the project-level
+`myjarbis-commit-hygiene` skill said in writing that the body went «en español,
+como el resto del historial», and the baseline `commit-hygiene` was itself
+written in Spanish. The skills ordered the violation and the agent obeyed the
+skills, which is the correct precedence; the defect was that a skill had an
+opinion about something a convention owns.
+
+Both were fixed on 2026-10-21: the skills no longer decide the language (the
+baseline defers to this file, the override states English and cites it), and the
+nineteen non-English messages after `v0.4.5` were rewritten, trees and topology
+verified unchanged, no tag moved. The lesson worth keeping is the one about
+authority, not the one about language: **a rule that justifies itself with the
+repo's current state will ratify any drift the repo has.**
 
 Conversation with the user is a separate matter: that follows
 `interaction-style`, which is per-project and may be any language.
