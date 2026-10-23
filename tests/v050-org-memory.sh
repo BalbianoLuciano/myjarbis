@@ -454,6 +454,77 @@ console.log(out.join('\n'));
 " > "$ASSERTS" 2>"$WORK/err6" || { echo "    ✗ node block crashed"; cat "$WORK/err6" >&2; FAILED=$((FAILED + 1)); }
 read_asserts
 
+echo "→ [7] drift: has the ground moved under this lesson"
+#
+# Staleness with no expiry policy, no vote and no model: a note records the
+# blob sha of every file it cited, and comparing those against the current ones
+# answers the only question that matters about an old lesson — whether the code
+# it describes is still the code.
+cd "$WORK/alpha"
+mkdir -p src && printf 'the original\n' > src/drifty.ts && printf 'untouched\n' > src/stable.ts
+git add src/drifty.ts src/stable.ts >/dev/null 2>&1
+git -c commit.gpgsign=false commit -q -m "add two files" >/dev/null 2>&1
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession } from '$B/tools/session.js';
+import { saveObservation } from '$B/tools/observations.js';
+import { promoteObservation, refreshDrift } from '$B/tools/orgMemory.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  startSession(ctx, { module: '_general' });
+  const o = saveObservation(ctx, {
+    kind: 'gotcha',
+    title: 'A dunnartword depends on both files',
+    content: 'it reads one and writes the other',
+    files: 'src/drifty.ts,src/stable.ts,src/never-existed.ts',
+  });
+  const p = promoteObservation(ctx, { observation_id: o.observationId });
+  const row = ctx.db.orgNotes.findById(p.orgNoteId);
+  const refs = JSON.parse(row.code_refs);
+  t(refs.length === 2, 'only the files git knows become code_refs');
+  t(refs.every((r) => typeof r.blob_sha === 'string' && r.blob_sha.length === 40),
+    'each pinned to the blob it had at promotion');
+  t(!refs.some((r) => r.path.includes('never-existed')),
+    'a path git never had is dropped rather than recorded as missing');
+
+  const clean = refreshDrift(ctx);
+  t(clean.drifted === 0, 'nothing has drifted yet');
+  const beforeHits = ctx.db.search('dunnartword', { scope: 'org' });
+  t(beforeHits[0].meta.drift.changed === 0, 'and the hit says so, as zero rather than null');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/err7a" || { echo "    ✗ node block crashed"; cat "$WORK/err7a" >&2; FAILED=$((FAILED + 1)); }
+read_asserts
+
+printf 'the original, edited\n' > src/drifty.ts
+git add src/drifty.ts >/dev/null 2>&1
+git -c commit.gpgsign=false commit -q -m "edit one of them" >/dev/null 2>&1
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { refreshDrift } from '$B/tools/orgMemory.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  const res = refreshDrift(ctx);
+  t(res.drifted === 1, 'editing one cited file makes exactly one note drift');
+  const hits = ctx.db.search('dunnartword', { scope: 'org' });
+  const h = hits.find((x) => String(x.title).includes('dunnartword'));
+  t(h.meta.drift.changed === 1, 'the hit reports one changed file, not two');
+  t(typeof h.meta.drift.checkedAt === 'string', 'and when that was checked');
+
+  // Drifted notes are downranked, not hidden. The reader decides, with the
+  // reason in front of them.
+  t(h !== undefined, 'a drifted note still answers');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/err7b" || { echo "    ✗ node block crashed"; cat "$WORK/err7b" >&2; FAILED=$((FAILED + 1)); }
+read_asserts
+
 if [ "$FAILED" -gt 0 ]; then
   echo
   echo "✗ $FAILED assertion(s) failed"

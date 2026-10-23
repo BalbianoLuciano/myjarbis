@@ -105,20 +105,6 @@ export function draftFromObservation(obs: ObservationRow): OrgNoteDraft {
   };
 }
 
-/** HEAD of the repo, for the drift baseline. Null outside a repository. */
-function headCommit(cwd: string): string | null {
-  try {
-    const out = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd,
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }).trim();
-    return out || null;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * `code_refs` for the files an observation touched, each pinned to the blob
  * it had at promotion time.
@@ -599,7 +585,6 @@ export function promoteObservation(ctx: ServerContext, rawArgs: unknown): Promot
     confidence: args.confidence ?? 'assumed',
     evidence: finalEvidence,
     codeRefs: codeRefsFor(ctx.projectPath, obs.files),
-    atCommit: headCommit(ctx.projectPath),
     expiresInDays: args.expires_in_days,
   });
 
@@ -632,6 +617,99 @@ export function promoteObservation(ctx: ServerContext, rawArgs: unknown): Promot
       (rewritten ? ' The text was rewritten by the scrub before storing.' : '') +
       (identityNote ? ` Warning: ${identityNote}` : ''),
   };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Drift: "has the ground moved under this lesson?"
+//
+// Staleness without an expiry policy, without a vote and without a model. A
+// note records the blob sha of every file it cited at promotion; comparing
+// those against the current ones answers the only question that matters about
+// an old lesson — whether the code it describes is still the code.
+//
+// Computed HERE and cached on the row, never inside `search`. A fifty-hit
+// query with three code_refs each would spawn up to a hundred and fifty
+// `git rev-parse` processes inside the cheapest operation in the system.
+// `search` reads `drift_changed`; this is what writes it.
+//
+// Silent when it cannot tell. A shallow clone, a file that moved, a checkout
+// that is not a repository: all of those produce `null`, which reads as "no
+// information" rather than as "nothing changed". Those are different answers
+// and a reader deserves to know which one they got.
+// ─────────────────────────────────────────────────────────────────────
+
+export interface DriftRefreshResult {
+  checked: number;
+  /** Notes with at least one cited file that has changed. */
+  drifted: number;
+  /** Notes whose refs could not be resolved at all. */
+  unknown: number;
+}
+
+/** Current blob sha of a path, or null when git cannot say. */
+function blobSha(cwd: string, p: string): string | null {
+  try {
+    const out = execFileSync('git', ['rev-parse', `HEAD:${p}`], {
+      cwd,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
+    return out || null;
+  } catch {
+    return null;
+  }
+}
+
+export function refreshDrift(ctx: ServerContext): DriftRefreshResult {
+  const org = orgOf(ctx);
+  if (!org) return { checked: 0, drifted: 0, unknown: 0 };
+
+  const project = ctx.requireProject();
+  const rows = ctx.db.orgNotes.listByOrg(org.id, { projectId: project.id, limit: 10000 });
+
+  let checked = 0;
+  let drifted = 0;
+  let unknown = 0;
+
+  for (const n of rows) {
+    if (!n.code_refs) continue;
+    let refs: Array<{ path: string; blob_sha: string }>;
+    try {
+      refs = JSON.parse(n.code_refs) as Array<{ path: string; blob_sha: string }>;
+    } catch {
+      continue;
+    }
+    if (refs.length === 0) continue;
+
+    let changed = 0;
+    let resolvable = 0;
+    for (const r of refs) {
+      const now = blobSha(ctx.projectPath, r.path);
+      if (now === null) {
+        // The path is gone from HEAD. That IS a change — a lesson about a file
+        // that no longer exists is exactly what a reader should be warned
+        // about — but only when git could answer at all. Distinguished from
+        // "not a repository" by the probe below.
+        changed++;
+        continue;
+      }
+      resolvable++;
+      if (now !== r.blob_sha) changed++;
+    }
+
+    // If nothing resolved and nothing is at its old sha, git told us nothing:
+    // this is a clone without history, not a project where every file moved.
+    if (resolvable === 0 && blobSha(ctx.projectPath, refs[0].path) === null) {
+      unknown++;
+      continue;
+    }
+
+    ctx.db.orgNotes.setDrift(n.id, changed);
+    checked++;
+    if (changed > 0) drifted++;
+  }
+
+  return { checked, drifted, unknown };
 }
 
 // ─────────────────────────────────────────────────────────────────────

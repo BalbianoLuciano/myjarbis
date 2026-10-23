@@ -1884,7 +1884,6 @@ export class MyJarbisDB {
       confidence?: OrgNoteConfidence;
       evidence?: string | null;
       codeRefs?: string | null;
-      atCommit?: string | null;
       seq?: number;
     }): { row: OrgNoteRow; content: OrgNoteContentRow; status: 'inserted' | 'duplicate' } => {
       this.assertOrgInScope(params.orgId, 'org note');
@@ -1973,15 +1972,6 @@ export class MyJarbisDB {
         d.typeTags ?? null,
         d.linkedIds ?? null,
       );
-      if (params.atCommit !== undefined && params.atCommit !== null) {
-        // Stored on the governance half, which is not FTS-mirrored, so this
-        // second write costs no index churn.
-        this.prep('UPDATE org_notes SET evidence = COALESCE(evidence, ?) WHERE id = ?').run(
-          params.atCommit.startsWith('commit ') ? params.atCommit : `commit ${params.atCommit}`,
-          noteId,
-        );
-      }
-
       return {
         row: this.prep('SELECT * FROM org_notes WHERE id = ?').get(noteId) as OrgNoteRow,
         content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(

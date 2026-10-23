@@ -56,7 +56,7 @@ import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
 import { resolveIdentity, setIdentity, identityWarning } from './org/identity.js';
 import { transportFor } from './org/memory/transport.js';
-import { listOrgNotes } from './tools/orgMemory.js';
+import { listOrgNotes, refreshDrift } from './tools/orgMemory.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
 import {
   CLAUDE_HOOKS,
@@ -2805,7 +2805,11 @@ function runOrg(argv: string[]): void {
         const res = transportFor(ctx).pull(ctx, {
           dir: flags.dir ? String(flags.dir) : undefined,
         });
-        if (wantsJson(flags)) return printJson(res);
+        // The rows that just arrived cite files, and nobody has compared them
+        // against this checkout yet. Done here rather than in `search`, where
+        // it would spawn a git process per cited file per hit.
+        const drift = refreshDrift(ctx);
+        if (wantsJson(flags)) return printJson({ ...res, drift });
         ptySection('MyJarbis · org pull');
         ptyKV('Org', `${bold(res.org.slug)} (${res.org.name})`);
         ptyKV('Dir', res.dir);
@@ -2815,6 +2819,12 @@ function runOrg(argv: string[]): void {
             `already had ${res.duplicates}` +
             (res.governanceUpdated > 0 ? `  updated ${res.governanceUpdated}` : ''),
         );
+        if (drift.drifted > 0) {
+          ptyKV(
+            'Drift',
+            `${drift.drifted} of ${drift.checked} note(s) cite files that have changed here`,
+          );
+        }
         if (res.orgRegistered) {
           console.log('');
           ptyLine('  ' + bold('This project just joined the org.') + ' Its notes now ride `search`.');
@@ -2870,6 +2880,7 @@ function runOrg(argv: string[]): void {
       const ctx = ServerContext.initialize();
       try {
         const all = truthy(flags.all);
+        refreshDrift(ctx);
         const res = listOrgNotes(ctx, {
           status: all ? ['active', 'stale', 'superseded', 'deleted'] : undefined,
           limit: flags.limit ? Number(flags.limit) : undefined,
