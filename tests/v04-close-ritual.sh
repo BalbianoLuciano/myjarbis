@@ -292,6 +292,45 @@ else
   oops "the failed close damaged the handoff"
 fi
 
+# ─── the org-promotion step reaches every language ───
+#
+# Checked as a SET rather than one file at a time. A step that exists in
+# English and not in Spanish is worse than one that exists nowhere: the feature
+# then works or not depending on which language a project was initialised in,
+# and nobody would think to look there. The repo already paid for one
+# per-language divergence (`commands sync` exists because a template fix stayed
+# unpropagated across 23 projects while reading as done in git).
+echo "→ [8] the close ritual offers the org promotion, in all three languages"
+TEMPLATES="$REPO_ROOT/global/templates/.claude/commands"
+MISSING_TOOL=""
+MISSING_FIELD=""
+MISSING_REFUSAL=""
+for lang in en es pt; do
+  f="$TEMPLATES/jarbis-close.$lang.md"
+  if [ ! -f "$f" ]; then
+    oops "missing template jarbis-close.$lang.md"
+    continue
+  fi
+  grep -q 'promote_observation' "$f" || MISSING_TOOL="$MISSING_TOOL $lang"
+  grep -q 'promotionProposals' "$f" || MISSING_FIELD="$MISSING_FIELD $lang"
+  grep -q 'ORG_NOTE_UNSAFE' "$f" || MISSING_REFUSAL="$MISSING_REFUSAL $lang"
+done
+[ -z "$MISSING_TOOL" ] && pass "every language names promote_observation" \
+  || oops "promote_observation missing from:$MISSING_TOOL"
+[ -z "$MISSING_FIELD" ] && pass "every language reads promotionProposals" \
+  || oops "promotionProposals missing from:$MISSING_FIELD"
+[ -z "$MISSING_REFUSAL" ] && pass "and every language says what to do when the gate refuses" \
+  || oops "the ORG_NOTE_UNSAFE path missing from:$MISSING_REFUSAL"
+
+# The instruction has to be an instruction, not a mention: "never promote
+# without asking" is the behaviour, and an agent handed a list will otherwise
+# promote all of it.
+if grep -qi 'never promote without asking' "$TEMPLATES/jarbis-close.en.md"; then
+  pass "and states that nothing is promoted without asking"
+else
+  oops "the English template does not say that promotion requires asking"
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
   echo "✓ v04-close-ritual: all assertions passed"

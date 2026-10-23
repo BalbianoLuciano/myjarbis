@@ -217,6 +217,20 @@ Format:
 - **files**: comma-separated list of paths touched, if any.
 - **tags**: free-form, used for grouping in search.
 
+## When the project is in an org
+
+A \`gotcha\` or an \`error\` is what a whole team re-learns if nobody writes it
+where they can read it. When the project belongs to an org, those two come
+back from \`save_observation\` with \`promotable: true\`.
+
+That is a flag, not a cue to act. **You propose, the user decides**, and the
+moment to propose is the close — \`end_session\` returns
+\`promotionProposals\`, and interrupting mid-task to ask about sharing is how
+people learn to ignore the question.
+
+Two things never cross to the org memory, and neither is a judgement call:
+the session summary and the handoff. There is no tool that takes them.
+
 ## Triggers conversacionales
 
 Saltá al \`save_observation\` correcto cuando oigas:
