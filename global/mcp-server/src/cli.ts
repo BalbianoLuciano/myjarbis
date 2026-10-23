@@ -614,7 +614,8 @@ function runStatus(argv: string[]): void {
       // Not a git repo
     }
 
-    const org = project.org_id === null ? null : ctx.db.orgs.findById(project.org_id);
+    const orgId = ctx.db.scopedOrgId;
+    const org = orgId === null ? null : ctx.db.orgs.findById(orgId);
     const brain = {
       path: ctx.db.dbPath,
       isolation: project.isolation,

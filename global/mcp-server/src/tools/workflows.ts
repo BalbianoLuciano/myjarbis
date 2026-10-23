@@ -38,16 +38,34 @@ function currentBranch(cwd: string): string | null {
 export const listWorkflowsInputSchema = { type: 'object' as const, properties: {} };
 
 export function listWorkflowsTool(ctx: ServerContext): {
-  workflows: Array<{ slug: string; name: string; layers: string[]; steps: number }>;
+  workflows: Array<{
+    slug: string;
+    name: string;
+    layers: string[];
+    steps: number;
+    standalone: boolean;
+    uses: string[];
+    error?: string;
+  }>;
+  broken?: Array<{ slug: string; error: string }>;
   hint: string;
 } {
   const workflows = listWorkflows(ctx);
+  const broken = workflows
+    .filter((w) => w.error !== undefined)
+    .map((w) => ({ slug: w.slug, error: w.error! }));
   return {
     workflows,
-    hint: workflows.length
-      ? 'Call get_workflow(slug) for the resolved steps before starting that kind of work.'
-      : 'No workflows reachable from this project. An org pack supplies them, or ' +
-        'define project-level ones with set_workflow_step.',
+    broken: broken.length > 0 ? broken : undefined,
+    hint:
+      (workflows.length
+        ? 'Call get_workflow(slug) for the resolved steps before starting that kind of work.'
+        : 'No workflows reachable from this project. An org pack supplies them, or ' +
+          'define project-level ones with set_workflow_step.') +
+      (broken.length
+        ? ` ${broken.length} workflow(s) do not resolve and are listed with their ` +
+          'error: say so rather than treating them as missing.'
+        : ''),
   };
 }
 
@@ -97,6 +115,17 @@ export function getWorkflow(ctx: ServerContext, rawArgs: unknown): unknown {
         ? ` Suppressed by a more specific layer: ${resolved.suppressed
             .map((s) => s.name)
             .join(', ')}.`
+        : '') +
+      (resolved.expanded.length
+        ? ` Expanded ${resolved.expanded.length} child workflow(s): ${resolved.expanded
+            .map((e) => e.slug)
+            .join(', ')}. A step name with a "/" came from the workflow before ` +
+          'the slash — the list is already flat and already in order, so do not ' +
+          'go looking for the child. To change one of those steps, change it there.'
+        : '') +
+      (resolved.steps.length > 3
+        ? ' More than three steps: open a run with start_workflow_run so "where was ' +
+          'I" survives a compaction, and advance_workflow_step as each one completes.'
         : ''),
   };
 }
@@ -143,6 +172,27 @@ export const setWorkflowStepInputSchema = {
         'decidable; guidance belongs in notes.',
     },
     notes: { type: 'string' as const, description: 'Free-form guidance for this step.' },
+    uses: {
+      type: 'string' as const,
+      description:
+        'Slug of another workflow to run at this point, instead of doing ' +
+        'something here. Mutually exclusive with `capability`: a step either ' +
+        'delegates or acts. The child\'s steps arrive namespaced ' +
+        '("child-slug/step-name") and keep being owned by the child, so they ' +
+        'are overridden in the child and not from here.',
+    },
+    workflow_name: {
+      type: 'string' as const,
+      description:
+        'Display name for the workflow, when creating it. Omit to inherit the ' +
+        'name the broader layer already gave it.',
+    },
+    standalone: {
+      type: 'boolean' as const,
+      description:
+        'Default true. False marks this workflow as a CHILD: hidden from the ' +
+        'list of rituals a user picks from, still invocable from a parent.',
+    },
     disabled: {
       type: 'boolean' as const,
       description: 'Switch off a step inherited from a broader layer.',
@@ -162,6 +212,9 @@ const setWorkflowStepArgsZ = z
     capability: z.string().min(1).max(80).optional(),
     condition: z.string().min(1).max(300).optional(),
     notes: z.string().max(2000).optional(),
+    uses: z.string().min(1).max(60).optional(),
+    workflow_name: z.string().min(1).max(120).optional(),
+    standalone: z.boolean().optional(),
     disabled: z.boolean().optional(),
   })
   .strict();
@@ -174,15 +227,59 @@ export function setWorkflowStep(ctx: ServerContext, rawArgs: unknown): unknown {
     assertCondition(args.condition, `step "${args.name}"`);
   }
 
+  // A step either delegates or acts. Enforced here rather than as a CHECK
+  // because SQLite cannot add a table-level constraint to an existing table,
+  // and a constraint only new databases have is worse than one nobody has.
+  if (args.uses && args.capability) {
+    throw new MyJarbisError(
+      ErrorType.INVALID_INPUT,
+      `step "${args.name}" has both uses="${args.uses}" and capability=` +
+        `"${args.capability}". A step either runs another workflow or does ` +
+        'something itself, never both: split it into two steps.',
+    );
+  }
+  if (args.uses === args.slug) {
+    throw new MyJarbisError(
+      ErrorType.INVALID_INPUT,
+      `step "${args.name}" would make "${args.slug}" invoke itself.`,
+    );
+  }
+
+  // A namespaced name is the RESOLVED name of a step that belongs to a child
+  // workflow, not an address anybody can write to. Accepting it would create a
+  // step literally called "commit-ritual/push" in the parent, which looks like
+  // an override, resolves as a second unrelated step, and has to be found by
+  // somebody wondering why their override does nothing.
+  if (args.name.includes('/')) {
+    throw new MyJarbisError(
+      ErrorType.INVALID_INPUT,
+      `"${args.name}" is a resolved name, not a writable one: the part before ` +
+        `the slash is the workflow that owns the step. Override it there — ` +
+        `set_workflow_step({ slug: "${args.name.split('/')[0]}", name: ` +
+        `"${args.name.split('/').slice(1).join('/')}", ... }).`,
+    );
+  }
+
   // 'user' scope is keyed by project too: there is no user table, and a
   // per-user layer that leaked across projects would be worse than none.
   const scopeId = project.id;
 
+  // The display name is INHERITED when not given.
+  //
+  // This used to be `name: args.slug` unconditionally, so adding one step at
+  // project scope to an org workflow called "Closing a ticket (Acme)" silently
+  // renamed it to "ticket-close" — the project layer is the more specific one,
+  // and the resolver takes its name. The user saw their org's workflow lose
+  // its name as a side effect of changing a gate.
+  const existingLayers = ctx.db.workflows.layersFor(args.slug, project.id, ctx.db.scopedOrgId);
+  const inheritedName = existingLayers[0]?.name;
+
   const wf = ctx.db.workflows.upsert({
     slug: args.slug,
-    name: args.slug,
+    name: args.workflow_name ?? inheritedName ?? args.slug,
     scope: args.scope,
     scopeId,
+    standalone: args.standalone,
   });
 
   // Position has to be inherited from the step being overridden, across
@@ -195,7 +292,7 @@ export function setWorkflowStep(ctx: ServerContext, rawArgs: unknown): unknown {
 
   if (position === undefined) {
     let inheritedMax = 0;
-    for (const layer of ctx.db.workflows.layersFor(args.slug, project.id, project.org_id)) {
+    for (const layer of ctx.db.workflows.layersFor(args.slug, project.id, ctx.db.scopedOrgId)) {
       for (const s of ctx.db.workflowSteps.listByWorkflow(layer.id)) {
         if (s.name === args.name && position === undefined) position = s.position;
         if (s.position > inheritedMax) inheritedMax = s.position;
@@ -212,17 +309,43 @@ export function setWorkflowStep(ctx: ServerContext, rawArgs: unknown): unknown {
     actor: args.actor ?? 'agent',
     gate: args.gate ?? 'none',
     capability: args.capability,
+    uses: args.uses,
     condition: args.condition,
     notes: args.notes,
     disabled: args.disabled,
   });
 
-  const resolved = resolveWorkflow(ctx, args.slug);
+  // The resolution is for the RESPONSE, not for validation, so it must not be
+  // able to fail the write. Writing a step that invokes a workflow which does
+  // not exist yet is the normal way a parent gets authored — you write the
+  // ritual, then you write its parts — and throwing here made that impossible:
+  // the row was already saved and the call reported an error anyway.
+  //
+  // The graph is checked where it is actually needed: at `get_workflow`, which
+  // names the offending parent step, and at pack load, where the whole set of
+  // slugs is known at once.
+  let resolvedSteps: string[] = [];
+  let unresolved: string | undefined;
+  try {
+    const resolved = resolveWorkflow(ctx, args.slug);
+    resolvedSteps = resolved.steps.map((s) => `${s.order}:${s.name} (${s.from})`);
+  } catch (err) {
+    unresolved = err instanceof MyJarbisError ? err.message : String(err);
+  }
+
   return {
     workflow: { slug: args.slug, scope: args.scope, id: wf.id },
     step: { id: step.id, name: step.name, position: step.position, gate: step.gate },
-    resolvedSteps: resolved.steps.map((s) => `${s.position}:${s.name} (${s.from})`),
-    hint: `Saved at ${args.scope} scope. user overrides project, project overrides org.`,
+    resolvedSteps,
+    hint:
+      `Saved at ${args.scope} scope. user overrides project, project overrides org.` +
+      (unresolved
+        ? ` The step is stored, but the workflow does not resolve yet: ${unresolved}`
+        : '') +
+      (args.uses
+        ? ` It invokes "${args.uses}", whose steps arrive namespaced as ` +
+          `"${args.uses}/<step>" and are overridden in "${args.uses}", not here.`
+        : ''),
   };
 }
 

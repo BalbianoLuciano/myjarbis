@@ -201,7 +201,7 @@ export function saveObservation(
   try {
     if (
       (args.kind === 'gotcha' || args.kind === 'error') &&
-      ctx.requireProject().org_id !== null
+      ctx.db.scopedOrgId !== null
     ) {
       promotable = true;
     }

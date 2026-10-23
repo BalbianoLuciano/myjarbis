@@ -1646,16 +1646,30 @@ export class MyJarbisDB {
       scope: WorkflowScope;
       scopeId: number;
       extends?: number | null;
+      standalone?: boolean;
     }): WorkflowRow => {
       if (params.scope === 'project') {
         this.assertInScope(params.scopeId, 'workflow');
       }
+      // `standalone` is only written when the caller said something. Omitting
+      // it on an update must not flip a child back into a top-level ritual
+      // just because somebody edited one of its steps.
       this.prep(
-        `INSERT INTO workflows(slug, name, scope, scope_id, extends)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO workflows(slug, name, scope, scope_id, extends, standalone)
+         VALUES (?, ?, ?, ?, ?, COALESCE(?, 1))
          ON CONFLICT(slug, scope, scope_id) DO UPDATE SET
-           name = excluded.name, extends = excluded.extends`,
-      ).run(params.slug, params.name, params.scope, params.scopeId, params.extends ?? null);
+           name       = excluded.name,
+           extends    = excluded.extends,
+           standalone = COALESCE(?, workflows.standalone)`,
+      ).run(
+        params.slug,
+        params.name,
+        params.scope,
+        params.scopeId,
+        params.extends ?? null,
+        params.standalone === undefined ? null : params.standalone ? 1 : 0,
+        params.standalone === undefined ? null : params.standalone ? 1 : 0,
+      );
       return this.workflows.find(params.slug, params.scope, params.scopeId)!;
     },
 
@@ -1668,16 +1682,38 @@ export class MyJarbisDB {
       (this.prep('SELECT * FROM workflows WHERE id = ?').get(id) as WorkflowRow | undefined) ??
       null,
 
-    /** Every slug reachable from a project: its own, its org's, the user's. */
-    listSlugs: (projectId: number, orgId: number | null): string[] => {
+    /**
+     * Every slug reachable from a project: its own, its org's, the user's.
+     *
+     * `scope = 'user'` is filtered by scope_id like the other two, and that
+     * is a FIX rather than a detail. `set_workflow_step` has always written
+     * user-scope rows with `scope_id = project.id` — there is no user table,
+     * and the comment at its write site says a per-user layer leaking across
+     * projects would be worse than none — but both reads here carried a bare
+     * `OR scope = 'user'`. In a shared brain that made a user-scope workflow
+     * written in one project resolvable from every other project in the file.
+     * Latent only because the table has never held a row.
+     *
+     * `standalone = 0` rows are hidden unless asked for: a workflow that only
+     * ever runs as a fragment of another should not be offered as a ritual of
+     * its own. It stays fully resolvable by slug, which is how a parent's
+     * `uses` step reaches it.
+     */
+    listSlugs: (
+      projectId: number,
+      orgId: number | null,
+      opts: { includeNonStandalone?: boolean } = {},
+    ): string[] => {
       this.assertInScope(projectId, 'workflow listing');
+      const standaloneFilter = opts.includeNonStandalone ? '' : ' AND standalone = 1';
       const rows = this.prep(
         `SELECT DISTINCT slug FROM workflows
-          WHERE (scope = 'project' AND scope_id = ?)
-             OR (scope = 'org'     AND scope_id = ?)
-             OR  scope = 'user'
+          WHERE ( (scope = 'project' AND scope_id = ?)
+               OR (scope = 'org'     AND scope_id = ?)
+               OR (scope = 'user'    AND scope_id = ?) )
+            ${standaloneFilter}
           ORDER BY slug`,
-      ).all(projectId, orgId ?? -1) as Array<{ slug: string }>;
+      ).all(projectId, orgId ?? -1, projectId) as Array<{ slug: string }>;
       return rows.map((r) => r.slug);
     },
 
@@ -1689,12 +1725,53 @@ export class MyJarbisDB {
           WHERE slug = ?
             AND ( (scope = 'org'     AND scope_id = ?)
                OR (scope = 'project' AND scope_id = ?)
-               OR  scope = 'user' )
+               OR (scope = 'user'    AND scope_id = ?) )
           ORDER BY CASE scope WHEN 'org' THEN 1 WHEN 'project' THEN 2 ELSE 3 END`,
-      ).all(slug, orgId ?? -1, projectId) as WorkflowRow[];
+      ).all(slug, orgId ?? -1, projectId, projectId) as WorkflowRow[];
     },
 
-    delete: (id: number): void => {
+    /**
+     * Remove a workflow row and, by cascade, its steps.
+     *
+     * Refuses an org-scope row: those come from a pack, `applyPack` is their
+     * only writer, and deleting one here would be undone by the next sync
+     * while looking like it worked.
+     *
+     * Refuses a workflow some other workflow invokes, naming the parent. A
+     * parent whose child is gone resolves to WORKFLOW_NOT_FOUND at the worst
+     * possible moment — mid-ritual, with the first steps already done.
+     */
+    delete: (id: number, opts: { force?: boolean } = {}): void => {
+      const row = this.workflows.findById(id);
+      if (!row) return;
+      if (row.scope === 'project') this.assertInScope(row.scope_id, 'workflow');
+      if (row.scope === 'org' && !opts.force) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `"${row.slug}" is an org-scope workflow: it comes from the org pack, and ` +
+            'removing it here would be restored by the next `org sync`. Remove it ' +
+            'from the pack instead.',
+          { slug: row.slug, scope: row.scope },
+        );
+      }
+      if (!opts.force) {
+        const parents = this.prep(
+          `SELECT DISTINCT w.slug AS parent, s.name AS step
+             FROM workflow_steps s
+             JOIN workflows w ON w.id = s.workflow_id
+            WHERE s.uses = ? AND s.disabled = 0`,
+        ).all(row.slug) as Array<{ parent: string; step: string }>;
+        if (parents.length > 0) {
+          throw new MyJarbisError(
+            ErrorType.INVALID_INPUT,
+            `"${row.slug}" is invoked by ${parents
+              .map((p) => `${p.parent} (step "${p.step}")`)
+              .join(', ')}. Removing it would break those mid-ritual. Remove the ` +
+              'invoking step first, or pass force.',
+            { slug: row.slug, parents },
+          );
+        }
+      }
       this.prep('DELETE FROM workflows WHERE id = ?').run(id);
     },
   };
@@ -1707,21 +1784,29 @@ export class MyJarbisDB {
       actor: string;
       gate?: StepGate;
       capability?: string | null;
+      uses?: string | null;
       condition?: string | null;
       notes?: string | null;
       overrides?: number | null;
       disabled?: boolean;
     }): WorkflowStepRow => {
+      if (params.uses && params.capability) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `step "${params.name}" cannot both delegate (uses) and act (capability).`,
+        );
+      }
       this.prep(
         `INSERT INTO workflow_steps(
-           workflow_id, position, name, actor, gate, capability,
+           workflow_id, position, name, actor, gate, capability, uses,
            condition, notes, overrides, disabled)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workflow_id, name) DO UPDATE SET
            position   = excluded.position,
            actor      = excluded.actor,
            gate       = excluded.gate,
            capability = excluded.capability,
+           uses       = excluded.uses,
            condition  = excluded.condition,
            notes      = excluded.notes,
            overrides  = excluded.overrides,
@@ -1733,6 +1818,7 @@ export class MyJarbisDB {
         params.actor,
         params.gate ?? 'none',
         params.capability ?? null,
+        params.uses ?? null,
         params.condition ?? null,
         params.notes ?? null,
         params.overrides ?? null,
@@ -1751,6 +1837,233 @@ export class MyJarbisDB {
     delete: (id: number): void => {
       this.prep('DELETE FROM workflow_steps WHERE id = ?').run(id);
     },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // Workflow runs — where a ritual got to, and how long each step took.
+  //
+  // A run is a SNAPSHOT of a resolution, not a pointer into it. Steps are
+  // stored by name, with the workflow that owned them, because the resolution
+  // has no row: it is computed from three layers plus any expansion, and it
+  // can legitimately change mid-ritual when somebody edits a step. A run that
+  // referenced step ids would silently re-point at a different process.
+  // ─────────────────────────────────────────────────────────────────
+  workflowRuns = {
+    open: (params: {
+      projectId: number;
+      slug: string;
+      sessionId: number | null;
+      steps: Array<{ position: number; name: string; fromWorkflow: string; actor: string }>;
+    }): { run: WorkflowRunRow; steps: WorkflowRunStepRow[] } => {
+      this.assertInScope(params.projectId, 'workflow run');
+      const info = this.prep(
+        `INSERT INTO workflow_runs(project_id, slug, session_id) VALUES (?, ?, ?)`,
+      ).run(params.projectId, params.slug, params.sessionId);
+      const runId = Number(info.lastInsertRowid);
+
+      // The first step is 'active' from the start: a run whose every step is
+      // 'pending' cannot answer "where was I", which is the only question it
+      // exists to answer.
+      params.steps.forEach((s, i) => {
+        this.prep(
+          `INSERT INTO workflow_run_steps(
+             run_id, position, step_name, from_workflow, status, started_at, actor)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          runId,
+          s.position,
+          s.name,
+          s.fromWorkflow,
+          i === 0 ? 'active' : 'pending',
+          i === 0 ? new Date().toISOString().replace('T', ' ').slice(0, 19) : null,
+          s.actor,
+        );
+      });
+
+      return {
+        run: this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(runId) as WorkflowRunRow,
+        steps: this.workflowRunSteps.listByRun(runId),
+      };
+    },
+
+    findOpen: (projectId: number, slug?: string): WorkflowRunRow | null => {
+      this.assertInScope(projectId, 'workflow run');
+      const sql = slug
+        ? `SELECT * FROM workflow_runs WHERE project_id = ? AND slug = ? AND status = 'open'
+             ORDER BY id DESC LIMIT 1`
+        : `SELECT * FROM workflow_runs WHERE project_id = ? AND status = 'open'
+             ORDER BY id DESC LIMIT 1`;
+      const row = slug
+        ? this.prep(sql).get(projectId, slug)
+        : this.prep(sql).get(projectId);
+      return (row as WorkflowRunRow | undefined) ?? null;
+    },
+
+    findById: (id: number): WorkflowRunRow | null => {
+      const row = this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(id) as
+        | WorkflowRunRow
+        | undefined;
+      if (!row) return null;
+      this.assertInScope(row.project_id, 'workflow run');
+      return row;
+    },
+
+    listByProject: (
+      projectId: number,
+      opts: { status?: WorkflowRunStatus[]; limit?: number } = {},
+    ): WorkflowRunRow[] => {
+      this.assertInScope(projectId, 'workflow run');
+      const where = ['project_id = ?'];
+      const params: unknown[] = [projectId];
+      if (opts.status && opts.status.length > 0) {
+        where.push(`status IN (${opts.status.map(() => '?').join(',')})`);
+        params.push(...opts.status);
+      }
+      params.push(opts.limit ?? 50);
+      return this.prep(
+        `SELECT * FROM workflow_runs WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`,
+      ).all(...params) as WorkflowRunRow[];
+    },
+
+    close: (id: number, status: 'done' | 'abandoned'): WorkflowRunRow => {
+      const run = this.workflowRuns.findById(id);
+      if (!run) {
+        throw new MyJarbisError(ErrorType.RESOURCE_NOT_FOUND, `No workflow run with id ${id}.`);
+      }
+      this.prep(`UPDATE workflow_runs SET status = ?, ended_at = datetime('now') WHERE id = ?`).run(
+        status,
+        id,
+      );
+      return this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(id) as WorkflowRunRow;
+    },
+
+    /**
+     * Open runs whose session is closed or gone.
+     *
+     * The session dying is the normal way a ritual ends unfinished — the editor
+     * was closed, the machine slept — and a run left 'open' forever would make
+     * the next `start_workflow_run` refuse to start anything, which is a wedged
+     * ritual rather than a recorded one.
+     */
+    listOrphaned: (projectId: number): WorkflowRunRow[] => {
+      this.assertInScope(projectId, 'workflow run');
+      return this.prep(
+        `SELECT r.* FROM workflow_runs r
+           LEFT JOIN sessions s ON s.id = r.session_id
+          WHERE r.project_id = ?
+            AND r.status = 'open'
+            AND (r.session_id IS NULL OR s.id IS NULL OR s.ended_at IS NOT NULL)
+          ORDER BY r.id`,
+      ).all(projectId) as WorkflowRunRow[];
+    },
+  };
+
+  workflowRunSteps = {
+    listByRun: (runId: number): WorkflowRunStepRow[] =>
+      this.prep(
+        'SELECT * FROM workflow_run_steps WHERE run_id = ? ORDER BY position, id',
+      ).all(runId) as WorkflowRunStepRow[],
+
+    current: (runId: number): WorkflowRunStepRow | null =>
+      (this.prep(
+        `SELECT * FROM workflow_run_steps WHERE run_id = ? AND status = 'active'
+           ORDER BY position, id LIMIT 1`,
+      ).get(runId) as WorkflowRunStepRow | undefined) ?? null,
+
+    advance: (params: {
+      runId: number;
+      stepName: string;
+      status: 'done' | 'skipped' | 'blocked';
+      note?: string | null;
+      actor?: string | null;
+    }): { completed: WorkflowRunStepRow; next: WorkflowRunStepRow | null } => {
+      const run = this.workflowRuns.findById(params.runId);
+      if (!run) {
+        throw new MyJarbisError(
+          ErrorType.RESOURCE_NOT_FOUND,
+          `No workflow run with id ${params.runId}.`,
+        );
+      }
+      const step = this.prep(
+        'SELECT * FROM workflow_run_steps WHERE run_id = ? AND step_name = ?',
+      ).get(params.runId, params.stepName) as WorkflowRunStepRow | undefined;
+      if (!step) {
+        const names = this.workflowRunSteps
+          .listByRun(params.runId)
+          .map((s) => s.step_name)
+          .join(', ');
+        throw new MyJarbisError(
+          ErrorType.RESOURCE_NOT_FOUND,
+          `Run ${params.runId} has no step "${params.stepName}". It has: ${names}.`,
+        );
+      }
+      // A skip with no reason is the thing that makes a run log worthless
+      // later: "step 3 skipped" answers nothing a month afterwards.
+      if (params.status === 'skipped' && !params.note) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `Skipping "${params.stepName}" needs a reason. A run log that records ` +
+            'what was skipped without why cannot be read later.',
+        );
+      }
+
+      this.prep(
+        `UPDATE workflow_run_steps
+            SET status = ?, completed_at = datetime('now'),
+                note = COALESCE(?, note), actor = COALESCE(?, actor),
+                started_at = COALESCE(started_at, datetime('now'))
+          WHERE id = ?`,
+      ).run(params.status, params.note ?? null, params.actor ?? null, step.id);
+
+      const next =
+        (this.prep(
+          `SELECT * FROM workflow_run_steps
+            WHERE run_id = ? AND status = 'pending'
+            ORDER BY position, id LIMIT 1`,
+        ).get(params.runId) as WorkflowRunStepRow | undefined) ?? null;
+      if (next) {
+        this.prep(
+          `UPDATE workflow_run_steps SET status = 'active', started_at = datetime('now')
+            WHERE id = ?`,
+        ).run(next.id);
+      }
+
+      return {
+        completed: this.prep('SELECT * FROM workflow_run_steps WHERE id = ?').get(
+          step.id,
+        ) as WorkflowRunStepRow,
+        next: next
+          ? (this.prep('SELECT * FROM workflow_run_steps WHERE id = ?').get(
+              next.id,
+            ) as WorkflowRunStepRow)
+          : null,
+      };
+    },
+
+    /**
+     * Seconds per step. The "split the hours" query.
+     *
+     * Measured, not estimated: `completed_at - started_at` on rows a human
+     * actually walked through. `null` for a step that has not finished, which
+     * is different from zero.
+     */
+    timings: (
+      runId: number,
+    ): Array<{ stepName: string; fromWorkflow: string; status: string; seconds: number | null }> =>
+      this.prep(
+        `SELECT step_name AS stepName, from_workflow AS fromWorkflow, status,
+                CASE WHEN completed_at IS NOT NULL AND started_at IS NOT NULL
+                     THEN CAST(ROUND((julianday(completed_at) - julianday(started_at)) * 86400) AS INTEGER)
+                     ELSE NULL END AS seconds
+           FROM workflow_run_steps
+          WHERE run_id = ?
+          ORDER BY position, id`,
+      ).all(runId) as Array<{
+        stepName: string;
+        fromWorkflow: string;
+        status: string;
+        seconds: number | null;
+      }>,
   };
 
   // ─────────────────────────────────────────────────────────────────

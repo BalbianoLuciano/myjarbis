@@ -115,6 +115,16 @@ import {
   listOrgNotes,
   listOrgNotesInputSchema,
 } from './tools/orgMemory.js';
+import {
+  startWorkflowRun,
+  startWorkflowRunInputSchema,
+  advanceWorkflowStep,
+  advanceWorkflowStepInputSchema,
+  closeWorkflowRun,
+  closeWorkflowRunInputSchema,
+  getWorkflowRun,
+  getWorkflowRunInputSchema,
+} from './tools/workflowRuns.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool registry
@@ -395,9 +405,53 @@ function buildToolRegistry(): RegisteredTool[] {
     },
     {
       name: 'list_workflows',
-      description: 'Workflow slugs reachable from this project, with their layers.',
+      description:
+        'Workflow slugs reachable from this project, with their layers and which ' +
+        'child workflows each one invokes. Children are not listed on their own.',
       inputSchema: listWorkflowsInputSchema,
       handler: (ctx) => listWorkflowsTool(ctx),
+    },
+    {
+      // Not deferred: the whole point is that "where was I" survives a
+      // compaction, and a tool whose schema has to be fetched first is a tool
+      // the agent skips exactly when the context is already tight.
+      name: 'start_workflow_run',
+      description:
+        'Begin following a workflow, recording where you get to. Use it for any ' +
+        'ritual longer than three steps: a compaction keeps almost none of the ' +
+        'commands you ran, and "I have done steps 1-4" is the kind of sentence ' +
+        'that does not survive one. Refuses to start a second run of the same ' +
+        'workflow and tells you where the first one got to instead.',
+      inputSchema: startWorkflowRunInputSchema,
+      handler: (ctx, args) => startWorkflowRun(ctx, args),
+    },
+    {
+      name: 'advance_workflow_step',
+      description:
+        'Record the current step as done, skipped or blocked, and activate the ' +
+        'next. "skipped" requires a reason. Defaults to the open run and its ' +
+        'active step, so the common call takes no arguments at all.',
+      inputSchema: advanceWorkflowStepInputSchema,
+      handler: (ctx, args) => advanceWorkflowStep(ctx, args),
+    },
+    {
+      name: 'close_workflow_run',
+      description:
+        'Finish a run. "done" is refused while steps are unfinished; ' +
+        '"abandoned" is always allowed and is the honest record when the ritual ' +
+        'was not completed.',
+      inputSchema: closeWorkflowRunInputSchema,
+      handler: (ctx, args) => closeWorkflowRun(ctx, args),
+      deferred: true,
+    },
+    {
+      name: 'get_workflow_run',
+      description:
+        'Where a ritual got to and how long each step took. The answer to ' +
+        '"where was I" as a row rather than as prose.',
+      inputSchema: getWorkflowRunInputSchema,
+      handler: (ctx, args) => getWorkflowRun(ctx, args),
+      deferred: true,
     },
     {
       name: 'set_workflow_step',
