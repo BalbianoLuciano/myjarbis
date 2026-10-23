@@ -74,6 +74,7 @@ SUITES=(
   v050-perf-budget
   v050-stress
   v050-hostile
+  v050-update-dryrun
 )
 
 # ─── what to print when a suite fails ─────────────────────────────

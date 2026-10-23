@@ -102,6 +102,20 @@ sync_executables() {
     done
 }
 
+# Print the lines a report-mode command produced, or say there were none.
+# A bare header with nothing under it reads as a bug in the reporter rather
+# than as "there is nothing to do", which is the usual answer.
+report_lines() {
+    local out="$1" pattern="$2" empty="$3" n=0
+    while read -r l; do
+        [ -z "$l" ] && continue
+        note "  $l"
+        n=$((n+1))
+    done < <(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -iE "$pattern" | head -6)
+    [ "$n" = "0" ] && note "  $empty"
+    return 0
+}
+
 # Propagation is ON by default.
 #
 # It used to be opt-in behind --projects, and the three things that need
@@ -124,6 +138,7 @@ SOURCE_OVERRIDE=""
 SKIP_PULL=""
 ASSUME_YES=""
 PROJECTS_ONLY=""
+DRY_RUN=""
 
 for arg in "$@"; do
     case "$arg" in
@@ -136,9 +151,10 @@ for arg in "$@"; do
         --projects-only) SYNC_PROJECTS=1; PROJECTS_ONLY=1 ;;
         --no-pull)    SKIP_PULL=1 ;;
         --yes|-y)     ASSUME_YES=1 ;;
+        --dry-run|-n) DRY_RUN=1 ;;
         --from=*)     SOURCE_OVERRIDE="${arg#*=}" ;;
         --help|-h)
-            echo "Usage: myjarbis update [--projects-only|--no-projects] [--no-pull] [--yes] [--from=<path>]"
+            echo "Usage: myjarbis update [--dry-run] [--projects-only|--no-projects] [--no-pull] [--yes] [--from=<path>]"
             echo
             echo "  By default this also propagates to every registered project:"
             echo "  hook scripts and their wiring, slash commands, and baseline"
@@ -151,6 +167,9 @@ for arg in "$@"; do
             echo "                   the rebuild, so a running Claude session keeps"
             echo "                   working. Use this to fix unwired projects."
             echo "  --no-pull        Re-sync from the local checkout without pulling."
+            echo "  --dry-run, -n    Report what WOULD change, per project, writing nothing."
+            echo "                   Run this first: the real run rebuilds the MCP"
+            echo "                   server a running Claude session is attached to."
             echo "  --yes, -y        Do not ask anything, even with Claude Code running."
             echo "  --from=<path>    Use this checkout as the source and remember it."
             exit 0
@@ -163,6 +182,9 @@ echo
 echo -e "${RED}${BOLD}MyJarbis${NC} · update"
 echo
 echo -e "  ${BOLD}Install${NC}  $INSTALL_DIR"
+if [ -n "$DRY_RUN" ]; then
+    echo -e "  ${BOLD}Mode${NC}     ${RED}${BOLD}dry run${NC} — nothing will be written"
+fi
 
 if [ ! -d "$INSTALL_DIR" ]; then
     fail "MyJarbis is not installed at $INSTALL_DIR"
@@ -191,7 +213,7 @@ fi
 # Skipped entirely for --projects-only: that path never rebuilds, so the
 # running session keeps the build it is attached to. Warning anyway would
 # train people to ignore the warning on the run that does matter.
-if [ -z "$PROJECTS_ONLY" ] && command -v pgrep >/dev/null 2>&1; then
+if [ -z "$PROJECTS_ONLY" ] && [ -z "$DRY_RUN" ] && command -v pgrep >/dev/null 2>&1; then
     CLAUDE_PIDS="$(pgrep -x claude 2>/dev/null | tr '\n' ' ' | sed 's/ $//')" || CLAUDE_PIDS=""
     if [ -n "$CLAUDE_PIDS" ]; then
         # The warning prints even with --yes. That flag says "do not ask me",
@@ -258,7 +280,9 @@ else
     fi
     # Only remembered on a run that actually syncs from it. --projects-only
     # may have been handed a --from purely to name the checkout to protect.
-    [ -z "$PROJECTS_ONLY" ] && printf '%s\n' "$SOURCE" > "$INSTALL_DIR/.source"
+    # Not remembered in a dry run: the point is to change nothing, and
+    # .source is a real write with a real consequence for the next run.
+    [ -z "$PROJECTS_ONLY" ] && [ -z "$DRY_RUN" ] && printf '%s\n' "$SOURCE" > "$INSTALL_DIR/.source"
     note "$SOURCE"
     ok
 fi
@@ -277,6 +301,47 @@ note "skipped — --projects-only"
 ok
 step 4 "Install dependencies and rebuild"
 note "skipped — --projects-only (the running build is left alone)"
+ok
+
+elif [ -n "$DRY_RUN" ]; then
+
+# Steps 2-4 reported rather than performed. Each one says what it WOULD do
+# and, where it is cheap to find out, how much there is to do — `git` can
+# answer "how far behind" without fetching, and the installed build's version
+# is readable without rebuilding it.
+step 2 "Pull latest changes"
+if [ -n "$SKIP_PULL" ]; then
+    note "would skip the pull — --no-pull given"
+elif [ -d "$SOURCE/.git" ]; then
+    BRANCH="$(git -C "$SOURCE" rev-parse --abbrev-ref HEAD 2>/dev/null || echo HEAD)"
+    if [ -n "$(git -C "$SOURCE" status --porcelain 2>/dev/null)" ]; then
+        warn "the checkout has uncommitted changes — a real run would NOT pull"
+        note "it would install what is in the working tree, on branch $BRANCH"
+    else
+        BEHIND="$(git -C "$SOURCE" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo '?')"
+        if [ "$BEHIND" = "0" ]; then
+            note "branch $BRANCH is up to date with its upstream"
+        else
+            note "branch $BRANCH is $BEHIND commit(s) behind its upstream"
+        fi
+    fi
+else
+    note "not a git checkout — would install the files as they are"
+fi
+ok
+
+step 3 "Sync code, templates and CLI"
+note "would copy $SOURCE/global/* into $INSTALL_DIR (except the registry)"
+note "and $SOURCE/bin/* into $INSTALL_DIR/bin"
+INSTALLED_VER="$(node -e "try{console.log(require('$INSTALL_DIR/mcp-server/package.json').version)}catch(e){console.log('?')}" 2>/dev/null || echo '?')"
+SOURCE_VER="$(node -e "try{console.log(require('$SOURCE/global/mcp-server/package.json').version)}catch(e){console.log('?')}" 2>/dev/null || echo '?')"
+note "version: installed $INSTALLED_VER → source $SOURCE_VER"
+ok
+
+step 4 "Install dependencies and rebuild"
+note "would run npm install and npm run build in $INSTALL_DIR/mcp-server"
+warn "that is the step a running Claude session cannot survive"
+note "it replaces the build the session is attached to; close Claude first"
 ok
 
 else
@@ -448,7 +513,11 @@ process.stdin.on('end', () => {
         # true: the loop below copies .claude-plugin/ and nothing else.
         # Commands are files in .claude/commands/ and have their own
         # propagation path, `myjarbis commands sync`.
-        note "refreshing hooks in $NEEDS_HOOKS project(s)..."
+        if [ -n "$DRY_RUN" ]; then
+            note "$NEEDS_HOOKS project(s) would have their hooks touched:"
+        else
+            note "refreshing hooks in $NEEDS_HOOKS project(s)..."
+        fi
         while IFS=$'\t' read -r status name dir hooks schema isolation wiring; do
             [ "${status:-}" != "OK" ] && continue
             # The skip condition used to be `hooks = current` alone, which
@@ -477,6 +546,20 @@ process.stdin.on('end', () => {
             if [ -n "$SOURCE" ] && [ "$(cd "$dir" 2>/dev/null && pwd)" = "$SOURCE" ]; then
                 note "  $name — source checkout: re-wiring only, templates left alone"
                 WANT_COPY=
+            fi
+
+            if [ -n "$DRY_RUN" ]; then
+                # Reported, not repaired. The two halves are named separately
+                # because they are fixed by different things and a reader needs
+                # to know which one is wrong.
+                WOULD=""
+                [ -n "$WANT_COPY" ] && WOULD="replace .claude-plugin/"
+                if [ -n "$WANT_WIRE" ]; then
+                    [ -n "$WOULD" ] && WOULD="$WOULD + "
+                    WOULD="${WOULD}rewrite the hook wiring"
+                fi
+                note "  $name — would $WOULD"
+                continue
             fi
 
             if [ -n "$WANT_COPY" ] && [ -d "$INSTALL_DIR/templates/.claude-plugin" ]; then
@@ -530,11 +613,19 @@ process.stdin.on('end', () => {
         # update. The same applies to the greps — grep exits 1 when it matches
         # nothing, and under pipefail that kills the run.
         echo
-        note "syncing slash commands..."
-        CMD_OUT=$("${MJ_CLI[@]}" commands sync --all --apply 2>&1 || true)
-        echo "$CMD_OUT" | sed 's/\x1b\[[0-9;]*m//g' \
-            | grep -iE "updated|wrote|current|diverged|Nothing|Every project" \
-            | head -6 | while read -r l; do note "  $l"; done || true
+        # `--apply` is what makes these WRITE. Dropping it is the whole dry
+        # run: the classification is identical either way, so the report is
+        # exactly the list a real run would act on, produced by the same code
+        # rather than by a prediction that can drift from it.
+        APPLY_FLAG="--apply"
+        [ -n "$DRY_RUN" ] && APPLY_FLAG=""
+        if [ -n "$DRY_RUN" ]; then
+            note "slash commands that would change:"
+        else
+            note "syncing slash commands..."
+        fi
+        CMD_OUT=$("${MJ_CLI[@]}" commands sync --all $APPLY_FLAG 2>&1 || true)
+        report_lines "$CMD_OUT" "updated|wrote|current|diverged|Nothing|Every project" "nothing to change"
 
         # ── Baseline skills ─────────────────────────────────────────
         #
@@ -553,7 +644,7 @@ process.stdin.on('end', () => {
         # with no warning. Up to 9 project-level rows per project, no deletes,
         # but across a shared brain there is no transaction spanning projects:
         # a failure halfway leaves a partial reseed.
-        if [ -f "$INSTALL_DIR/mcp-server/build/cli.js" ]; then
+        if [ -z "$DRY_RUN" ] && [ -f "$INSTALL_DIR/mcp-server/build/cli.js" ]; then
             BRAIN="${MYJARBIS_HOME:-$HOME/.myjarbis}/memory.db"
             if [ -f "$BRAIN" ]; then
                 BACKUP_DIR="$INSTALL_DIR/backups"
@@ -568,11 +659,33 @@ process.stdin.on('end', () => {
             fi
         fi
 
-        note "reseeding baseline skills..."
-        SKILL_OUT=$("${MJ_CLI[@]}" skill reseed --all --apply 2>&1 || true)
-        echo "$SKILL_OUT" | sed 's/\x1b\[[0-9;]*m//g' \
-            | grep -iE "updated|inserted|unchanged|project" \
-            | head -6 | while read -r l; do note "  $l"; done || true
+        if [ -n "$DRY_RUN" ]; then
+            note "baseline skills that would change:"
+        else
+            note "reseeding baseline skills..."
+        fi
+        SKILL_OUT=$("${MJ_CLI[@]}" skill reseed --all $APPLY_FLAG 2>&1 || true)
+        report_lines "$SKILL_OUT" "updated|inserted|unchanged|project" "nothing to change"
+
+        # ── Baseline workflows ──────────────────────────────────────
+        #
+        # Rows too, and until now `update` did not carry them at all — so the
+        # four baselines `init` seeds would have reached new projects only,
+        # which is exactly the trap `skill reseed` and `commands sync` were
+        # built to close. "Anything seeded by init needs a propagation path on
+        # day one, or improving it silently helps nobody who already uses the
+        # tool."
+        #
+        # Safe unattended for the same reason reseed is, and a stronger one: it
+        # never reverts a step overridden at project or user scope, so a team
+        # that turned a gate off keeps it off.
+        if [ -n "$DRY_RUN" ]; then
+            note "baseline workflows that would change:"
+        else
+            note "reseeding baseline workflows..."
+        fi
+        WF_OUT=$("${MJ_CLI[@]}" workflow reseed --all $APPLY_FLAG 2>&1 || true)
+        report_lines "$WF_OUT" "created|extended|left alone|unchanged|nothing to do" "nothing to change"
 
         # ── And onto disk ───────────────────────────────────────────
         #
@@ -588,11 +701,29 @@ process.stdin.on('end', () => {
         # business deleting anything, and strictly additive is the behaviour
         # that needs no explanation. Only myjarbis-* folders are ever touched
         # either way, so a user-authored skill beside them is never at risk.
-        note "re-materializing skills to disk..."
+        if [ -n "$DRY_RUN" ]; then
+            note "skills that would be written to disk:"
+        else
+            note "re-materializing skills to disk..."
+        fi
         MAT_OK=0; MAT_FAIL=0
         PERM_OK=0
+        MAT_WOULD=0
         while IFS=$'\t' read -r status name dir hooks schema isolation wiring; do
             [ "${status:-}" != "OK" ] && continue
+            if [ -n "$DRY_RUN" ]; then
+                # `--dry-run` reports the same `written` list a real run acts
+                # on, computed by the same comparison.
+                N=$( ( cd "$dir" && env -u MYJARBIS_PROJECT node \
+                       "$INSTALL_DIR/mcp-server/build/cli.js" skill materialize \
+                       --no-cleanup --dry-run 2>/dev/null ) \
+                     | node -e "let r='';process.stdin.on('data',d=>r+=d).on('end',()=>{try{console.log((JSON.parse(r).written||[]).length)}catch(e){console.log('?')}})" 2>/dev/null || echo '?')
+                if [ "$N" != "0" ] && [ "$N" != "?" ]; then
+                    note "  $name — $N skill file(s) would be written"
+                    MAT_WOULD=$((MAT_WOULD+1))
+                fi
+                continue
+            fi
             if ( cd "$dir" && env -u MYJARBIS_PROJECT node \
                  "$INSTALL_DIR/mcp-server/build/cli.js" skill materialize --no-cleanup ) >/dev/null 2>&1; then
                 MAT_OK=$((MAT_OK+1))
@@ -618,9 +749,21 @@ process.stdin.on('end', () => {
                 PERM_OK=$((PERM_OK+1))
             fi
         done <<< "$REPORT"
-        note "  $MAT_OK project(s) re-materialized$([ "$MAT_FAIL" -gt 0 ] && echo ", $MAT_FAIL failed")"
-        note "  $PERM_OK project(s) have the read-only permission baseline"
-        note "no need to reopen Claude for the skills — they are on disk now"
+        if [ -n "$DRY_RUN" ]; then
+            if [ "$MAT_WOULD" = "0" ]; then
+                note "  every project already has its skills on disk"
+            else
+                note "  $MAT_WOULD project(s) would get new skill files"
+            fi
+            echo
+            note "NOTHING WAS WRITTEN. Re-run without --dry-run to apply,"
+            note "with Claude Code closed — step 4 replaces the build a running"
+            note "session is attached to."
+        else
+            note "  $MAT_OK project(s) re-materialized$([ "$MAT_FAIL" -gt 0 ] && echo ", $MAT_FAIL failed")"
+            note "  $PERM_OK project(s) have the read-only permission baseline"
+            note "no need to reopen Claude for the skills — they are on disk now"
+        fi
     else
         note "skipped projects (--no-projects): commands and skills not propagated"
     fi
@@ -638,7 +781,13 @@ process.stdin.on('end', () => {
 fi
 
 echo
-echo -e "${RED}${BOLD}Done${NC}"
-echo
-echo -e "  Restart Claude Code to pick up the new server and hooks."
+if [ -n "$DRY_RUN" ]; then
+    echo -e "${RED}${BOLD}Dry run${NC}"
+    echo
+    echo -e "  Nothing was written. Close Claude Code, then: ${BOLD}myjarbis update${NC}"
+else
+    echo -e "${RED}${BOLD}Done${NC}"
+    echo
+    echo -e "  Restart Claude Code to pick up the new server and hooks."
+fi
 echo

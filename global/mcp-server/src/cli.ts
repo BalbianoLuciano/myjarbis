@@ -889,6 +889,7 @@ function runSkill(argv: string[]): void {
         const result = materializeSkills(ctx, {
           module: flags.module as string | undefined,
           cleanup_stale: flags['no-cleanup'] !== true,
+          dry_run: truthy(flags['dry-run']) ? true : undefined,
         });
         printJson(result);
         return;
