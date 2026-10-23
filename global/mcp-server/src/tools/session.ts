@@ -25,6 +25,7 @@ import {
 } from '../db/schema.js';
 import { generateModuleDiagram, isDiagramAuto } from '../diagram/generate.js';
 import { openInVscode } from '../diagram/open.js';
+import { proposePromotions } from './orgMemory.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Stale-resume detection
@@ -444,6 +445,17 @@ export interface EndSessionResult {
   nextSession: string;
   module: { id: number; name: string };
   observationsCount: number;
+  /**
+   * What this session learned that the team might want, when the project is
+   * in an org. Absent otherwise, which is every project today.
+   *
+   * Offered HERE, at the close, and nowhere else: SAP's deployment of the
+   * same idea reports that the thing which decides whether a shared memory
+   * lives or dies is whether contributing costs a developer anything at a
+   * moment they were already stopping. Mid-task it is an interruption; at
+   * the close it is one keystroke.
+   */
+  promotionProposals?: { count: number; org: string; display: string; hint: string };
 }
 
 export function endSession(
@@ -457,6 +469,25 @@ export function endSession(
   const module = ctx.db.modules.findById(moduleId)!;
   const observations = ctx.db.observations.listBySession(sessionId);
 
+  // Computed BEFORE clearing the active session, and best-effort: a session
+  // must close even if the org mirror cannot be read. Losing a handoff to
+  // make a suggestion would be the wrong trade by a wide margin.
+  let proposals: EndSessionResult['promotionProposals'];
+  try {
+    const p = proposePromotions(ctx, { sessionId });
+    if (p.org && p.proposals.some((x) => !x.alreadyThere)) {
+      proposals = {
+        count: p.proposals.filter((x) => !x.alreadyThere).length,
+        org: p.org.slug,
+        display: p.display,
+        hint: p.hint,
+      };
+    }
+  } catch {
+    // No org, no registry, an unreadable mirror: all of them mean "nothing to
+    // offer", none of them mean "do not close the session".
+  }
+
   ctx.clearActiveSession();
 
   return {
@@ -467,6 +498,7 @@ export function endSession(
     nextSession: closed.next_session!,
     module: { id: module.id, name: module.name },
     observationsCount: observations.length,
+    promotionProposals: proposals,
   };
 }
 

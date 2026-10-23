@@ -331,6 +331,129 @@ console.log(out.join('\n'));
 " > "$ASSERTS" 2>"$WORK/err4" || { echo "    ✗ node block crashed"; cat "$WORK/err4" >&2; FAILED=$((FAILED + 1)); }
 read_asserts
 
+echo "→ [5] what gets proposed, and what never does"
+cd "$WORK/alpha"
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession, endSession } from '$B/tools/session.js';
+import { saveObservation } from '$B/tools/observations.js';
+import { proposePromotions } from '$B/tools/orgMemory.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  const s = startSession(ctx, { module: '_general' });
+
+  const g = saveObservation(ctx, { kind: 'gotcha', title: 'A wombatword breaks the build', content: 'because of the thing' });
+  const e = saveObservation(ctx, { kind: 'error', title: 'The wombatword deploy is red', content: 'missing env var' });
+  const p = saveObservation(ctx, { kind: 'progress', title: 'wombatword story done', content: 'shipped' });
+  const dLocal = saveObservation(ctx, { kind: 'decision', title: 'Use a local cache here', content: 'for this module only' });
+  const dTeam = saveObservation(ctx, { kind: 'decision', title: 'Commits carry Why and What for', content: 'everywhere', topic_key: 'conventions/commit-format' });
+
+  t(g.promotable === true, 'saving a gotcha reports it as promotable');
+  t(e.promotable === true, 'and so does an error');
+  t(p.promotable === undefined, 'a progress note is not flagged');
+
+  const prop = proposePromotions(ctx, { sessionId: s.sessionId });
+  const ids = prop.proposals.map((x) => x.observationId);
+  t(prop.org && prop.org.slug === 'acme', 'the proposal names the org');
+  t(ids.includes(g.observationId), 'a gotcha is proposed');
+  t(ids.includes(e.observationId), 'an error is proposed');
+  t(!ids.includes(p.observationId), 'a progress note is NEVER proposed');
+  t(!ids.includes(dLocal.observationId), 'a local decision is not proposed');
+  t(ids.includes(dTeam.observationId), 'but a decision under a conventions/ topic key is');
+  t(prop.proposals.find((x) => x.observationId === dTeam.observationId).reason === 'decision-convention',
+    'and it says why');
+
+  // The display is rendered server-side and bounded, like the module menu.
+  t(prop.display.includes('acme'), 'the display names the org');
+  t(prop.display.includes('never promoted'), 'and states what can never travel');
+  t(prop.display.length < 1200, 'and stays small enough to print at a close');
+
+  // An explicitly named id overrides the kind rules -- a default that cannot
+  // be overridden is wrong about something sooner or later.
+  const forced = proposePromotions(ctx, { observationIds: [p.observationId] });
+  t(forced.proposals.length === 1 && forced.proposals[0].reason === 'asked-for',
+    'a progress note named explicitly IS offered, marked as asked-for');
+
+  // And the close carries the offer, which is the only moment it is cheap.
+  const closed = endSession(ctx, { summary: 'did some things', next_session: 'do the next things' });
+  t(closed.promotionProposals !== undefined, 'end_session carries the proposals');
+  t(closed.promotionProposals.count >= 3, 'with a count of what is still open');
+  t(closed.promotionProposals.org === 'acme', 'and the org they would go to');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/err5" || { echo "    ✗ node block crashed"; cat "$WORK/err5" >&2; FAILED=$((FAILED + 1)); }
+read_asserts
+
+echo "→ [6] the gate blocks, and nothing is written when it does"
+cd "$WORK/alpha"
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession } from '$B/tools/session.js';
+import { saveObservation } from '$B/tools/observations.js';
+import { promoteObservation } from '$B/tools/orgMemory.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  startSession(ctx, { module: '_general' });
+  const org = ctx.db.orgs.findBySlug('acme');
+  const before = ctx.db.orgNotes.countByOrg(org.id);
+
+  const leaky = saveObservation(ctx, {
+    kind: 'gotcha',
+    title: 'The numbatword path matters',
+    content: 'It reads $WORK/alpha/src/a.ts and the token is ghp_abcdefghijklmnopqrstuvwxyz0123',
+  });
+
+  let err = null;
+  try { promoteObservation(ctx, { observation_id: leaky.observationId }); } catch (e) { err = e; }
+  t(err !== null && String(err.type) === 'ORG_NOTE_UNSAFE', 'a leaky note is refused');
+  t(ctx.db.orgNotes.countByOrg(org.id) === before,
+    'and NOTHING was written -- the assertion that matters most in this file');
+  t(err && String(err.message).includes('→'), 'the refusal shows the proposed rewrite');
+  t(err && err.details && err.details.findings.length >= 2, 'and lists every finding at once');
+
+  // Accepting the rewrites promotes the SCRUBBED text, not the original.
+  const ok = promoteObservation(ctx, { observation_id: leaky.observationId, apply_rewrites: true });
+  t(ok.status === 'inserted', 'with apply_rewrites it is promoted');
+  t(ok.rewritten === true, 'and reported as rewritten');
+  const stored = ctx.db.orgNotes.findById(ok.orgNoteId);
+  t(!stored.answer.includes('ghp_'), 'the stored text has no token');
+  t(!stored.answer.includes('$WORK/alpha'), 'and no local path');
+  t(stored.author_handle === 'Dev Of alpha', 'the author is the git identity of this repo');
+  t(stored.author_source === 'git', 'recorded as coming from git');
+
+  // verified requires evidence: it means somebody OBSERVED this.
+  const clean = saveObservation(ctx, { kind: 'gotcha', title: 'A tenrecword is fine', content: 'no secrets here' });
+  let err2 = null;
+  try {
+    promoteObservation(ctx, { observation_id: clean.observationId, confidence: 'verified' });
+  } catch (e) { err2 = e; }
+  t(err2 !== null && String(err2.type) === 'INVALID_INPUT',
+    'verified without evidence is refused');
+  const withEv = promoteObservation(ctx, {
+    observation_id: clean.observationId,
+    confidence: 'verified',
+    evidence: 'commit 0a90c8a',
+  });
+  t(withEv.confidence === 'verified', 'and accepted with it');
+
+  // A project-scoped promotion and an org-wide one are different notes.
+  const wide = promoteObservation(ctx, {
+    observation_id: clean.observationId,
+    scope: 'org',
+    confidence: 'verified',
+    evidence: 'commit 0a90c8a',
+  });
+  t(wide.scope === 'org' && wide.orgNoteId !== withEv.orgNoteId,
+    'the same lesson at org scope is a separate note, not a duplicate');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/err6" || { echo "    ✗ node block crashed"; cat "$WORK/err6" >&2; FAILED=$((FAILED + 1)); }
+read_asserts
+
 if [ "$FAILED" -gt 0 ]; then
   echo
   echo "✗ $FAILED assertion(s) failed"

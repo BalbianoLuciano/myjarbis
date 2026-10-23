@@ -109,6 +109,12 @@ import {
   listContextKinds,
   listContextKindsInputSchema,
 } from './tools/kinds.js';
+import {
+  promoteObservation,
+  promoteObservationInputSchema,
+  listOrgNotes,
+  listOrgNotesInputSchema,
+} from './tools/orgMemory.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool registry
@@ -350,6 +356,32 @@ function buildToolRegistry(): RegisteredTool[] {
         '"RESUME HERE".',
       inputSchema: setProjectStateInputSchema,
       handler: (ctx, args) => setProjectState(ctx, args),
+    },
+    {
+      // NOT deferred, unlike most write tools. A tool the agent is supposed to
+      // call at the end of a session is a tool it will skip if the schema has
+      // to be fetched first — and the whole feature rests on it being offered
+      // at the one moment the user is already stopping.
+      name: 'promote_observation',
+      description:
+        'Promote ONE personal note into the org memory, where the whole team ' +
+        'reads it. Takes an observation id and nothing else: there is no path ' +
+        'for a session, a summary, a handoff or a conversation. Propose first ' +
+        'and let the user confirm — never promote on your own judgement. A note ' +
+        'carrying a credential, a local path, an internal host or a real project ' +
+        'name is REFUSED with the offending line and a rewrite.',
+      inputSchema: promoteObservationInputSchema,
+      handler: (ctx, args) => promoteObservation(ctx, args),
+    },
+    {
+      name: 'list_org_notes',
+      description:
+        'What the org memory already holds for this project, with authors, ' +
+        'confidence and staleness. Read it before promoting: roughly half of ' +
+        'what gets offered to a shared store is already in it.',
+      inputSchema: listOrgNotesInputSchema,
+      handler: (ctx, args) => listOrgNotes(ctx, args),
+      deferred: true,
     },
     {
       name: 'get_workflow',
