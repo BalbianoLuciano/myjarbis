@@ -364,6 +364,44 @@ export class MyJarbisDB {
     return this._scope;
   }
 
+  /**
+   * Every project name in this brain with its module count, crossing the
+   * tenant boundary on purpose.
+   *
+   * This is the ONLY read in the codebase that deliberately leaves the bound
+   * scope without rebinding, and it exists for one caller: the scrub that
+   * refuses to let those names travel into a shared repository. Knowing all of
+   * them is the whole job — a scrub that only knew the current project's name
+   * would let every other client's name through.
+   *
+   * So the exemption is not hidden. It takes a `reason`, the way
+   * `bindScope({ kind: 'all', reason })` does, and `grep -rn
+   * 'namesAcrossProjects'` finds every place the boundary is crossed. A
+   * cross-project read that looks like an ordinary one is how the boundary
+   * stops meaning anything.
+   *
+   * ONE query, not one per project. The previous version looped the registry
+   * and issued a `SELECT COUNT(*)` per entry — 23 statements on every session
+   * close of an org project, through the raw handle.
+   */
+  namesAcrossProjects(reason: string): Array<{ name: string; modules: number }> {
+    if (!reason.trim()) {
+      throw new MyJarbisError(
+        ErrorType.INVALID_INPUT,
+        'namesAcrossProjects requires a reason: it crosses the tenant boundary, ' +
+          'and an unexplained crossing is the thing the scope mechanism exists ' +
+          'to make impossible.',
+      );
+    }
+    return this.prep(
+      `SELECT p.name AS name, COUNT(m.id) AS modules
+         FROM projects p
+         LEFT JOIN modules m ON m.project_id = p.id
+        GROUP BY p.id, p.name
+        ORDER BY p.name`,
+    ).all() as Array<{ name: string; modules: number }>;
+  }
+
   /** The bound scope, or a hard failure. Every scoped read goes through here. */
   private get scope(): Scope {
     if (!this._scope) {

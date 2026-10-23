@@ -142,7 +142,28 @@ interface Replacement {
  * leave `<home>/dev-own/acme-portal` — anonymous about the developer and still
  * naming the client.
  */
+/**
+ * Compiled rules, memoised per context object.
+ *
+ * `scrubOrgNote` is called once per candidate note, and a session close can
+ * offer several. Rebuilding the rule list each time means compiling one RegExp
+ * per project per note — fifty projects and six candidates is three hundred
+ * regex compilations to say the same thing six times.
+ *
+ * A WeakMap keyed on the context: the caller builds one per promotion, so the
+ * cache lives exactly as long as it is valid and nothing has to invalidate it.
+ */
+const rulesCache = new WeakMap<ScrubContext, Replacement[]>();
+
 function rulesFor(ctx: ScrubContext): Replacement[] {
+  const cached = rulesCache.get(ctx);
+  if (cached) return cached;
+  const built = buildRules(ctx);
+  rulesCache.set(ctx, built);
+  return built;
+}
+
+function buildRules(ctx: ScrubContext): Replacement[] {
   const rules: Replacement[] = [];
 
   if (ctx.projectPath) {

@@ -169,33 +169,43 @@ function orgOf(ctx: ServerContext): { id: number; slug: string; name: string } |
  */
 export function scrubContextFor(ctx: ServerContext): ScrubContext {
   const project = ctx.requireProject();
-  const others: Array<{ name: string; modules: number }> = [];
+  const byName = new Map<string, number>();
+
+  // ONE query for every project in this brain, through the named accessor
+  // that makes the boundary crossing greppable. This used to be a registry
+  // loop issuing a COUNT per entry — 23 statements through the raw handle, on
+  // every session close of an org project.
   try {
-    for (const entry of readRegistryRaw()) {
-      if (entry.name === project.name) continue;
-      let modules = 0;
-      try {
-        const row = ctx.db.db
-          .prepare(
-            'SELECT COUNT(*) AS c FROM modules WHERE project_id = (SELECT id FROM projects WHERE name = ?)',
-          )
-          .get(entry.name) as { c: number } | undefined;
-        modules = row?.c ?? 0;
-      } catch {
-        modules = 0;
-      }
-      others.push({ name: entry.name, modules });
+    for (const row of ctx.db.namesAcrossProjects(
+      'the scrub has to recognise every project name in order to refuse to let it travel',
+    )) {
+      byName.set(row.name, row.modules);
     }
   } catch {
-    // No registry is not a reason to skip the scrub: the path, host and
-    // secret rules do not depend on it, and they are the ones that matter
-    // most. A missing registry weakens the gate; it must not disable it.
+    // A brain that cannot be read is a weaker gate, not a disabled one: the
+    // secret, path and host rules do not depend on this at all, and they are
+    // the ones that matter most.
   }
+
+  // The registry can name projects this brain does not hold — a silo, or one
+  // whose directory is gone. Those names must not travel either, so they are
+  // merged in with no module count rather than skipped. `readRegistryRaw`
+  // and not `readRegistry`: a project whose directory was deleted is still a
+  // client whose name is a client's name.
+  try {
+    for (const entry of readRegistryRaw()) {
+      if (!byName.has(entry.name)) byName.set(entry.name, 0);
+    }
+  } catch {
+    // Same reasoning as above.
+  }
+
+  byName.delete(project.name);
   return {
     homeDir: process.env.HOME ?? '',
     projectPath: ctx.projectPath,
     selfProjectName: project.name,
-    otherProjects: others,
+    otherProjects: [...byName].map(([name, modules]) => ({ name, modules })),
   };
 }
 

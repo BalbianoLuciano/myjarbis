@@ -33,6 +33,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export MYJARBIS_INSTALL_DIR="${MYJARBIS_INSTALL_DIR:-$REPO_ROOT/global}"
 B="$MYJARBIS_INSTALL_DIR/mcp-server/build"
+MJ="$REPO_ROOT/bin/myjarbis"
 
 if [ ! -f "$B/org/scrub.js" ]; then
   echo "✗ build not found at $B — run: cd $MYJARBIS_INSTALL_DIR/mcp-server && npm run build"
@@ -167,6 +168,93 @@ t(twice.rewritten.answer === once.rewritten.answer, 'which leaves the text alone
 
 console.log(out.join('\n'));
 " > "$ASSERTS" 2>"$WORK/err2" || { echo "    ✗ node block crashed"; cat "$WORK/err2" >&2; FAILED=$((FAILED + 1)); }
+read_asserts
+
+echo "→ [3] the cost of knowing every project name"
+#
+# The scrub has to recognise every project name on the machine in order to
+# refuse to let one travel. That is a cross-project read, and it runs on every
+# session close of an org project — so it has to cost ONE query, not one per
+# project, and it has to be visible as a boundary crossing rather than look
+# like an ordinary read.
+#
+# It was neither: a registry loop issuing a COUNT per entry through the raw
+# `ctx.db.db` handle, 23 statements per close, bypassing the scope guard.
+mkdir -p "$WORK/proj" && cd "$WORK/proj" && git init -q -b master .
+git config user.email s@s.test && git config user.name 'Scrub Dev'
+git remote add origin git@github.com:example/proj.git
+"$MJ" init --isolation=shared --yes --skip-memory >/dev/null 2>&1
+
+# Fifty projects, twice the real fleet, in BOTH the brain and the registry.
+#
+# Both halves matter and the first version of this got it wrong: with the
+# projects only in the brain, the registry held one entry, so the old
+# per-project loop issued exactly one query and the "at most ONE statement"
+# assertion passed against the code it was written to catch. A fixture that
+# does not reproduce the condition proves nothing, however green it looks.
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import * as fs from 'fs';
+const ctx = ServerContext.initialize();
+const ins = ctx.db.db.prepare(\"INSERT INTO projects (name, path, isolation) VALUES (?, ?, 'shared')\");
+const mod = ctx.db.db.prepare('INSERT INTO modules (project_id, name) VALUES (?, ?)');
+const reg = JSON.parse(fs.readFileSync('$MYJARBIS_REGISTRY', 'utf-8'));
+for (let i = 1; i <= 50; i++) {
+  const name = 'client-project-' + i;
+  const path = '/tmp/fixture/' + name;
+  const r = ins.run(name, path);
+  for (let m = 0; m < (i % 7); m++) mod.run(Number(r.lastInsertRowid), 'mod' + m);
+  reg.projects[name] = { name, path, framework: null, initialized: new Date().toISOString() };
+}
+fs.writeFileSync('$MYJARBIS_REGISTRY', JSON.stringify(reg, null, 2));
+ctx.close();
+" 2>/dev/null
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { scrubContextFor } from '$B/tools/orgMemory.js';
+import { scrubOrgNote } from '$B/org/scrub.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  // Count every statement the scrub context build prepares, by wrapping the
+  // raw handle's prepare. Counting statements rather than timing is the
+  // assertion that cannot flake on a loaded machine.
+  const realPrepare = ctx.db.db.prepare.bind(ctx.db.db);
+  let prepared = 0;
+  ctx.db.db.prepare = (sql) => { prepared++; return realPrepare(sql); };
+
+  const scrubCtx = scrubContextFor(ctx);
+  ctx.db.db.prepare = realPrepare;
+
+  t(prepared <= 1, 'building the scrub context prepares at most ONE statement (was ' + prepared + ')');
+  t(scrubCtx.otherProjects.length >= 50, 'and still knows all 50 other projects');
+  t(!scrubCtx.otherProjects.some((p) => p.name === ctx.requireProject().name),
+    'excluding the project being promoted from');
+  const withMods = scrubCtx.otherProjects.filter((p) => p.modules > 0);
+  t(withMods.length > 0, 'with module counts, so the rewrite can stay a sentence');
+
+  // A stand-in rather than undefined, so a context built WRONG fails the
+  // assertions that name the problem instead of crashing the block and
+  // reporting 'node block crashed'. Learned twice in this file now.
+  const target = withMods[0] ?? { name: '(no project with modules was loaded)', modules: -1 };
+  const r = scrubOrgNote({ answer: 'it only breaks on ' + target.name + ' for some reason' }, scrubCtx);
+  t(r.findings.some((f) => f.rule === 'project_name' && f.excerpt === target.name),
+    'a client name is still caught with 50 projects loaded');
+  t(r.rewritten.answer.includes(target.modules + '-module project'),
+    'and still rewritten into a usable sentence');
+
+  // The compiled rules are memoised per context, and the regexes are global —
+  // so a second pass over the SAME context must not be affected by the
+  // lastIndex the first pass left behind.
+  const again = scrubOrgNote({ answer: 'it only breaks on ' + target.name + ' for some reason' }, scrubCtx);
+  t(again.findings.length === r.findings.length,
+    'a second note scrubbed with the same context finds the same things');
+  t(again.rewritten.answer === r.rewritten.answer, 'and rewrites them identically');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/err3" || { echo "    ✗ node block crashed"; cat "$WORK/err3" >&2; FAILED=$((FAILED + 1)); }
 read_asserts
 
 if [ "$FAILED" -gt 0 ]; then
