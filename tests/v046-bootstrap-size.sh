@@ -365,6 +365,77 @@ for L in es en pt; do
   fi
 done
 
+# ─── [9] what start_session adds for workflows is names, and bounded ───
+#
+# Workflows reached the bootstrap in v0.5, which is the first time anything
+# told the agent they exist — the subsystem had shipped two releases earlier
+# and nothing ever mentioned it. Adding to the bootstrap is exactly what this
+# suite exists to police, so the addition is measured here rather than
+# eyeballed, and the shape is pinned too: SLUGS, not objects. Returning the
+# listing would be the module-menu mistake again, one surface over.
+echo "→ [9] the workflow slugs in the session payload stay a line"
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+try {
+  const r = startSession(ctx, { module: '_general' });
+  const w = r.workflows;
+  if (!Array.isArray(w)) { console.error('NOT_ARRAY'); process.exit(2); }
+  if (!w.every((x) => typeof x === 'string')) { console.error('NOT_STRINGS'); process.exit(3); }
+  const bytes = JSON.stringify(w).length;
+  if (bytes >= 200) { console.error('TOO_BIG', bytes); process.exit(4); }
+  console.log('OK', w.length, bytes);
+} finally { ctx.close(); }
+" > "$WORK/wf.out" 2>&1
+case "$(head -c 2 "$WORK/wf.out")" in
+  OK) pass "start_session returns workflow slugs ($(cat "$WORK/wf.out"))" ;;
+  *)  oops "the workflow payload is wrong shape or too big: $(cat "$WORK/wf.out")" ;;
+esac
+
+# The baseline workflows must actually BE there, or the line above is bounded
+# by being empty, which proves nothing.
+if node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+const r = startSession(ctx, { module: '_general' });
+ctx.close();
+const w = r.workflows || [];
+process.exit(w.includes('session-close') && w.includes('commit-ritual') ? 0 : 1);
+" 2>/dev/null; then
+  pass "and they are the baseline rituals, not an empty list"
+else
+  oops "the baseline workflows are missing from the session payload"
+fi
+
+# A child must not be offered as a ritual of its own.
+if node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { startSession } from '$B/tools/session.js';
+const ctx = ServerContext.initialize();
+const r = startSession(ctx, { module: '_general' });
+ctx.close();
+process.exit((r.workflows || []).includes('pre-push-checks') ? 1 : 0);
+" 2>/dev/null; then
+  pass "while the non-standalone child is not offered on its own"
+else
+  oops "a non-standalone workflow leaked into the session payload"
+fi
+
+# And the skill that tells the agent to use any of this is on disk.
+SKILL_MD="$WORK/proj/.claude/skills/myjarbis-workflow-driven/SKILL.md"
+if [ -f "$SKILL_MD" ]; then
+  pass "the workflow-driven skill is materialized"
+  if grep -q 'get_workflow' "$SKILL_MD" && grep -q 'gate' "$SKILL_MD"; then
+    pass "and it names get_workflow and the gates"
+  else
+    oops "the workflow-driven skill does not mention get_workflow or gates"
+  fi
+else
+  oops "myjarbis-workflow-driven/SKILL.md was not materialized"
+fi
+
 echo
 if [ "$FAILED" -eq 0 ]; then
   echo "✓ v046-bootstrap-size: all assertions passed"

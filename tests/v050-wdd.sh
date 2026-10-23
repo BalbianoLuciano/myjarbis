@@ -395,6 +395,114 @@ console.log(out.join('\n'));
 " > "$ASSERTS" 2>"$WORK/e8" || { echo "    ✗ node block crashed"; cat "$WORK/e8" >&2; FAILED=$((FAILED+1)); }
 read_asserts
 
+echo "→ [9] the baseline rituals, and a reseed that can be run twice"
+#
+# They are shipped rather than left to the user because the subsystem spent two
+# releases fully implemented and holding zero rows — a composition feature with
+# no data is one nobody will find a bug in. And they are the fixture the
+# composition above wants, with real content: session-close uses commit-ritual
+# uses pre-push-checks, three levels and one shared child.
+mkdir -p "$WORK/fresh" && cd "$WORK/fresh" && git init -q -b master .
+git config user.email f@f.test && git config user.name Fresh
+git remote add origin git@github.com:example/fresh.git
+"$MJ" init --isolation=shared --yes --skip-memory >/dev/null 2>&1
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { getWorkflow, listWorkflowsTool, setWorkflowStep } from '$B/tools/workflows.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  const listed = listWorkflowsTool(ctx).workflows;
+  const slugs = listed.map((w) => w.slug).sort();
+  t(JSON.stringify(slugs) === JSON.stringify(['branch-per-session', 'commit-ritual', 'session-close']),
+    'a fresh init offers three rituals');
+  t(!slugs.includes('pre-push-checks'), 'and hides the fragment the other two share');
+  t(ctx.db.workflows.listSlugs(ctx.requireProject().id, null, { includeNonStandalone: true }).length === 4,
+    'while all four rows exist');
+
+  // The three-level chain, with real content.
+  const close = getWorkflow(ctx, { slug: 'session-close' });
+  t(close.steps.length === 11, 'session-close expands to eleven flat steps');
+  t(close.expanded.map((e) => e.slug + '@' + e.depth).join(',') === 'commit-ritual@1,pre-push-checks@2',
+    'through commit-ritual at depth 1 and pre-push-checks at depth 2');
+  t(close.steps.some((s) => s.name === 'pre-push-checks/confirm-green' && s.gate === 'approve'),
+    'and a gate two levels down survives the flattening');
+  t(close.steps.every((s) => typeof s.notes === 'string' && s.notes.length > 20),
+    'every step says what it means, not just what it is called');
+
+  // The same child is reached by a second parent, which is the point of a child.
+  const commit = getWorkflow(ctx, { slug: 'commit-ritual' });
+  t(commit.expanded.some((e) => e.slug === 'pre-push-checks'),
+    'commit-ritual reaches the same child');
+
+  // Overriding the shared child once changes it for both parents.
+  setWorkflowStep(ctx, {
+    slug: 'pre-push-checks', name: 'confirm-green', scope: 'project', actor: 'human', gate: 'none',
+  });
+  t(getWorkflow(ctx, { slug: 'session-close' }).steps
+      .find((s) => s.name === 'pre-push-checks/confirm-green').gate === 'none',
+    'and overriding it once reaches session-close');
+  t(getWorkflow(ctx, { slug: 'commit-ritual' }).steps
+      .find((s) => s.name === 'pre-push-checks/confirm-green').gate === 'none',
+    'and commit-ritual too — one rule, one place');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/e9" || { echo "    ✗ node block crashed"; cat "$WORK/e9" >&2; FAILED=$((FAILED+1)); }
+read_asserts
+
+# The reseed rule that decides whether anybody runs it a second time: a step
+# the user changed is never reverted.
+RESEED="$("$MJ" workflow reseed --json 2>/dev/null)"
+if echo "$RESEED" | grep -q '"applied": *false'; then
+  pass "workflow reseed is a dry run by default"
+else
+  oops "reseed did not report itself as a dry run"
+fi
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { setWorkflowStep } from '$B/tools/workflows.js';
+const ctx = ServerContext.initialize();
+// A step the user owns, at user scope, plus one deleted from the project layer
+// so the reseed has something legitimate to add back.
+setWorkflowStep(ctx, { slug: 'commit-ritual', name: 'push', scope: 'user', actor: 'agent', gate: 'none' });
+const row = ctx.db.workflows.find('commit-ritual', 'project', ctx.requireProject().id);
+const step = ctx.db.workflowSteps.listByWorkflow(row.id).find((s) => s.name === 'stage-by-name');
+ctx.db.workflowSteps.delete(step.id);
+ctx.close();
+" 2>/dev/null
+
+RESEED2="$("$MJ" workflow reseed --apply --json 2>/dev/null)"
+if echo "$RESEED2" | grep -q 'commit-ritual/push (user)'; then
+  pass "a step the user overrode is reported as left alone"
+else
+  oops "reseed did not preserve the user's override (got: $(echo "$RESEED2" | head -c 200))"
+fi
+if echo "$RESEED2" | grep -q '+1 step'; then
+  pass "while a genuinely missing step is added back"
+else
+  oops "reseed did not restore the deleted step"
+fi
+
+node --input-type=module -e "
+import { ServerContext } from '$B/context.js';
+import { getWorkflow } from '$B/tools/workflows.js';
+const out = [];
+const t = (c, m) => out.push((c ? 'PASS|' : 'FAIL|') + m);
+const ctx = ServerContext.initialize();
+try {
+  const r = getWorkflow(ctx, { slug: 'commit-ritual' });
+  const push = r.steps.find((s) => s.name === 'push');
+  t(push.gate === 'none' && push.from === 'user',
+    \"and after --apply the user's gate is still the user's\");
+  t(r.steps.some((s) => s.name === 'stage-by-name'), 'with the missing step restored');
+} finally { ctx.close(); }
+console.log(out.join('\n'));
+" > "$ASSERTS" 2>"$WORK/e9b" || { echo "    ✗ node block crashed"; cat "$WORK/e9b" >&2; FAILED=$((FAILED+1)); }
+read_asserts
+
 if [ "$FAILED" -gt 0 ]; then
   echo
   echo "✗ $FAILED assertion(s) failed"

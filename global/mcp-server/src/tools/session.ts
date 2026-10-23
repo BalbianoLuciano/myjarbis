@@ -192,7 +192,42 @@ export interface StartSessionResult {
     /** First line of its last handoff, as a pointer rather than the text. */
     lastHandoffFirstLine: string | null;
   }>;
+  /**
+   * Slugs of the rituals this project has, names only.
+   *
+   * The adoption half of workflows-as-data, and it was the missing half. The
+   * subsystem shipped in v0.3 and nothing — no skill, no hook, no slash
+   * command, no bootstrap payload — ever told the agent the workflows existed;
+   * `get_workflow` appeared only in a precedence table. A capability nobody is
+   * told about configures nothing.
+   *
+   * Names ONLY, and no steps: the budget here is measured by
+   * `v046-bootstrap-size`, and the menu already taught this repo what happens
+   * when the bootstrap grows — handed a wall of text it already had, the agent
+   * went and re-queried the database for it.
+   *
+   * Absent when the project has none, so it costs nothing where it says
+   * nothing. Non-standalone children are excluded: they are fragments.
+   */
+  workflows?: string[];
   hint?: string;
+}
+
+/**
+ * The standalone workflow slugs of this project, or undefined.
+ *
+ * Best-effort: a broken workflow definition must not stop a session from
+ * opening. Losing a session over a listing is the wrong trade by a wide
+ * margin, and `list_workflows` is where a broken one gets reported.
+ */
+function reachableWorkflows(ctx: ServerContext): string[] | undefined {
+  try {
+    const project = ctx.requireProject();
+    const slugs = ctx.db.workflows.listSlugs(project.id, ctx.db.scopedOrgId);
+    return slugs.length > 0 ? slugs : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function startSession(
@@ -332,6 +367,7 @@ export function startSession(
           staleAfterDays,
         }
       : null,
+    workflows: reachableWorkflows(ctx),
     curatedResume: curated ?? undefined,
     autoClosedPrevious: autoClosed
       ? {

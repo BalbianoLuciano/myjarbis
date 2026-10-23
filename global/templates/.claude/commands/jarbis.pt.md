@@ -248,7 +248,7 @@ duas fontes discordam, a ordem é, da mais forte para a mais fraca:
 2. **`project_context` kind=`convention` / `practice`** deste projeto.
 3. **`get_workflow(slug)`** — os passos resolvidos e seus gates.
 4. **Skills do org pack** (`overrides/` já substituiu as baseline).
-5. **As 10 skills baseline do MyJarbis.**
+5. **As 11 skills baseline do MyJarbis.**
 6. **Os seus defaults do Claude Code.** Por último. Valem apenas onde o
    MyJarbis não disse nada.
 

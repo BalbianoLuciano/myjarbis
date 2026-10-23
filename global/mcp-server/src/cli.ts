@@ -24,6 +24,7 @@ import { listSkills, addSkill, materializeSkills } from './tools/skills.js';
 import { startSession, readStaleThreshold, computeStaleness } from './tools/session.js';
 import { applyInteractionStyle, inferCurrent } from './tools/interactionStyle.js';
 import { seedNewProject } from './db/migrate.js';
+import { BASELINE_WORKFLOWS } from './workflows/baseline.js';
 import { ModuleRow, SessionRow, SCHEMA_VERSION } from './db/schema.js';
 import {
   composeInteractionStyle,
@@ -70,6 +71,7 @@ import { listContextKinds, migrateKinds } from './tools/kinds.js';
 import {
   listWorkflowsTool,
   getWorkflow,
+  setWorkflowStep,
   listProviders,
   setProvider,
 } from './tools/workflows.js';
@@ -2950,6 +2952,9 @@ function runKinds(argv: string[]): void {
 /** myjarbis workflow <list|show> [slug] */
 function runWorkflow(argv: string[]): void {
   const sub = argv[0] ?? 'list';
+  // Routed before a context is opened: reseed walks the registry and opens one
+  // brain per project itself.
+  if (sub === 'reseed') return runWorkflowReseed(argv.slice(1));
   const { positional, flags } = parseFlags(argv.slice(1));
   const ctx = ServerContext.initialize();
   try {
@@ -2963,10 +2968,244 @@ function runWorkflow(argv: string[]): void {
       printJson(getWorkflow(ctx, { slug, evaluate: !truthy(flags['no-evaluate']) }));
       return;
     }
-    fail('Usage: myjarbis workflow <list|show>');
+    if (sub === 'set') {
+      const [slug, name] = positional;
+      if (!slug || !name) {
+        fail(
+          'Usage: myjarbis workflow set <slug> <step> [--scope=project|user] ' +
+            '[--position=N] [--actor=] [--gate=none|approve|on-request] ' +
+            '[--capability=] [--uses=] [--condition=] [--notes=] [--name=] ' +
+            '[--standalone=false] [--disabled]',
+        );
+      }
+      // The SAME function the MCP tool calls. Two entry points, one
+      // implementation: the position-inheritance rule across layers has its
+      // own postmortem, and a second implementation of it would re-earn that
+      // bug rather than inherit the fix.
+      printJson(
+        setWorkflowStep(ctx, {
+          slug,
+          name,
+          scope: (flags.scope as string | undefined) ?? 'project',
+          position: flags.position === undefined ? undefined : Number(flags.position),
+          actor: flags.actor ? String(flags.actor) : undefined,
+          gate: flags.gate ? String(flags.gate) : undefined,
+          capability: flags.capability ? String(flags.capability) : undefined,
+          uses: flags.uses ? String(flags.uses) : undefined,
+          condition: flags.condition ? String(flags.condition) : undefined,
+          notes: flags.notes ? String(flags.notes) : undefined,
+          workflow_name: flags.name ? String(flags.name) : undefined,
+          standalone:
+            flags.standalone === undefined ? undefined : truthy(flags.standalone),
+          disabled: truthy(flags.disabled) ? true : undefined,
+        }),
+      );
+      return;
+    }
+    if (sub === 'delete') {
+      const slug = positional[0];
+      if (!slug) fail('Usage: myjarbis workflow delete <slug> [--scope=project|user] [--step=<name>] [--force]');
+      const project = ctx.requireProject();
+      const scope = ((flags.scope as string | undefined) ?? 'project') as 'project' | 'user';
+      const row = ctx.db.workflows.find(slug, scope, project.id);
+      if (!row) fail(`No ${scope}-scope workflow "${slug}" in this project.`);
+      if (flags.step) {
+        const step = ctx.db.workflowSteps
+          .listByWorkflow(row!.id)
+          .find((x) => x.name === String(flags.step));
+        if (!step) fail(`Workflow "${slug}" has no step "${String(flags.step)}" at ${scope} scope.`);
+        ctx.db.workflowSteps.delete(step!.id);
+        printJson({ deleted: { workflow: slug, step: String(flags.step), scope } });
+        return;
+      }
+      ctx.db.workflows.delete(row!.id, { force: truthy(flags.force) });
+      printJson({ deleted: { workflow: slug, scope } });
+      return;
+    }
+    if (sub === 'runs') {
+      const project = ctx.requireProject();
+      const runs = ctx.db.workflowRuns.listByProject(project.id, {
+        status: truthy(flags.open) ? ['open'] : undefined,
+        limit: flags.limit ? Number(flags.limit) : undefined,
+      });
+      printJson({
+        runs: runs.map((r) => ({
+          id: r.id,
+          slug: r.slug,
+          status: r.status,
+          startedAt: r.started_at,
+          endedAt: r.ended_at,
+          steps: ctx.db.workflowRunSteps.timings(r.id),
+          minutes: Math.round(
+            ctx.db.workflowRunSteps
+              .timings(r.id)
+              .reduce((acc, s) => acc + (s.seconds ?? 0), 0) / 60,
+          ),
+        })),
+      });
+      return;
+    }
+    fail('Usage: myjarbis workflow <list|show|set|delete|runs|reseed>');
   } finally {
     ctx.close();
   }
+}
+
+/**
+ * myjarbis workflow reseed [--all] [--apply]
+ *
+ * The same shape as `skill reseed`: dry by default, `--all` walks the
+ * registry, and the report is the list `--apply` would act on.
+ *
+ * The rule that decides whether anybody runs it twice: a step the user has
+ * overridden at project or user scope is NEVER touched. `skill reseed` learned
+ * this as `RESEED_EXCLUDED` for `interaction-style`, which every project
+ * legitimately differs on. Here it is per STEP rather than per workflow,
+ * because the whole point of the layers is that a project changes one gate and
+ * keeps the rest — and a reseed that reverted that gate would be a reseed
+ * nobody runs a second time.
+ */
+function runWorkflowReseed(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+  const all = truthy(flags.all);
+
+  const targets = all ? readRegistry().map((e) => e.path) : [process.cwd()];
+  const results: Array<{
+    project: string;
+    created: string[];
+    updated: string[];
+    preserved: string[];
+    unchanged: number;
+    error?: string;
+  }> = [];
+
+  for (const dir of targets) {
+    const resolution = resolveProject({ cwd: dir });
+    if (!resolution) {
+      results.push({
+        project: dir,
+        created: [],
+        updated: [],
+        preserved: [],
+        unchanged: 0,
+        error: 'no brain holds this project',
+      });
+      continue;
+    }
+    const { db, project } = resolution;
+    const created: string[] = [];
+    const updated: string[] = [];
+    const preserved: string[] = [];
+    let unchanged = 0;
+
+    try {
+      for (const wf of BASELINE_WORKFLOWS) {
+        const existing = db.workflows.find(wf.slug, 'project', project.id);
+        if (!existing) {
+          if (apply) {
+            const row = db.workflows.upsert({
+              slug: wf.slug,
+              name: wf.name,
+              scope: 'project',
+              scopeId: project.id,
+              standalone: wf.standalone,
+            });
+            wf.steps.forEach((st, i) => {
+              db.workflowSteps.upsert({
+                workflowId: row.id,
+                position: (i + 1) * 10,
+                name: st.name,
+                actor: st.actor,
+                gate: st.gate,
+                capability: st.capability,
+                uses: st.uses,
+                condition: st.condition,
+                notes: st.notes,
+              });
+            });
+          }
+          created.push(wf.slug);
+          continue;
+        }
+
+        // A workflow that exists: only MISSING steps are added. An existing
+        // step is left exactly as it is, whatever it now says.
+        const have = new Map(
+          db.workflowSteps.listByWorkflow(existing.id).map((s) => [s.name, s]),
+        );
+        const userLayer = db.workflows.find(wf.slug, 'user', project.id);
+        const userSteps = new Set(
+          userLayer ? db.workflowSteps.listByWorkflow(userLayer.id).map((s) => s.name) : [],
+        );
+
+        let addedHere = 0;
+        wf.steps.forEach((st, i) => {
+          if (userSteps.has(st.name)) {
+            preserved.push(`${wf.slug}/${st.name} (user)`);
+            return;
+          }
+          if (have.has(st.name)) {
+            preserved.push(`${wf.slug}/${st.name} (project)`);
+            return;
+          }
+          if (apply) {
+            db.workflowSteps.upsert({
+              workflowId: existing.id,
+              position: (i + 1) * 10,
+              name: st.name,
+              actor: st.actor,
+              gate: st.gate,
+              capability: st.capability,
+              uses: st.uses,
+              condition: st.condition,
+              notes: st.notes,
+            });
+          }
+          addedHere++;
+        });
+        if (addedHere > 0) updated.push(`${wf.slug} (+${addedHere} step)`);
+        else unchanged++;
+      }
+    } catch (err) {
+      results.push({
+        project: project.name,
+        created,
+        updated,
+        preserved,
+        unchanged,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      db.close();
+      continue;
+    }
+
+    results.push({ project: project.name, created, updated, preserved, unchanged });
+    db.close();
+  }
+
+  if (wantsJson(flags)) {
+    printJson({ applied: apply, projects: results });
+    return;
+  }
+  ptySection(`MyJarbis · workflow reseed${apply ? '' : ' ' + dim('(dry run)')}`);
+  for (const r of results) {
+    const summary = r.error
+      ? red(r.error)
+      : [
+          r.created.length ? `${r.created.length} created` : null,
+          r.updated.length ? `${r.updated.length} extended` : null,
+          r.preserved.length ? `${r.preserved.length} left alone` : null,
+          r.unchanged ? `${r.unchanged} unchanged` : null,
+        ]
+          .filter(Boolean)
+          .join('  ') || 'nothing to do';
+    ptyKV(r.project, summary);
+  }
+  console.log('');
+  if (!apply) ptyDim('  Nothing was written. Re-run with --apply.');
+  else ptyDim('  Steps you had overridden were left exactly as they were.');
+  console.log('');
 }
 
 /** myjarbis provider <list|set> */
