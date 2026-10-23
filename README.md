@@ -187,7 +187,7 @@ org (optional — owns the pack: skills, workflows, taxonomy)
   │     │           ├── topic_key (new in v0.3 — identity; saving again updates it)
   │     │           └── refs      (new in v0.3 — links to commits / MRs / tickets)
   │     └── skills (module-level — only when this module is active)
-  └── skills (project-level — always loaded: 10 baselines + any org pack)
+  └── skills (project-level — always loaded: 11 baselines + any org pack)
 ```
 
 When you open Claude, the SessionStart hook asks which vertical you want.
@@ -448,7 +448,7 @@ schema until you run `myjarbis migrate`, which backs up first.
 
 ```bash
 cd ~/projects/my-app
-myjarbis init                          # creates memory.db + 10 baselines + plugin hooks
+myjarbis init                          # creates memory.db + 11 baselines + 4 workflows + hooks
 ```
 
 `myjarbis init` is **interactive** — it asks two questions to personalize
@@ -521,7 +521,7 @@ and Anthropic's prompt cache survives between calls.
 
 You say *"let's work on backend"* → the agent calls
 `start_session("backend")` and gets project_core + backend context + the
-previous `next_session`. Only the 10 baselines + backend's module-level
+previous `next_session`. Only the 11 baselines + backend's module-level
 skills are materialized to `.claude/skills/`. Frontend's are not on disk.
 
 Name two and you get both: *"backend and frontend"* →
@@ -585,7 +585,7 @@ into one call.
 </details>
 
 <details>
-<summary><b>The 10 baseline skills</b></summary>
+<summary><b>The 11 baseline skills</b></summary>
 
 Materialized to `.claude/skills/myjarbis-<name>/SKILL.md` and loaded at
 session start.
@@ -825,7 +825,7 @@ sees hits from the one you're in.
 
 **v0.1 → v0.2** (markdown → SQLite) runs automatically on first open:
 `knowledge-base.md` → observations, `daily.md` → workflow,
-`project-summary.md` → functional spec, 10 baselines seeded. Auto-backup
+`project-summary.md` → functional spec, 11 baselines seeded. Auto-backup
 at `~/.myjarbis-global/backups/<project>/<ts>/`. Legacy aliases
 (`search_code`, `get_context`, `update_memory`) still work.
 
@@ -911,7 +911,7 @@ myjarbis import <file.json> --target=... --kind=<kind> --mapping='items[]'
 <summary><b>Tests</b></summary>
 
 ```bash
-bash tests/run-all.sh          # 18 suites, 302 assertions, each builds its own fixture
+bash tests/run-all.sh          # 31 suites, 711 assertions, each builds its own fixture
 ```
 
 ```bash
@@ -957,7 +957,7 @@ snapshot instead of `bin/` and passes regardless of the source.
 
 <p align="center">
   <b>Three slash commands: <code>/jarbis</code> to open, <code>/jarbis-save</code> to write it down, <code>/jarbis-close</code> to close.</b> Everything else is conversation or a quick CLI verb.<br>
-  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 10 baseline skills let the agent infer all of it.<br>
+  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 11 baseline skills let the agent infer all of it.<br>
   None of the three is a new capability. They are the rituals worth having a key for: the <code>SessionEnd</code> hook always closes the session, but only a written handoff tells the next one what to do — and <code>/jarbis-save</code> writes that handoff without ending anything, for the sessions that stop without being closed.
 </p>
 

@@ -100,6 +100,73 @@ session did as one unit, and to drop it as one unit if it turns out wrong.
 `master` staying clean and pushed is also what lets `project_state` say
 "master at <sha>, clean" and have that mean something.
 
+## Reading across projects
+
+One brain holds twenty-three projects, and the only thing separating them when
+you enter through SQL is the `WHERE` clause you happen to write. The MCP tools
+enforce the module scope; a `node -e` against `~/.myjarbis/memory.db` does not.
+
+**Read across projects only when the user asks for it explicitly.** Otherwise
+stay inside the open module set and answer with the scoped tools. When a direct
+query is the right instrument, filter by `project_id` in the query itself
+rather than in the reading afterwards.
+
+This was earned on 2026-10-22: asked whether a handoff was the latest, the
+agent answered correctly with `resume()` and `git log`, then went to the DB
+with `SELECT ... FROM sessions WHERE id >= 484` to explain a gap in the ids.
+`sessions` has no `project_id` — it hangs off `modules` — so a query by id
+range returns every project in the file, and another project's rows were
+surfaced unasked. Observation 1558.
+
+## Where a process rule lives
+
+Now that `workflows` holds rows, a rule about HOW work is done has three
+possible homes, and picking the wrong one is how the subsystem ended up unused:
+
+- **a workflow step** — anything with a sequence, a gate, or a condition.
+  "Ask before pushing" is a step with `gate: approve`, not a sentence in a
+  skill.
+- **`project_context` kind=`convention`** — a fact about this repository that
+  owns its subject. The language of the log is a convention; no workflow step
+  decides it.
+- **a skill** — how to USE the tools, and when to reach for them. A skill may
+  cite a convention or a workflow; it must not re-decide what either one says.
+
+The failure this prevents has already happened twice. A skill that stated the
+commit language "as the rest of the history does" overrode the convention that
+owned it and ratified the drift it had itself caused. A rule in two places is a
+rule that will disagree with itself.
+
+## Registering a new table
+
+Seven places, and two of them are not obvious because they fail silently:
+
+1. `db/schema.ts` → `SCHEMA_SQL`, for a new file.
+2. `db/schema.ts` → `MIGRATIONS[n]`, for an existing one. Declare the objects
+   ONCE and use them in both — v4 wrote `observations.project_id` in both
+   places with different `ON DELETE` clauses, so every upgraded brain carries a
+   weaker constraint than every created one.
+3. `db/upgrade.ts` → `COUNTED_TABLES`, so `migrate` reconciles its row count.
+4. `tools/brain.ts` → `DUMP_TABLES`, in FK order, with a project scope clause.
+5. `db/merge.ts` → the id remap, the copy loop, the second pass for
+   self-references, **and the docstring that enumerates them**.
+6. `db/schema.ts` → `FTS_TABLES`, if it has an FTS mirror.
+7. The ALTERs that `MIGRATIONS` can only append must be declared LAST in
+   `SCHEMA_SQL` too. `ALTER TABLE` cannot insert a column in the middle, and
+   the brain dump writes keys in physical column order — declared anywhere
+   else, a created brain and a migrated one emit identical rows with the keys
+   in a different order, and the file conflicts in git for no visible reason.
+
+Places 3, 4 and 6 are asserted by `tests/v050-schema-v5.sh`, which diffs all
+three lists against `sqlite_master`. "Remember to add it everywhere" is not a
+mechanism; a failing assertion is.
+
+And the invariant behind it: **anything `MIGRATIONS[n]` cannot express must
+not appear in `SCHEMA_SQL`.** SQLite has no `ALTER TABLE ... ADD CONSTRAINT`,
+so a rule needing a table-level CHECK on an existing table lives in the
+repository that writes the row — a constraint only new databases have is worse
+than one nobody has.
+
 ## Verifying a fix
 
 Two rules earned the hard way, both recorded in `project_state`:

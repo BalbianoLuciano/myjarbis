@@ -1,5 +1,171 @@
 # Changelog
 
+## Unreleased — org memory and workflow-driven development (schema v5)
+
+Two features, and both of them are about the same thing: knowledge that
+currently lives in one developer's head or one developer's file, becoming
+something a team and an agent can act on.
+
+### Added — the org memory
+
+- **A second, smaller memory, shared across an org.** Only promoted notes:
+  durable lessons with an author, an expiry and a confidence. Everything else
+  — sessions, handoffs, summaries, the living state, conversations — stays on
+  the machine that produced it.
+
+  The split is STRUCTURAL rather than a setting. `org_notes` has no
+  `session_id`, no `summary`, no `next_session` and no free-text body, and the
+  only door in is `promote_observation`, which takes one observation id. "A
+  conversation cannot leak into the team memory" is a property of the schema,
+  not a promise about behaviour.
+
+- **`myjarbis org push` / `org pull`.** The transport is the repository the
+  team already clones: `<project>/.myjarbis/org/` holds a manifest and two
+  NDJSON files, one line per note. No new repo to create, no access to grant,
+  no server to run — a dev who can check out the code can read what the team
+  learned, and `org pull` after a clone is the whole onboarding step.
+
+  Three decisions, each borrowed from a project that paid for it. Pull is
+  **additive and never deletes** (basic-memory shipped a mirroring sync, found
+  it unusable for teams and disabled it there). Identity is the **content
+  hash**, not a row id or a sequence number, so two people recording the same
+  lesson converge on one row and the credit stays with whoever was first.
+  Rows are ordered by `(promoted_at, content_hash)` so a new note **appends**
+  rather than landing in the middle of the file, which is what makes the
+  ordinary case merge without asking.
+
+  `push` writes the files and prints the exact `git add` line. It does not
+  commit: a tool cannot write the `Why:` / `What for:` / `Where:` body the
+  conventions require, and `git add -A` is forbidden.
+
+- **Promotion is proposed, never automatic.** `end_session` returns
+  `promotionProposals` when the project is in an org and the session produced
+  something worth sharing; `/jarbis-close` prints it and asks. `gotcha` and
+  `error` are always proposed, `decision` only under a conventions or
+  architecture topic key, `progress` and `discovery` never — a progress note
+  is true for one project on one day.
+
+  SAP deployed the same pipeline internally and reported that 417 of 900
+  contributed learnings — 46.3% — produced no memory at all, nearly all
+  because the knowledge was already there. Half of what gets offered should be
+  refused, so an agent promoting on its own judgement fills a shared store
+  with the half nobody needed.
+
+- **A blocking scrub between a note and a shared repo.** Credentials, local
+  paths, internal hosts and real project names read from the registry. On a
+  hit the promotion is REFUSED with the offending line and a proposed rewrite;
+  accepting the rewrite re-runs the scan and refuses again if it still leaks.
+
+  Not hypothetical: `d342442` scrubbed three real client names out of this
+  repository's tracked files and left them in the commit messages, and the
+  history was rewritten two releases later partly for that.
+
+- **Attribution, which this codebase has never had.** One ladder —
+  `myjarbis config dev <handle>`, then `git config user.name`, then
+  `$USER@hostname` — with the rung travelling alongside the handle, so a
+  fallback reads as a guess instead of as a name somebody chose.
+
+- **Deterministic staleness, with no votes.** A `status` lifecycle
+  (active → stale → superseded → logically deleted, never a row removal), an
+  `expires_at` defaulting to 180 days where expiry is a WARNING rather than a
+  removal, and a drift signal: a note records the blob sha of every file it
+  cited, and a hit says how many of them have changed since. Silent when it
+  cannot tell — a shallow clone and an unchanged file are different answers.
+
+- Org notes ride plain `search` as `source: 'org_note'`, annotated and
+  downranked relative to local knowledge, with `scope: 'org'` to read only
+  them. No new scope to opt into: a corpus the caller has to remember is a
+  corpus the caller forgets.
+
+### Added — workflow-driven development
+
+- **A step can invoke another workflow.** `uses: <slug>` splices the child's
+  resolved steps in place, namespaced (`commit-ritual/push`), each reporting
+  which workflow owns it and at what depth. `get_workflow` still returns one
+  flat ordered list.
+
+  The ordering is the design: **layers resolve first, expansion happens over
+  the resolved list.** Expanding first would put the child's steps in the
+  parent's name space before the project and user layers key against it, so
+  overriding one child step would mean writing it into every parent that
+  invokes the child — three copies of one rule, which is what this table was
+  created to end.
+
+- **Runs.** `workflow_runs` + `workflow_run_steps` snapshot a resolution and
+  record per-step timestamps, so "where was I in this ritual" is a query and
+  the time per step is measured rather than estimated. A compaction keeps
+  almost none of the commands an agent ran; a row survives one perfectly.
+
+  A run whose session dies is marked abandoned and the step it died on
+  blocked, with the same `[auto]` marker a synthetic session close uses —
+  otherwise it stays open forever and the next start answers "already in
+  progress" about a ritual nobody is running.
+
+- **Four baseline workflows**, seeded by `init` at project scope, with this
+  repository's own conventions as their content: `commit-ritual`,
+  `pre-push-checks` (a child, hidden from the menu), `branch-per-session`,
+  `session-close`. `session-close` uses `commit-ritual` uses
+  `pre-push-checks` — three levels and one shared child.
+
+- **An authoring path and a reseed.** `myjarbis workflow set|delete|runs|
+  reseed`, calling the same function the MCP tool calls. `reseed` is dry by
+  default and NEVER reverts a step the user overrode — per step, not per
+  workflow, because the point of the layers is changing one gate and keeping
+  the rest.
+
+- **Something finally tells the agent they exist.** `start_session` returns
+  the reachable slugs (names only, 54 bytes for three, measured against the
+  bootstrap budget) and an eleventh baseline skill, `workflow-driven`, says
+  when to call `get_workflow` and that a gate is a stop. For two releases the
+  subsystem was complete, tested, documented — and mentioned in nothing but a
+  precedence table, which is why it held zero rows in every brain.
+
+### Fixed
+
+- **A user-scope workflow was visible from every project in a shared brain.**
+  `scope = 'user'` was READ without its `scope_id` while the write side has
+  always keyed user rows by project. Latent only because the table had never
+  held a row.
+- **Adding one step at project scope renamed the workflow to its slug**, so an
+  org workflow called "Closing a ticket (Acme)" lost its name as a side effect
+  of changing a gate.
+- **`set_workflow_step` threw when the graph was incomplete**, because it
+  resolved the workflow afterwards to build its response — so a parent could
+  not be authored before its child, and the row was saved while the call
+  reported failure.
+- **One broken workflow took the whole of `list_workflows` with it.** An agent
+  that cannot list any workflow cannot find the healthy ones either; a broken
+  one is now listed as broken.
+- **`workflows.delete` had no callers and no guards.** It refuses an org-scope
+  row, which a pack owns, and refuses a workflow something else invokes,
+  naming the parent — a child deleted under a parent fails mid-ritual, with
+  the first steps already done.
+- **`requireProject()` hands back a row cached when the connection was
+  bound**, so `org_id` went stale mid-process: joining an org and then using
+  it failed from inside Claude (one long-lived context) while working from the
+  CLI (a fresh process per subcommand). Every in-process reader now goes
+  through `db.scopedOrgId`.
+- Stale counts corrected: the README said 18 suites / 302 assertions and
+  ARCHITECTURE said 15 / 248; the real numbers were 25 before this work and
+  are 31 / 711 after it.
+
+### Schema
+
+**v4 → v5.** Additive: four new tables, one FTS mirror with its three
+triggers, and two columns on tables that hold no rows in any brain
+(`workflows.standalone`, `workflow_steps.uses`). No backfill, so the
+`rebuild`-before-`UPDATE` hazard that bit v4 does not arise.
+
+The v5 objects are declared ONCE and used by both `SCHEMA_SQL` and
+`MIGRATIONS[5]`. v4 wrote `observations.project_id` in both places with
+different `ON DELETE` clauses, so every brain that upgraded carries a weaker
+constraint than every brain that was created — invisible until a project is
+deleted. `tests/v050-schema-v5.sh` asserts that a fresh brain and a migrated
+one are identical column for column.
+
+`myjarbis migrate` is not automatic. It backs the brain up first, and
+`--dry-run` upgrades a copy.
+
 ## v0.4.6
 
 ### Added
