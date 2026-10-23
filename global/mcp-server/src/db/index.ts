@@ -56,6 +56,31 @@ import {
 } from './schema.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 
+/**
+ * How long an org note is assumed good for.
+ *
+ * 180 days, borrowed from the one shipped prior art that bothers to pick a
+ * number and say why: knowledge about infrastructure rots, and a store with no
+ * expiry serves a confidently wrong answer forever. Expiry is a WARNING and
+ * not a removal — an expired note still answers, it just says it is old.
+ */
+const DEFAULT_ORG_NOTE_TTL_DAYS = 180;
+
+/**
+ * How much an org note is pushed down relative to local knowledge.
+ *
+ * bm25 `rank` is negative and more negative is better, so a penalty is a
+ * multiplier TOWARD zero. An org note is general advice that happens to match;
+ * a project_context row or an observation is about THIS project. When both
+ * answer, the specific one should be read first.
+ */
+const ORG_RANK_PENALTY = 0.7;
+
+/** A second penalty for a note that is stale, expired, or sitting on files
+ *  that have changed since it was written. Downranked, never hidden: the
+ *  reader decides, with the reason attached to the hit. */
+const ORG_DEGRADED_PENALTY = 0.5;
+
 // ───────────────────────────────────────────────────────────────────
 // Helpers
 // ───────────────────────────────────────────────────────────────────
@@ -153,7 +178,28 @@ export type SearchScope =
   | 'project'       // all module contexts of project + project core
   | 'module_only'   // only the given module context
   | 'observations'  // observations in module sessions
-  | 'skills';       // skills (project + module-level)
+  | 'skills'        // skills (project + module-level)
+  | 'org';          // only the org memory, when this project belongs to one
+
+/**
+ * Scopes that ALSO return org notes alongside their own corpus.
+ *
+ * Org notes ride the default search rather than hiding behind their own
+ * scope value, and that is the whole adoption argument: a scope the caller
+ * has to opt into is a corpus the caller keeps forgetting, which is the
+ * failure mode of every "lessons learned" store anybody has written about.
+ *
+ * `module_only` is excluded on purpose — its documented contract is "one
+ * module, excluding the project core", and an org note is wider than the
+ * project, so including it would contradict the one scope whose point is
+ * narrowness. `skills` is excluded because it is a different corpus.
+ */
+const ORG_AWARE_SCOPES: ReadonlySet<SearchScope> = new Set<SearchScope>([
+  'module',
+  'project',
+  'observations',
+  'org',
+]);
 
 /** Chronological event in a module's timeline (sessions + observations).
  *  Ordered newest first by `at` when returned from `MyJarbisDB.timeline`. */
@@ -178,7 +224,7 @@ export type TimelineEvent =
     };
 
 export interface SearchHit {
-  source: 'project_context' | 'module_context' | 'observation' | 'skill';
+  source: 'project_context' | 'module_context' | 'observation' | 'skill' | 'org_note';
   rowid: number;
   title: string;
   snippet: string;
@@ -1708,6 +1754,384 @@ export class MyJarbisDB {
   };
 
   // ─────────────────────────────────────────────────────────────────
+  // Org memory
+  //
+  // The tenant here is the ORG, and it is DERIVED from the bound project
+  // rather than accepted as an argument. That is not a stylistic choice:
+  // graphiti ships `group_id` as a parameter and has six open issues where
+  // it leaks — UUID-addressed reads and deletes crossing groups, an
+  // unknown group silently reading the default one, a shared driver
+  // answering from whichever group was written last. A scope the caller
+  // supplies is a scope the caller can get wrong.
+  //
+  // `project_id IS NULL` means "true across the org", so this is the one
+  // place in this file where a row is legitimately reachable with no
+  // project — `assertInScope` would reject it, and the next reader would
+  // reasonably assume that is a bug. It is not: the org filter is what
+  // bounds these reads, and the project filter only narrows them.
+  // ─────────────────────────────────────────────────────────────────
+
+  /** The org of the bound project, or null when it belongs to none. */
+  get scopedOrgId(): number | null {
+    const projectId = this.scopedProjectId;
+    if (projectId === null) return null;
+    const row = this.prep('SELECT org_id FROM projects WHERE id = ?').get(projectId) as
+      | { org_id: number | null }
+      | undefined;
+    return row?.org_id ?? null;
+  }
+
+  /** Throw unless `orgId` is the org of the bound project. */
+  private assertOrgInScope(orgId: number, what: string): void {
+    if (this.scope.kind === 'all') return;
+    const mine = this.scopedOrgId;
+    if (mine === null) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        `${what} belongs to org ${orgId}, but this project belongs to no org.`,
+        { requested: orgId, scopedTo: null },
+      );
+    }
+    if (mine !== orgId) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        `${what} belongs to org ${orgId}, but this project belongs to org ${mine}.`,
+        { requested: orgId, scopedTo: mine },
+      );
+    }
+  }
+
+  orgNotes = {
+    /** Days before a note is treated as possibly rotten. */
+    ttlDays: DEFAULT_ORG_NOTE_TTL_DAYS,
+
+    /**
+     * The identity of a lesson: a hash over the org, the project scope and
+     * the seven content fields.
+     *
+     * Author and dates are deliberately NOT in it. The same lesson written
+     * by two people is one lesson — which is also what makes a pull
+     * idempotent across machines, since the row either is or is not already
+     * there regardless of who promoted it first.
+     */
+    hashOf: (params: {
+      orgSlug: string;
+      projectName: string | null;
+      draft: {
+        question: string;
+        answer: string;
+        workingExample?: string | null;
+        caveats?: string | null;
+        toolTags?: string | null;
+        typeTags?: string | null;
+        linkedIds?: string | null;
+      };
+    }): string => {
+      const d = params.draft;
+      // Joined on NUL, which cannot occur in any of these fields, so that
+      // moving text across a field boundary changes the hash: an empty
+      // separator would make {question:"ab", answer:"c"} collide with
+      // {question:"a", answer:"bc"}.
+      //
+      // Written as an escape rather than as a literal byte. A raw NUL in a
+      // source file makes it binary to grep, to diff and to every review
+      // tool, which costs more than the two characters it saves.
+      const SEP = '\u0000';
+      const parts = [
+        params.orgSlug,
+        params.projectName ?? '',
+        d.question,
+        d.answer,
+        d.workingExample ?? '',
+        d.caveats ?? '',
+        d.toolTags ?? '',
+        d.typeTags ?? '',
+        d.linkedIds ?? '',
+      ];
+      return crypto.createHash('sha256').update(parts.join(SEP)).digest('hex');
+    },
+
+    /**
+     * Insert, or hand back the row that already carries this hash.
+     *
+     * `ON CONFLICT DO NOTHING` then SELECT, and never check-then-insert:
+     * mem0 has an open bug (#6515) where exactly that pattern produces
+     * PERMANENTLY duplicated memories under concurrency, because the gap
+     * between the check and the insert is a window two writers fit through.
+     * A constraint has no window.
+     */
+    add: (params: {
+      orgId: number;
+      projectId: number | null;
+      sourceObservationId?: number | null;
+      author: { handle: string; email: string | null; source: AuthorSource };
+      draft: {
+        question: string;
+        answer: string;
+        workingExample?: string | null;
+        caveats?: string | null;
+        toolTags?: string | null;
+        typeTags?: string | null;
+        linkedIds?: string | null;
+      };
+      contentHash: string;
+      createdAt?: string;
+      promotedAt?: string;
+      status?: OrgNoteStatus;
+      expiresAt?: string | null;
+      /** Omitted = 180 days from now. Explicit null = never expires. */
+      expiresInDays?: number;
+      confidence?: OrgNoteConfidence;
+      evidence?: string | null;
+      codeRefs?: string | null;
+      atCommit?: string | null;
+      seq?: number;
+    }): { row: OrgNoteRow; content: OrgNoteContentRow; status: 'inserted' | 'duplicate' } => {
+      this.assertOrgInScope(params.orgId, 'org note');
+      if (params.projectId !== null) this.assertInScope(params.projectId, 'org note');
+
+      const existing = this.prep(
+        'SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?',
+      ).get(params.orgId, params.contentHash) as OrgNoteRow | undefined;
+      if (existing) {
+        return {
+          row: existing,
+          content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+            existing.id,
+          ) as OrgNoteContentRow,
+          status: 'duplicate',
+        };
+      }
+
+      const expiresAt =
+        params.expiresAt !== undefined
+          ? params.expiresAt
+          : (
+              this.prep(
+                `SELECT datetime('now', '+' || ? || ' days') AS d`,
+              ).get(params.expiresInDays ?? DEFAULT_ORG_NOTE_TTL_DAYS) as { d: string }
+            ).d;
+
+      const seq = params.seq ?? this.orgNotes.maxSeq(params.orgId) + 1;
+      const d = params.draft;
+
+      const info = this.prep(
+        `INSERT INTO org_notes(
+           org_id, project_id, source_observation_id, author_handle, author_email,
+           author_source, created_at, promoted_at, status, expires_at, confidence,
+           evidence, code_refs, content_hash, seq)
+         VALUES (?, ?, ?, ?, ?, ?,
+                 COALESCE(?, datetime('now')), COALESCE(?, datetime('now')),
+                 ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(org_id, content_hash) DO NOTHING`,
+      ).run(
+        params.orgId,
+        params.projectId,
+        params.sourceObservationId ?? null,
+        params.author.handle,
+        params.author.email,
+        params.author.source,
+        params.createdAt ?? null,
+        params.promotedAt ?? null,
+        params.status ?? 'active',
+        expiresAt,
+        params.confidence ?? 'assumed',
+        params.evidence ?? null,
+        params.codeRefs ?? null,
+        params.contentHash,
+        seq,
+      );
+
+      // DO NOTHING means another writer won the race between the SELECT
+      // above and this INSERT. Their row is the row.
+      if (info.changes === 0) {
+        const won = this.prep(
+          'SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?',
+        ).get(params.orgId, params.contentHash) as OrgNoteRow;
+        return {
+          row: won,
+          content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+            won.id,
+          ) as OrgNoteContentRow,
+          status: 'duplicate',
+        };
+      }
+
+      const noteId = Number(info.lastInsertRowid);
+      this.prep(
+        `INSERT INTO org_note_content(
+           note_id, question, answer, working_example, caveats,
+           tool_tags, type_tags, linked_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        noteId,
+        d.question,
+        d.answer,
+        d.workingExample ?? null,
+        d.caveats ?? null,
+        d.toolTags ?? null,
+        d.typeTags ?? null,
+        d.linkedIds ?? null,
+      );
+      if (params.atCommit !== undefined && params.atCommit !== null) {
+        // Stored on the governance half, which is not FTS-mirrored, so this
+        // second write costs no index churn.
+        this.prep('UPDATE org_notes SET evidence = COALESCE(evidence, ?) WHERE id = ?').run(
+          params.atCommit.startsWith('commit ') ? params.atCommit : `commit ${params.atCommit}`,
+          noteId,
+        );
+      }
+
+      return {
+        row: this.prep('SELECT * FROM org_notes WHERE id = ?').get(noteId) as OrgNoteRow,
+        content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+          noteId,
+        ) as OrgNoteContentRow,
+        status: 'inserted',
+      };
+    },
+
+    /**
+     * One note by id, scope-checked.
+     *
+     * Checked even though the id is unambiguous, because "it is addressed by
+     * id so it must be mine" is precisely the reasoning behind graphiti
+     * #2020, where a UUID-addressed read and delete crossed tenants.
+     */
+    findById: (id: number): (OrgNoteRow & OrgNoteContentRow) | null => {
+      const row = this.prep(
+        `SELECT n.*, c.question, c.answer, c.working_example, c.caveats,
+                c.tool_tags, c.type_tags, c.linked_ids
+           FROM org_notes n
+           JOIN org_note_content c ON c.note_id = n.id
+          WHERE n.id = ?`,
+      ).get(id) as (OrgNoteRow & OrgNoteContentRow) | undefined;
+      if (!row) return null;
+      this.assertOrgInScope(row.org_id, 'org note');
+      return row;
+    },
+
+    findByHash: (orgId: number, hash: string): OrgNoteRow | null => {
+      this.assertOrgInScope(orgId, 'org note');
+      return (
+        (this.prep('SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?').get(
+          orgId,
+          hash,
+        ) as OrgNoteRow | undefined) ?? null
+      );
+    },
+
+    listByOrg: (
+      orgId: number,
+      opts: {
+        /** `undefined` = the whole org. `null` = org-wide notes only. */
+        projectId?: number | null;
+        status?: OrgNoteStatus[];
+        sinceSeq?: number;
+        limit?: number;
+      } = {},
+    ): Array<OrgNoteRow & OrgNoteContentRow> => {
+      this.assertOrgInScope(orgId, 'org note');
+      const where: string[] = ['n.org_id = ?'];
+      const params: unknown[] = [orgId];
+
+      if (opts.projectId === null) where.push('n.project_id IS NULL');
+      else if (opts.projectId !== undefined) {
+        // An org-wide note applies to every project, so narrowing to a
+        // project includes them rather than excluding them.
+        where.push('(n.project_id IS NULL OR n.project_id = ?)');
+        params.push(opts.projectId);
+      }
+      if (opts.status && opts.status.length > 0) {
+        where.push(`n.status IN (${opts.status.map(() => '?').join(',')})`);
+        params.push(...opts.status);
+      }
+      if (opts.sinceSeq !== undefined) {
+        where.push('n.seq > ?');
+        params.push(opts.sinceSeq);
+      }
+      params.push(opts.limit ?? 200);
+
+      return this.prep(
+        `SELECT n.*, c.question, c.answer, c.working_example, c.caveats,
+                c.tool_tags, c.type_tags, c.linked_ids
+           FROM org_notes n
+           JOIN org_note_content c ON c.note_id = n.id
+          WHERE ${where.join(' AND ')}
+          ORDER BY n.promoted_at, n.content_hash
+          LIMIT ?`,
+      ).all(...params) as Array<OrgNoteRow & OrgNoteContentRow>;
+    },
+
+    /**
+     * Move a note along its lifecycle. There is no delete.
+     *
+     * `deleted` is logical and keeps the row, its author and its provenance:
+     * a lesson that turned out to be wrong is the most useful thing in the
+     * store, because the alternative is the next person learning it again
+     * and recording it again.
+     */
+    setStatus: (id: number, status: OrgNoteStatus, supersededBy?: number): OrgNoteRow => {
+      const note = this.orgNotes.findById(id);
+      if (!note) {
+        throw new MyJarbisError(ErrorType.RESOURCE_NOT_FOUND, `No org note with id ${id}.`);
+      }
+      if (supersededBy !== undefined) {
+        const successor = this.orgNotes.findById(supersededBy);
+        if (!successor) {
+          throw new MyJarbisError(
+            ErrorType.RESOURCE_NOT_FOUND,
+            `No org note with id ${supersededBy} to supersede ${id} with.`,
+          );
+        }
+        // The pointer goes on the SUCCESSOR, pointing back at what it
+        // replaced, so a chain can be walked in the direction it was built.
+        this.prep(
+          `UPDATE org_notes SET supersedes_id = ?, updated_at = datetime('now') WHERE id = ?`,
+        ).run(id, supersededBy);
+      }
+      this.prep(`UPDATE org_notes SET status = ?, updated_at = datetime('now') WHERE id = ?`).run(
+        status,
+        id,
+      );
+      return this.prep('SELECT * FROM org_notes WHERE id = ?').get(id) as OrgNoteRow;
+    },
+
+    /** Cache the drift count. Local-only, never exported. */
+    setDrift: (id: number, changed: number): void => {
+      this.prep(
+        `UPDATE org_notes
+            SET drift_changed = ?, drift_checked_at = datetime('now')
+          WHERE id = ?`,
+      ).run(changed, id);
+    },
+
+    maxSeq: (orgId: number): number => {
+      const row = this.prep('SELECT MAX(seq) AS m FROM org_notes WHERE org_id = ?').get(orgId) as
+        | { m: number | null }
+        | undefined;
+      return row?.m ?? 0;
+    },
+
+    countByOrg: (orgId: number, status?: OrgNoteStatus[]): number => {
+      this.assertOrgInScope(orgId, 'org note');
+      if (!status || status.length === 0) {
+        return (
+          this.prep('SELECT COUNT(*) AS c FROM org_notes WHERE org_id = ?').get(orgId) as {
+            c: number;
+          }
+        ).c;
+      }
+      return (
+        this.prep(
+          `SELECT COUNT(*) AS c FROM org_notes
+            WHERE org_id = ? AND status IN (${status.map(() => '?').join(',')})`,
+        ).get(orgId, ...status) as { c: number }
+      ).c;
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
   // timeline: chronological feed of sessions + observations for a
   // module. Reading the feed is 10× faster than loading the full
   // module_context dump when ramping back into a paused module.
@@ -1988,6 +2412,87 @@ export class MyJarbisDB {
           snippet: r.snippet,
           rank: r.rank,
           meta: { moduleId: r.module_id },
+        });
+      }
+    }
+
+    // ─── the org memory ───
+    //
+    // Skipped ENTIRELY when the project belongs to no org. Not run with a
+    // sentinel org id, not run and discarded: no query at all. Every project
+    // on this machine is org-less today, so this whole path is inert for all
+    // of them — which is what keeps a feature nobody has opted into from
+    // changing what `search` returns for everybody.
+    const orgId = ORG_AWARE_SCOPES.has(scope) ? this.scopedOrgId : null;
+    if (orgId !== null) {
+      const rows = this.prep(
+        `SELECT n.id AS rowid, c.question AS title,
+                snippet(org_note_content_fts, 1, '«', '»', '…', 12) AS snippet,
+                rank,
+                n.author_handle, n.promoted_at, n.status, n.confidence,
+                n.expires_at, n.drift_changed, n.drift_checked_at,
+                n.project_id,
+                CASE WHEN n.expires_at IS NOT NULL AND n.expires_at < datetime('now')
+                     THEN 1 ELSE 0 END AS expired
+           FROM org_note_content_fts
+           JOIN org_note_content c ON c.note_id = org_note_content_fts.rowid
+           JOIN org_notes n ON n.id = c.note_id
+          WHERE org_note_content_fts MATCH ?
+            AND n.org_id = ?
+            AND (n.project_id IS NULL OR n.project_id = ?)
+            AND n.status IN ('active', 'stale')
+          ORDER BY rank
+          LIMIT ?`,
+      ).all(ftsQuery, orgId, scopedProjectId, limit) as Array<{
+        rowid: number;
+        title: string;
+        snippet: string;
+        rank: number;
+        author_handle: string;
+        promoted_at: string;
+        status: OrgNoteStatus;
+        confidence: OrgNoteConfidence;
+        expires_at: string | null;
+        drift_changed: number | null;
+        drift_checked_at: string | null;
+        project_id: number | null;
+        expired: number;
+      }>;
+
+      for (const r of rows) {
+        // Downranked relative to local knowledge, and the SIGN matters:
+        // bm25 `rank` is NEGATIVE and more negative is better, so pushing a
+        // hit down means multiplying TOWARD zero. Getting this backwards
+        // promotes every org note above everything local and reads as a
+        // feature rather than as a bug.
+        //
+        // Local knowledge wins ties because it is about this project
+        // specifically; the org note is general advice that happens to
+        // match. And a note that is stale, expired or sitting on files that
+        // have since changed is downranked again rather than hidden — the
+        // reader decides, with the reason in front of them.
+        const degraded = r.status === 'stale' || r.expired === 1 || (r.drift_changed ?? 0) > 0;
+        hits.push({
+          source: 'org_note',
+          rowid: r.rowid,
+          title: r.title,
+          snippet: r.snippet,
+          rank: r.rank * (degraded ? ORG_RANK_PENALTY * ORG_DEGRADED_PENALTY : ORG_RANK_PENALTY),
+          meta: {
+            source: 'org',
+            author: r.author_handle,
+            promotedAt: r.promoted_at,
+            status: r.status,
+            confidence: r.confidence,
+            expired: r.expired === 1,
+            orgWide: r.project_id === null,
+            // `null` when it has never been checked, which is the honest
+            // answer to "did the ground move" and NOT the same as zero.
+            drift:
+              r.drift_checked_at === null
+                ? null
+                : { changed: r.drift_changed ?? 0, checkedAt: r.drift_checked_at },
+          },
         });
       }
     }

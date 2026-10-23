@@ -68,6 +68,7 @@ SUITES=(
   v050-schema-v5
   v050-org-identity
   v050-org-scrub
+  v050-org-memory
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
