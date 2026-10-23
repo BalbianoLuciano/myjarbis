@@ -42,6 +42,16 @@ import {
   StepGate,
   ProviderRow,
   ProviderRole,
+  FTS_TABLES,
+  OrgNoteRow,
+  OrgNoteContentRow,
+  OrgNoteStatus,
+  OrgNoteConfidence,
+  AuthorSource,
+  WorkflowRunRow,
+  WorkflowRunStatus,
+  WorkflowRunStepRow,
+  RunStepStatus,
   AUTO_MARKER,
 } from './schema.js';
 import { MyJarbisError, ErrorType } from '../types.js';
@@ -1994,12 +2004,7 @@ export class MyJarbisDB {
    * no index, because the hit looks legitimate.
    */
   rebuildFts(): void {
-    for (const t of [
-      'project_context_fts',
-      'module_context_fts',
-      'skills_fts',
-      'observations_fts',
-    ]) {
+    for (const t of FTS_TABLES) {
       this.db.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`);
     }
   }

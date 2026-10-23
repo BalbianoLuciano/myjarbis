@@ -37,7 +37,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
-import { SCHEMA_VERSION } from '../db/schema.js';
+import { SCHEMA_VERSION, FTS_TABLES } from '../db/schema.js';
 import { findSecrets, SECRET_GUIDANCE } from '../org/secrets.js';
 
 /** Directory name under `.myjarbis/` holding the dump. */
@@ -108,7 +108,43 @@ const TABLES: ReadonlyArray<DumpTable> = [
       "(scope IN ('project','user') AND scope_id = ?) OR " +
       "(scope = 'org' AND scope_id IN (SELECT org_id FROM projects WHERE id = ?)))",
   },
+  // The org memory travels in its own format too (see org/memory/), which is
+  // the one the team reads. It is dumped here as well because this dump is a
+  // backup of one project's rows, and a backup that silently omits a table is
+  // not one. Appended at the end so importBrain's reverse-order delete, which
+  // relies on this being FK-dependency order, stays correct.
+  {
+    name: 'org_notes',
+    orderBy: 'id',
+    scope:
+      'org_id IN (SELECT org_id FROM projects WHERE id = ?) ' +
+      'AND (project_id IS NULL OR project_id = ?)',
+  },
+  {
+    name: 'org_note_content',
+    orderBy: 'note_id',
+    scope:
+      'note_id IN (SELECT id FROM org_notes WHERE ' +
+      'org_id IN (SELECT org_id FROM projects WHERE id = ?) ' +
+      'AND (project_id IS NULL OR project_id = ?))',
+  },
+  { name: 'workflow_runs', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'workflow_run_steps',
+    orderBy: 'id',
+    scope: 'run_id IN (SELECT id FROM workflow_runs WHERE project_id = ?)',
+  },
 ];
+
+/**
+ * The same list, exported under the name the convention uses.
+ *
+ * Exported so a test can assert that every non-FTS table in `sqlite_master`
+ * appears both here and in `COUNTED_TABLES`. A new table has to be registered
+ * in several places, and "remember to add it in all of them" is not a
+ * mechanism — a failing assertion is.
+ */
+export const DUMP_TABLES = TABLES;
 
 /** How many times `?` appears in a table's scope clause. */
 function scopeArity(t: DumpTable): number {
@@ -518,7 +554,7 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
 
   // FTS5 mirrors are rebuilt by the schema triggers during the inserts above.
   // Ask SQLite to verify rather than trusting it.
-  for (const ftsTable of ['project_context_fts', 'module_context_fts', 'observations_fts', 'skills_fts']) {
+  for (const ftsTable of FTS_TABLES) {
     if (!tableExists(ctx, ftsTable)) continue;
     try {
       ctx.db.db.prepare(`INSERT INTO ${ftsTable}(${ftsTable}) VALUES ('rebuild')`).run();

@@ -12,8 +12,16 @@
  * .supersedes, project_context.project_id, module_context.module_id,
  * skills.project_id and .module_id, refs.observation_id,
  * project_state.project_id, providers.project_id, workflows.scope_id,
- * workflow_steps.workflow_id. Miss one and the brain is quietly wrong:
- * a note attached to somebody else's session.
+ * workflow_steps.workflow_id, org_notes.org_id and .project_id and
+ * .source_observation_id and .supersedes_id, org_note_content.note_id,
+ * workflow_runs.project_id and .session_id, workflow_run_steps.run_id.
+ * Miss one and the brain is quietly wrong: a note attached to somebody
+ * else's session.
+ *
+ * Two columns deliberately need no remapping, and it is worth knowing why:
+ * `workflow_steps.uses` names a workflow by SLUG, and `org_notes.content_hash`
+ * identifies a lesson by its text. Both survive a change of ids untouched,
+ * which is the point of addressing things by name rather than by row.
  *
  * AND THE FTS INDEXES MUST BE REBUILT. They are contentless and keyed by
  * rowid, so after a remap they resolve to different rows than they indexed.
@@ -27,7 +35,13 @@
 
 import * as fs from 'fs';
 import { MyJarbisDB } from './index.js';
-import { SCHEMA_VERSION } from './schema.js';
+import {
+  SCHEMA_VERSION,
+  OrgNoteRow,
+  OrgNoteContentRow,
+  WorkflowRunRow,
+  WorkflowRunStepRow,
+} from './schema.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 import { backupBrain, countRows, BackupResult, COUNTED_TABLES } from './upgrade.js';
 import { normalizeRemote } from '../resolve.js';
@@ -59,6 +73,8 @@ interface IdMap {
   sessions: Map<number, number>;
   observations: Map<number, number>;
   workflows: Map<number, number>;
+  orgNotes: Map<number, number>;
+  workflowRuns: Map<number, number>;
 }
 
 /**
@@ -207,6 +223,8 @@ export function mergeBrain(opts: {
     sessions: new Map(),
     observations: new Map(),
     workflows: new Map(),
+    orgNotes: new Map(),
+    workflowRuns: new Map(),
   };
   let newProjectId = 0;
   let ftsProbe: MergeReport['ftsProbe'];
@@ -494,15 +512,16 @@ export function mergeBrain(opts: {
         name: string;
         scope: string;
         extends: number | null;
+        standalone: number;
         created_at: string;
       }>;
       for (const w of srcWorkflows) {
         const info = dw
           .prepare(
-            `INSERT INTO workflows (slug, name, scope, scope_id, extends, created_at)
-             VALUES (?, ?, ?, ?, NULL, ?)`,
+            `INSERT INTO workflows (slug, name, scope, scope_id, extends, standalone, created_at)
+             VALUES (?, ?, ?, ?, NULL, ?, ?)`,
           )
-          .run(w.slug, w.name, w.scope, newProjectId, w.created_at);
+          .run(w.slug, w.name, w.scope, newProjectId, w.standalone, w.created_at);
         ids.workflows.set(w.id, Number(info.lastInsertRowid));
         copied.workflows++;
       }
@@ -517,9 +536,9 @@ export function mergeBrain(opts: {
         for (const s of src.workflowSteps.listByWorkflow(oldWfId)) {
           dw.prepare(
             `INSERT INTO workflow_steps
-               (workflow_id, position, name, actor, gate, capability, condition,
-                notes, overrides, disabled)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
+               (workflow_id, position, name, actor, gate, capability, uses,
+                condition, notes, overrides, disabled)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)`,
           ).run(
             newWfId,
             s.position,
@@ -527,11 +546,184 @@ export function mergeBrain(opts: {
             s.actor,
             s.gate,
             s.capability,
+            // `uses` names a slug, not an id, so it needs no remapping — which
+            // is one of the reasons composition is addressed by slug.
+            s.uses,
             s.condition,
             s.notes,
             s.disabled,
           );
           copied.workflow_steps++;
+        }
+      }
+
+      // ─── org notes ───
+      //
+      // Only reachable when the project belonged to an org; `destOrgId` is the
+      // org row in the destination, already upserted above.
+      //
+      // `project_id` is remapped, but a NULL stays NULL: an org-wide note is
+      // not about this project and must not become about it.
+      // `source_observation_id` is remapped through the note map, and dropped
+      // when the source note did not come along — a dangling pointer into
+      // another brain's observations is worse than no pointer.
+      // `seq` is reassigned from the destination's own counter, because it is
+      // local by definition and the destination may already hold notes from
+      // another machine.
+      if (destOrgId !== null) {
+        const srcNotes = src.db
+          .prepare(
+            `SELECT * FROM org_notes
+              WHERE org_id = ? AND (project_id IS NULL OR project_id = ?)
+              ORDER BY id`,
+          )
+          .all(chosen.org_id, chosen.id) as OrgNoteRow[];
+
+        let nextSeq =
+          ((
+            dw.prepare('SELECT MAX(seq) AS m FROM org_notes WHERE org_id = ?').get(destOrgId) as
+              | { m: number | null }
+              | undefined
+          )?.m ?? 0) + 1;
+
+        for (const n of srcNotes) {
+          // The destination may already hold this exact lesson, promoted by
+          // somebody else. UNIQUE(org_id, content_hash) says so; respect it
+          // rather than failing the whole merge over a duplicate.
+          const existing = dw
+            .prepare('SELECT id FROM org_notes WHERE org_id = ? AND content_hash = ?')
+            .get(destOrgId, n.content_hash) as { id: number } | undefined;
+          if (existing) {
+            ids.orgNotes.set(n.id, existing.id);
+            warnings.push(
+              `org note "${n.content_hash.slice(0, 8)}" was already in the destination; ` +
+                `kept the existing row and its author.`,
+            );
+            continue;
+          }
+
+          const info = dw
+            .prepare(
+              `INSERT INTO org_notes
+                 (org_id, project_id, source_observation_id, author_handle, author_email,
+                  author_source, created_at, promoted_at, updated_at, status, supersedes_id,
+                  expires_at, confidence, evidence, code_refs, content_hash, seq,
+                  drift_checked_at, drift_changed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              destOrgId,
+              n.project_id === null ? null : newProjectId,
+              n.source_observation_id === null
+                ? null
+                : (ids.observations.get(n.source_observation_id) ?? null),
+              n.author_handle,
+              n.author_email,
+              n.author_source,
+              n.created_at,
+              n.promoted_at,
+              n.updated_at,
+              n.status,
+              n.expires_at,
+              n.confidence,
+              n.evidence,
+              n.code_refs,
+              n.content_hash,
+              nextSeq++,
+              n.drift_checked_at,
+              n.drift_changed,
+            );
+          ids.orgNotes.set(n.id, Number(info.lastInsertRowid));
+          copied.org_notes++;
+        }
+
+        // Second pass for `supersedes_id`, same reason as observations: the
+        // target may be a row inserted later in this loop.
+        for (const n of srcNotes) {
+          if (n.supersedes_id === null) continue;
+          const self = ids.orgNotes.get(n.id);
+          const target = ids.orgNotes.get(n.supersedes_id);
+          if (self === undefined || target === undefined) continue;
+          dw.prepare('UPDATE org_notes SET supersedes_id = ? WHERE id = ?').run(target, self);
+        }
+
+        for (const [oldNoteId, newNoteId] of ids.orgNotes) {
+          const c = src.db
+            .prepare('SELECT * FROM org_note_content WHERE note_id = ?')
+            .get(oldNoteId) as OrgNoteContentRow | undefined;
+          if (!c) continue;
+          // A note the destination already had keeps its own content row.
+          const present = dw
+            .prepare('SELECT 1 AS x FROM org_note_content WHERE note_id = ?')
+            .get(newNoteId) as { x: number } | undefined;
+          if (present) continue;
+          dw.prepare(
+            `INSERT INTO org_note_content
+               (note_id, question, answer, working_example, caveats, tool_tags,
+                type_tags, linked_ids)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            newNoteId,
+            c.question,
+            c.answer,
+            c.working_example,
+            c.caveats,
+            c.tool_tags,
+            c.type_tags,
+            c.linked_ids,
+          );
+          copied.org_note_content++;
+        }
+      }
+
+      // ─── workflow runs ───
+      //
+      // A run is history: what was done, in what order, and how long it took.
+      // `session_id` is remapped and may legitimately end up NULL — the column
+      // is ON DELETE SET NULL for the same reason.
+      const srcRuns = src.db
+        .prepare('SELECT * FROM workflow_runs WHERE project_id = ? ORDER BY id')
+        .all(chosen.id) as WorkflowRunRow[];
+      for (const r of srcRuns) {
+        const info = dw
+          .prepare(
+            `INSERT INTO workflow_runs
+               (project_id, slug, session_id, started_at, ended_at, status)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            newProjectId,
+            r.slug,
+            r.session_id === null ? null : (ids.sessions.get(r.session_id) ?? null),
+            r.started_at,
+            r.ended_at,
+            r.status,
+          );
+        ids.workflowRuns.set(r.id, Number(info.lastInsertRowid));
+        copied.workflow_runs++;
+      }
+      for (const [oldRunId, newRunId] of ids.workflowRuns) {
+        const steps = src.db
+          .prepare('SELECT * FROM workflow_run_steps WHERE run_id = ? ORDER BY position, id')
+          .all(oldRunId) as WorkflowRunStepRow[];
+        for (const s of steps) {
+          dw.prepare(
+            `INSERT INTO workflow_run_steps
+               (run_id, position, step_name, from_workflow, status, started_at,
+                completed_at, actor, note)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            newRunId,
+            s.position,
+            s.step_name,
+            s.from_workflow,
+            s.status,
+            s.started_at,
+            s.completed_at,
+            s.actor,
+            s.note,
+          );
+          copied.workflow_run_steps++;
         }
       }
     });

@@ -23,7 +23,180 @@
  * migrations without code-detection of structure.
  */
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
+
+/**
+ * Objects introduced in v5, declared ONCE and used twice: interpolated into
+ * `SCHEMA_SQL` for a new file, and listed in `MIGRATIONS[5]` for an existing
+ * one.
+ *
+ * Writing them out in both places is how a fresh database and a migrated one
+ * drift apart, and the drift is invisible: v4 added `observations.project_id`
+ * with `ON DELETE CASCADE` in `SCHEMA_SQL` and without it in the migration, so
+ * every brain that upgraded has a weaker constraint than every brain that was
+ * created. One declaration makes that class of difference unrepresentable.
+ *
+ * The corollary, and it is a constraint on what can be declared here: an object
+ * must be expressible as a standalone statement that is valid on both paths.
+ * SQLite has no `ALTER TABLE ... ADD CONSTRAINT`, so a rule that would need a
+ * table-level CHECK on an existing table cannot live in the schema at all — it
+ * lives in the repository that writes the row. "A step either delegates
+ * (`uses`) or acts (`capability`), never both" is exactly such a rule.
+ */
+const V5_OBJECTS: string[] = [
+  // ─────────────────────────────────────────────────────────────────
+  // Org memory — the second, smaller memory, shared across an org.
+  //
+  // Separate tables rather than a flag on `observations`, because the
+  // guarantee has to be structural. A flag is something somebody can flip;
+  // a table with no column able to hold a transcript is a promise the
+  // schema keeps on its own. There is deliberately no `session_id`, no
+  // `summary`, no `next_session` and no free-text `content` here: the only
+  // door into this table is promote_observation, which takes one note id.
+  //
+  // Split in two on purpose. The governance half is read by status, expiry
+  // and author and is NOT mirrored into FTS; the content half is immutable
+  // (keyed by its hash) and IS. That split is what lets a status change --
+  // the most frequent UPDATE this feature has -- avoid touching the
+  // contentless index at all, instead of firing a delete+insert against it
+  // every time a note goes stale.
+  // ─────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS org_notes (
+  id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+  org_id                INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  -- NULL means org-wide. SET NULL and never CASCADE: removing a project
+  -- from this machine must not delete a lesson other people are reading.
+  project_id            INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+  -- The personal note this came from. A pointer into the local brain, so
+  -- it is never exported.
+  source_observation_id INTEGER REFERENCES observations(id) ON DELETE SET NULL,
+  author_handle         TEXT    NOT NULL,
+  author_email          TEXT,
+  author_source         TEXT    NOT NULL
+                        CHECK (author_source IN ('git', 'config', 'fallback')),
+  created_at            TEXT    NOT NULL DEFAULT (datetime('now')),
+  promoted_at           TEXT    NOT NULL DEFAULT (datetime('now')),
+  updated_at            TEXT,
+  -- Lifecycle, never deletion. A wrong lesson has to stay readable with its
+  -- provenance, or the next person re-learns it and records it again.
+  status                TEXT    NOT NULL DEFAULT 'active'
+                        CHECK (status IN ('active', 'stale', 'superseded', 'deleted')),
+  supersedes_id         INTEGER REFERENCES org_notes(id),
+  expires_at            TEXT,
+  confidence            TEXT    NOT NULL DEFAULT 'assumed'
+                        CHECK (confidence IN ('assumed', 'verified')),
+  evidence              TEXT,
+  -- JSON array of {path, blob_sha} captured at promotion. The blob shas are
+  -- the baseline the drift signal compares against.
+  code_refs             TEXT,
+  content_hash          TEXT    NOT NULL,
+  -- Local and monotonic per org, for incremental reads. NOT an identity and
+  -- never exported: two machines cannot allocate from one counter without a
+  -- vector clock. Identity is content_hash.
+  seq                   INTEGER NOT NULL,
+  -- Derived drift cache, local only. Refreshed by org pull/status, read by
+  -- search. Exporting it would rewrite the committed file on every refresh.
+  drift_checked_at      TEXT,
+  drift_changed         INTEGER,
+  -- The dedup guarantee, in the database. A check-then-insert in the
+  -- application is the window that gives mem0 permanently duplicated
+  -- memories under concurrency; a constraint has no window.
+  UNIQUE(org_id, content_hash)
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_org_notes_org     ON org_notes(org_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_org_notes_project ON org_notes(project_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_org_notes_seq     ON org_notes(org_id, seq)`,
+
+  // The content half. Immutable: a change of wording is a different hash and
+  // therefore a different note, which is what makes a pull idempotent and a
+  // supersession explicit rather than silent.
+  `CREATE TABLE IF NOT EXISTS org_note_content (
+  note_id         INTEGER PRIMARY KEY REFERENCES org_notes(id) ON DELETE CASCADE,
+  -- How another developer would phrase the search. Writing the question
+  -- down is what makes the answer findable by someone who was not there.
+  question        TEXT NOT NULL,
+  answer          TEXT NOT NULL,
+  working_example TEXT,
+  -- When this applies. The field that stops a lesson that is true in one
+  -- context from being applied everywhere.
+  caveats         TEXT,
+  tool_tags       TEXT,
+  type_tags       TEXT,
+  linked_ids      TEXT
+)`,
+
+  // ─────────────────────────────────────────────────────────────────
+  // Workflow runs — where a ritual got to, and how long each step took.
+  //
+  // get_workflow answers "what is the process"; it has never been able to
+  // answer "where was I in it". That answer lived in whatever prose the
+  // agent happened to write into next_session, which is the same failure
+  // the workflows table was created to end, one level up.
+  // ─────────────────────────────────────────────────────────────────
+  `CREATE TABLE IF NOT EXISTS workflow_runs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- Denormalised for the same reason observations.project_id is: without
+  -- it a run reaches its tenant only through a NULLABLE session_id, and a
+  -- nullable join is too thin to be the only thing between two clients.
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  slug       TEXT    NOT NULL,
+  session_id INTEGER REFERENCES sessions(id) ON DELETE SET NULL,
+  started_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  ended_at   TEXT,
+  status     TEXT    NOT NULL DEFAULT 'open'
+             CHECK (status IN ('open', 'done', 'abandoned'))
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_wfruns_project ON workflow_runs(project_id, status)`,
+  `CREATE INDEX IF NOT EXISTS idx_wfruns_session ON workflow_runs(session_id)`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_run_steps (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id        INTEGER NOT NULL REFERENCES workflow_runs(id) ON DELETE CASCADE,
+  position      INTEGER NOT NULL,
+  -- Namespaced ("child-slug/step-name") when the step came from a workflow
+  -- the parent invoked, which is why this is TEXT and not a step id: a run
+  -- is a snapshot of a resolution, and the resolution has no row.
+  step_name     TEXT    NOT NULL,
+  from_workflow TEXT    NOT NULL,
+  status        TEXT    NOT NULL DEFAULT 'pending'
+                CHECK (status IN ('pending', 'active', 'done', 'skipped', 'blocked')),
+  started_at    TEXT,
+  completed_at  TEXT,
+  actor         TEXT,
+  -- Why it was skipped. Required for 'skipped' by the repository: a run log
+  -- that records what was skipped without why answers nothing later.
+  note          TEXT,
+  UNIQUE(run_id, step_name)
+)`,
+  `CREATE INDEX IF NOT EXISTS idx_wfrunsteps_run ON workflow_run_steps(run_id, position)`,
+
+  // The FTS mirror of the content half, in the same shape as the other four.
+  // `note_id` is an INTEGER PRIMARY KEY, so it is the rowid alias and works
+  // as content_rowid. `linked_ids` is deliberately out of the index: it holds
+  // hashes, and indexing them makes an identifier match a text search.
+  `CREATE VIRTUAL TABLE IF NOT EXISTS org_note_content_fts USING fts5(
+  question, answer, working_example, caveats, tool_tags, type_tags,
+  content='org_note_content',
+  content_rowid='note_id'
+)`,
+  `CREATE TRIGGER IF NOT EXISTS org_note_content_ai AFTER INSERT ON org_note_content BEGIN
+  INSERT INTO org_note_content_fts(rowid, question, answer, working_example, caveats, tool_tags, type_tags)
+  VALUES (new.note_id, new.question, new.answer, new.working_example, new.caveats, new.tool_tags, new.type_tags);
+END`,
+  `CREATE TRIGGER IF NOT EXISTS org_note_content_ad AFTER DELETE ON org_note_content BEGIN
+  INSERT INTO org_note_content_fts(org_note_content_fts, rowid, question, answer, working_example, caveats, tool_tags, type_tags)
+  VALUES('delete', old.note_id, old.question, old.answer, old.working_example, old.caveats, old.tool_tags, old.type_tags);
+END`,
+  // The content half is never UPDATEd by the application. This trigger exists
+  // so that `brain import` and `merge`, which write rows directly, cannot
+  // leave the index describing a row that no longer says what it says.
+  `CREATE TRIGGER IF NOT EXISTS org_note_content_au AFTER UPDATE ON org_note_content BEGIN
+  INSERT INTO org_note_content_fts(org_note_content_fts, rowid, question, answer, working_example, caveats, tool_tags, type_tags)
+  VALUES('delete', old.note_id, old.question, old.answer, old.working_example, old.caveats, old.tool_tags, old.type_tags);
+  INSERT INTO org_note_content_fts(rowid, question, answer, working_example, caveats, tool_tags, type_tags)
+  VALUES (new.note_id, new.question, new.answer, new.working_example, new.caveats, new.tool_tags, new.type_tags);
+END`,
+];
 
 /** Migration steps applied in order when bumping from one schema version to
  *  the next. Each entry is a LIST of individual statements run AFTER the base
@@ -89,6 +262,31 @@ export const MIGRATIONS: Record<number, string[]> = {
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_obs_topic
        ON observations(project_id, topic_key) WHERE topic_key IS NOT NULL`,
     `CREATE INDEX IF NOT EXISTS idx_obs_project ON observations(project_id)`,
+  ],
+
+  // v4 → v5: the org memory (a second, smaller, shared store), workflow
+  // composition, and workflow runs.
+  //
+  // Additive only. Four new tables, one virtual table, three triggers and two
+  // new columns on tables that hold no rows in any brain yet — `workflows` and
+  // `workflow_steps` are empty everywhere, which is why this migration can
+  // extend them without a backfill.
+  //
+  // There is no `INSERT INTO ..._fts VALUES('rebuild')` here, and its absence
+  // is deliberate rather than an omission: v4 needed one because it ran an
+  // UPDATE over `observations`, and an UPDATE fires the _au trigger, whose
+  // 'delete' op against a contentless index returns SQLITE_CORRUPT_VTAB for a
+  // row the index does not hold. v5 updates no FTS-mirrored table, so there is
+  // no such op to protect. A rebuild added "to be safe" would be a statement
+  // nobody can justify, in the one place where every statement runs against
+  // somebody's only copy of their memory.
+  5: [
+    // The ALTERs cannot be shared with SCHEMA_SQL — a new file declares these
+    // columns inline in CREATE TABLE — so they are the one part written twice.
+    `ALTER TABLE workflows ADD COLUMN standalone INTEGER NOT NULL DEFAULT 1`,
+    `ALTER TABLE workflow_steps ADD COLUMN uses TEXT`,
+
+    ...V5_OBJECTS,
   ],
 };
 
@@ -358,6 +556,17 @@ CREATE TABLE IF NOT EXISTS workflows (
   scope_id   INTEGER NOT NULL,
   extends    INTEGER REFERENCES workflows(id),
   created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  -- 0 = a child: invocable only from a parent's "uses" step, and hidden from
+  -- the list a user picks from. A ritual that is only ever a fragment of
+  -- another ritual should not be offered as one.
+  --
+  -- Declared LAST, after created_at, and that position is not cosmetic:
+  -- ALTER TABLE ADD COLUMN can only append, so a brain that migrated has this
+  -- column last. The brain dump writes each row's keys in PHYSICAL column
+  -- order, so declaring it anywhere else would make a created brain and a
+  -- migrated brain emit the same rows with the keys in a different order --
+  -- a file that conflicts in git for no reason anybody can see.
+  standalone INTEGER NOT NULL DEFAULT 1,
   UNIQUE(slug, scope, scope_id)
 );
 CREATE INDEX IF NOT EXISTS idx_workflows_slug ON workflows(slug);
@@ -378,8 +587,33 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
   -- anything advisory belongs in "notes".
   condition   TEXT,
   notes       TEXT,
+  -- DEPRECATED, always NULL, no reader and no writer. A step overrides
+  -- another by sharing its name in a more specific layer, which is what
+  -- the resolver keys on; this column was a second way to say that and was
+  -- never wired to anything.
+  --
+  -- Kept rather than dropped: DROP COLUMN would have to be tolerated in the
+  -- migration runner, whose error filter currently swallows only "duplicate
+  -- column" and "already exists". Teaching it to also swallow "no such
+  -- column" would make every future migration with a mistyped column name
+  -- fail silently instead of loudly. That is a bad trade for deleting a
+  -- column that costs nothing.
   overrides   INTEGER REFERENCES workflow_steps(id),
   disabled    INTEGER NOT NULL DEFAULT 0,
+  -- The slug of another workflow to run at this point. A step either
+  -- delegates (uses) or acts (capability), never both -- a rule the
+  -- repository enforces, because SQLite cannot add a table-level CHECK to an
+  -- existing table and a constraint that only a new database has is worse
+  -- than one nobody has.
+  --
+  -- This is invocation, not inheritance. "extends" says "my steps start from
+  -- that workflow's steps", flattened under my own names; "uses" says "at
+  -- this position, run that workflow", and its steps arrive namespaced and
+  -- still owned by it.
+  --
+  -- Declared last for the same reason as workflows.standalone: ALTER TABLE
+  -- can only append, and the brain dump writes keys in physical column order.
+  uses        TEXT,
   UNIQUE(workflow_id, name)
 );
 CREATE INDEX IF NOT EXISTS idx_wfs_workflow ON workflow_steps(workflow_id, position);
@@ -543,7 +777,32 @@ END;
 -- "touch" triggers here because they cascade with the FTS5 sync triggers
 -- and can corrupt the contentless FTS5 index (SQLITE_CORRUPT_VTAB) when
 -- the same row receives two UPDATEs in the same statement.
+
+-- ─────────────────────────────────────────────────────────────────
+-- v5 objects. Same declarations MIGRATIONS[5] applies to an existing
+-- file, so the two paths cannot produce different schemas.
+-- ─────────────────────────────────────────────────────────────────
+${V5_OBJECTS.map((stmt) => `${stmt};`).join('\n\n')}
 `;
+
+/**
+ * Every FTS5 mirror in the schema, declared once.
+ *
+ * It was spelled out three times — `MyJarbisDB.rebuildFts`, `importBrain`'s
+ * post-import pass, and `mergeBrain`'s post-remap pass — and a new index added
+ * to two of the three would have been invisible: a contentless FTS table that
+ * nobody rebuilds after rows are re-inserted with explicit ids still answers
+ * queries, it just resolves hits to the wrong rows. The hit looks legitimate.
+ *
+ * So the list is data, and adding a mirror updates every rebuild at once.
+ */
+export const FTS_TABLES = [
+  'project_context_fts',
+  'module_context_fts',
+  'skills_fts',
+  'observations_fts',
+  'org_note_content_fts',
+] as const;
 
 // ───────────────────────────────────────────────────────────────────
 // TypeScript row types (1:1 with table columns)
@@ -611,6 +870,8 @@ export interface WorkflowRow {
   scope: WorkflowScope;
   scope_id: number;
   extends: number | null;
+  /** 0 = invocable only from a parent's `uses` step, hidden from the list. */
+  standalone: number;
   created_at: string;
 }
 
@@ -624,10 +885,102 @@ export interface WorkflowStepRow {
   actor: string;
   gate: StepGate;
   capability: string | null;
+  /** Slug of a workflow to run here. Mutually exclusive with `capability`. */
+  uses: string | null;
   condition: string | null;
   notes: string | null;
+  /** @deprecated Always NULL. See the column comment in SCHEMA_SQL. */
   overrides: number | null;
   disabled: number;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Org memory (v5)
+// ───────────────────────────────────────────────────────────────────
+
+/** Where a note is in its life. There is no row removal: a wrong lesson
+ *  has to stay readable with its provenance, or it gets re-learned and
+ *  re-recorded by the next person. */
+export type OrgNoteStatus = 'active' | 'stale' | 'superseded' | 'deleted';
+
+/** `verified` requires `evidence` — a commit, a merge request or a path
+ *  somebody can open. Without one the note is `assumed` and is reachable by
+ *  search but never surfaced proactively. */
+export type OrgNoteConfidence = 'assumed' | 'verified';
+
+/** How the author's handle was obtained, so a fallback is visibly a
+ *  fallback rather than a name somebody chose. */
+export type AuthorSource = 'git' | 'config' | 'fallback';
+
+export interface OrgNoteRow {
+  id: number;
+  org_id: number;
+  /** NULL = the note applies across the org, not to one project. */
+  project_id: number | null;
+  source_observation_id: number | null;
+  author_handle: string;
+  author_email: string | null;
+  author_source: AuthorSource;
+  created_at: string;
+  promoted_at: string;
+  updated_at: string | null;
+  status: OrgNoteStatus;
+  supersedes_id: number | null;
+  expires_at: string | null;
+  confidence: OrgNoteConfidence;
+  evidence: string | null;
+  /** JSON: Array<{ path: string; blob_sha: string }> */
+  code_refs: string | null;
+  content_hash: string;
+  /** Local, monotonic per org. Not an identity; see the column comment. */
+  seq: number;
+  drift_checked_at: string | null;
+  drift_changed: number | null;
+}
+
+export interface OrgNoteContentRow {
+  note_id: number;
+  question: string;
+  answer: string;
+  working_example: string | null;
+  caveats: string | null;
+  tool_tags: string | null;
+  type_tags: string | null;
+  linked_ids: string | null;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Workflow runs (v5)
+// ───────────────────────────────────────────────────────────────────
+
+export type WorkflowRunStatus = 'open' | 'done' | 'abandoned';
+
+/** `blocked` is what a step becomes when the session died under it: not
+ *  done, not skipped on purpose, and not still waiting. */
+export type RunStepStatus = 'pending' | 'active' | 'done' | 'skipped' | 'blocked';
+
+export interface WorkflowRunRow {
+  id: number;
+  project_id: number;
+  slug: string;
+  session_id: number | null;
+  started_at: string;
+  ended_at: string | null;
+  status: WorkflowRunStatus;
+}
+
+export interface WorkflowRunStepRow {
+  id: number;
+  run_id: number;
+  position: number;
+  /** Namespaced (`child-slug/step-name`) for a step that came from a child. */
+  step_name: string;
+  from_workflow: string;
+  status: RunStepStatus;
+  started_at: string | null;
+  completed_at: string | null;
+  actor: string | null;
+  note: string | null;
 }
 
 export type ProviderRole = 'tracker' | 'forge' | 'ci';
