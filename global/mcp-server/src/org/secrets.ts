@@ -41,7 +41,7 @@ const POINTER_KEY_RE = /_(file|path|env|var|name|location|ref|id)$/i;
  * anchored on recognisable prefixes and structures rather than "long
  * random-looking string", which would reject ordinary ids.
  */
-const SECRET_VALUE_PATTERNS: Array<{ re: RegExp; what: string }> = [
+export const SECRET_VALUE_PATTERNS: Array<{ re: RegExp; what: string }> = [
   { re: /\bgh[pousr]_[A-Za-z0-9]{16,}\b/, what: 'a GitHub token' },
   { re: /\bglpat-[A-Za-z0-9_-]{16,}\b/, what: 'a GitLab personal access token' },
   { re: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/, what: 'a Slack token' },
@@ -105,6 +105,36 @@ export function findSecrets(config: unknown, basePath = ''): SecretFinding[] {
 
   walk(config, basePath);
   return findings;
+}
+
+/**
+ * The same value patterns, run over free prose instead of a config tree.
+ *
+ * `findSecrets` walks keys and values of a parsed object, which is the right
+ * shape for `providers.config` and the wrong one for the body of a note. Both
+ * read ONE pattern list on purpose: a second copy is how the two guards end up
+ * disagreeing about what a credential looks like, and the weaker of the two is
+ * the one that matters, because it is the one that lets the token through.
+ *
+ * Returns every match, not the first, with the index so a caller can report
+ * the line and offer a replacement.
+ */
+export function findSecretsInText(
+  text: string,
+): Array<{ match: string; what: string; index: number }> {
+  const out: Array<{ match: string; what: string; index: number }> = [];
+  for (const p of SECRET_VALUE_PATTERNS) {
+    // The stored patterns are not global, and `exec` on a non-global regex
+    // always restarts at 0 — so scan with a per-call global clone instead of
+    // mutating shared state.
+    const re = new RegExp(p.re.source, p.re.flags.includes('g') ? p.re.flags : p.re.flags + 'g');
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      out.push({ match: m[0], what: p.what, index: m.index });
+      if (m[0].length === 0) break; // defensive: a zero-width match would loop
+    }
+  }
+  return out.sort((a, b) => a.index - b.index);
 }
 
 /** Where credentials are supposed to live, quoted in every rejection. */

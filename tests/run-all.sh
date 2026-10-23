@@ -67,6 +67,7 @@ SUITES=(
   v046-bootstrap-size
   v050-schema-v5
   v050-org-identity
+  v050-org-scrub
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
