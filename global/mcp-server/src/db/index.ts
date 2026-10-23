@@ -463,9 +463,37 @@ export class MyJarbisDB {
     return s;
   }
 
-  /** Run inside an immediate transaction. */
+  /**
+   * Run inside a DEFERRED transaction.
+   *
+   * The docstring here used to say "immediate" and it was wrong, which matters
+   * more than a wording slip: `db.transaction(fn)()` issues a bare `BEGIN`,
+   * and a bare `BEGIN` in SQLite is `BEGIN DEFERRED`. Under WAL a deferred
+   * transaction that reads and THEN writes can fail its write with
+   * `SQLITE_BUSY_SNAPSHOT` — and SQLite does not run the busy handler for that
+   * code, so the driver's 5 s `busy_timeout` does not help. The whole
+   * transaction has to be retried from the start.
+   *
+   * Fine for the existing callers, which are bulk imports and merges that run
+   * alone. Use `txImmediate` for anything that reads a value and then writes a
+   * row derived from it.
+   */
   tx<T>(fn: () => T): T {
     const wrapped = this.db.transaction(fn);
+    return wrapped();
+  }
+
+  /**
+   * Run inside an IMMEDIATE transaction: the write lock is taken up front.
+   *
+   * For the read-then-write sequences where a deferred transaction is a race:
+   * "the highest seq in this org, plus one", "no open run for this slug, so
+   * open one". Those read a value and write a row that is only correct if the
+   * value has not moved, and under WAL the deferred version fails late with a
+   * code the busy handler ignores rather than waiting at the start.
+   */
+  txImmediate<T>(fn: () => T): T {
+    const wrapped = this.db.transaction(fn).immediate;
     return wrapped();
   }
 
@@ -1894,6 +1922,19 @@ export class MyJarbisDB {
       steps: Array<{ position: number; name: string; fromWorkflow: string; actor: string }>;
     }): { run: WorkflowRunRow; steps: WorkflowRunStepRow[] } => {
       this.assertInScope(params.projectId, 'workflow run');
+      // One transaction, because a half-opened run is worse than none.
+      //
+      // The run row and its steps were separate commits, so any failure in the
+      // step loop left a `status='open'` run holding a PREFIX of its steps —
+      // and `findOpen` then returns it forever, so every later
+      // `start_workflow_run` answers "already in progress" about a ritual that
+      // can never be advanced or closed. `reconcileOrphanedRuns` does not help:
+      // it only touches runs whose session is gone.
+      //
+      // Immediate for the same reason as `orgNotes.add`: the caller has just
+      // read "no open run for this slug" and is writing a row that is only
+      // correct if that is still true.
+      return this.txImmediate(() => {
       const info = this.prep(
         `INSERT INTO workflow_runs(project_id, slug, session_id) VALUES (?, ?, ?)`,
       ).run(params.projectId, params.slug, params.sessionId);
@@ -1922,6 +1963,7 @@ export class MyJarbisDB {
         run: this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(runId) as WorkflowRunRow,
         steps: this.workflowRunSteps.listByRun(runId),
       };
+      });
     },
 
     findOpen: (projectId: number, slug?: string): WorkflowRunRow | null => {
@@ -2240,6 +2282,22 @@ export class MyJarbisDB {
       this.assertOrgInScope(params.orgId, 'org note');
       if (params.projectId !== null) this.assertInScope(params.projectId, 'org note');
 
+      // IMMEDIATE, and ALL of it inside one transaction.
+      //
+      // Two defects in the unwrapped version, both real. The note and its
+      // content were two separate commits, so there was a window in which
+      // `org_notes` held a row and `org_note_content` did not — and
+      // `listByOrg` INNER JOINs them, so a concurrent reader silently did not
+      // see the note, while the duplicate path below read a content row that
+      // was not there yet and returned `undefined` typed as a row. And `seq`
+      // was `MAX(seq) + 1` read outside any transaction, so two writers
+      // inserting different notes both got the same number, which makes an
+      // incremental `sinceSeq` read skip or re-deliver rows.
+      //
+      // Immediate rather than deferred because this reads a value and then
+      // writes a row derived from it: the deferred version fails that write
+      // with SQLITE_BUSY_SNAPSHOT, a code the busy handler does not retry.
+      return this.txImmediate(() => {
       const existing = this.prep(
         'SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?',
       ).get(params.orgId, params.contentHash) as OrgNoteRow | undefined;
@@ -2249,7 +2307,7 @@ export class MyJarbisDB {
           content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
             existing.id,
           ) as OrgNoteContentRow,
-          status: 'duplicate',
+          status: 'duplicate' as const,
         };
       }
 
@@ -2303,7 +2361,7 @@ export class MyJarbisDB {
           content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
             won.id,
           ) as OrgNoteContentRow,
-          status: 'duplicate',
+          status: 'duplicate' as const,
         };
       }
 
@@ -2328,8 +2386,9 @@ export class MyJarbisDB {
         content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
           noteId,
         ) as OrgNoteContentRow,
-        status: 'inserted',
+        status: 'inserted' as const,
       };
+      });
     },
 
     /**
@@ -2436,6 +2495,17 @@ export class MyJarbisDB {
         id,
       );
       return this.prep('SELECT * FROM org_notes WHERE id = ?').get(id) as OrgNoteRow;
+    },
+
+    /**
+     * Point one note at the one it replaces, by id.
+     *
+     * A named accessor rather than a raw `UPDATE` at the call site, because
+     * the call site is a loop over a file: through `prep` the statement is
+     * compiled once for the whole pull instead of once per row.
+     */
+    setSupersedes: (noteId: number, supersedesId: number): void => {
+      this.prep('UPDATE org_notes SET supersedes_id = ? WHERE id = ?').run(supersedesId, noteId);
     },
 
     /** Cache the drift count. Local-only, never exported. */

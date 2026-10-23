@@ -459,6 +459,25 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
   let rebasedFrom: string | undefined;
 
   ctx.db.tx(() => {
+    // SELF-REFERENCES cannot be ordered, so their enforcement is deferred to
+    // the COMMIT — and only to the commit, which is what keeps the guarantee
+    // the comment below describes.
+    //
+    // `org_notes.supersedes_id` and `observations.supersedes` both point at
+    // their own table. Row order within a table is by id, which is fine when a
+    // pointer always goes backwards — and it does not. `org pull` resolves
+    // `supersedes_hash` AFTER inserting every row in file order, which is
+    // `(promoted_at, content_hash)`, so a pulled note can legitimately end up
+    // superseding a note with a HIGHER id. Export that brain and import it
+    // again and the insert hits `FOREIGN KEY constraint failed` halfway
+    // through, on a dump that is perfectly valid.
+    //
+    // `defer_foreign_keys` is per-transaction and resets itself at commit, so
+    // this is not the same thing as turning foreign keys off: every constraint
+    // is still checked, just at the end. A dump with a genuinely dangling
+    // reference still fails, and still fails the whole transaction.
+    ctx.db.db.pragma('defer_foreign_keys = ON');
+
     // Foreign keys are ON: children first on the way out, parents first on the
     // way in. Deferring instead would let a bad dump land half-applied.
     for (const t of [...TABLES].reverse()) {

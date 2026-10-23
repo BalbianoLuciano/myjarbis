@@ -340,6 +340,12 @@ function pull(ctx: ServerContext, opts: { dir?: string } = {}): PullResult {
   // appears later in the same file.
   const insertedByHash = new Map<string, number>();
 
+  // Both passes in ONE transaction. A pull that died mid-file used to leave a
+  // partially merged mirror with no record of where it stopped — and because
+  // pull is idempotent by content hash, the next attempt would silently finish
+  // the job, which sounds fine until the file was mid-merge and half of it was
+  // somebody else's conflict markers. All of it, or none of it.
+  ctx.db.tx(() => {
   for (const n of noteRows) {
     const hash = String(n.content_hash ?? '');
     if (!hash) {
@@ -432,6 +438,8 @@ function pull(ctx: ServerContext, opts: { dir?: string } = {}): PullResult {
     insertedByHash.set(hash, result.row.id);
   }
 
+  // `prep` and not the raw handle: the statement is cached, so this is one
+  // prepare for the whole file rather than one per row.
   for (const n of noteRows) {
     const hash = String(n.content_hash ?? '');
     const supersedes = n.supersedes_hash;
@@ -439,8 +447,9 @@ function pull(ctx: ServerContext, opts: { dir?: string } = {}): PullResult {
     const self = insertedByHash.get(hash);
     const target = insertedByHash.get(String(supersedes));
     if (self === undefined || target === undefined) continue;
-    ctx.db.db.prepare('UPDATE org_notes SET supersedes_id = ? WHERE id = ?').run(target, self);
+    ctx.db.orgNotes.setSupersedes(self, target);
   }
+  });
 
   if (unknownProjects.size > 0) {
     warnings.push(

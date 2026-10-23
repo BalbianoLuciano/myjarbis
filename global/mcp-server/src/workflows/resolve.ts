@@ -286,6 +286,39 @@ export function resolveWorkflow(
   // `order` is just the index, and `position` is left alone.
   steps = steps.map((s, i) => ({ ...s, order: i + 1 }));
 
+  // ── a name has to be unique in the flat list ──
+  //
+  // Two steps of one parent invoking the SAME child, or two different children
+  // that both invoke a third, produce the child's steps twice with identical
+  // namespaced names. Expansion was happy to do it; everything downstream was
+  // not. `workflow_run_steps` has UNIQUE(run_id, step_name) and
+  // `workflowRuns.open` inserts plainly, so the second copy raised a raw
+  // SqliteError — no error type, no actionable message — in the middle of
+  // opening a run, after the run row had already been written. The project was
+  // then left with an open run that could never be advanced or closed, and
+  // every later start answered "already in progress".
+  //
+  // Refused here instead, at resolution, naming both sides. Refusing rather
+  // than inventing a disambiguating name on the spot: a ritual that genuinely
+  // needs the same child twice needs two addressable copies of it, and that is
+  // a decision for whoever writes the workflow, not for the resolver. The
+  // message says which two steps collided so it can be made.
+  const seenNames = new Map<string, string>();
+  for (const s of steps) {
+    const previous = seenNames.get(s.name);
+    if (previous !== undefined) {
+      throw new MyJarbisError(
+        ErrorType.INVALID_INPUT,
+        `workflow "${slug}" resolves to two steps called "${s.name}" (both from ` +
+          `"${s.fromWorkflow}", reached via "${previous}" and again later). A run ` +
+          'records a step by name, so it cannot hold two. Invoke that workflow ' +
+          'once, or split it into two workflows with their own names.',
+        { slug, duplicate: s.name, fromWorkflow: s.fromWorkflow },
+      );
+    }
+    seenNames.set(s.name, s.fromWorkflow);
+  }
+
   // Attach the concrete provider for each abstract capability.
   for (const s of steps) {
     if (!s.capability) continue;

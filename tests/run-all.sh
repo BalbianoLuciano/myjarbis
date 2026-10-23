@@ -72,6 +72,7 @@ SUITES=(
   v050-org-sync
   v050-wdd
   v050-perf-budget
+  v050-stress
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
