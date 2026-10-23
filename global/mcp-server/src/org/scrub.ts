@@ -100,6 +100,24 @@ const COMMON_WORD_NAMES = new Set([
   'shared',
   'common',
   'scripts',
+
+  // The words this module puts INTO the text. A project genuinely called
+  // `repo` would otherwise make every promotion fail: the first pass rewrites
+  // a path to `<repo>`, the second pass sees the project name inside its own
+  // replacement, and `promote_observation` refuses with "this needs wording by
+  // a person" about a note that was already clean.
+  //
+  // Skipping them costs the one thing it sounds like it costs — a project
+  // actually named `repo` or `machine` is not caught by name — and the path,
+  // host and secret rules still cover every way such a project would normally
+  // appear. A gate that fails closed on correct input is a gate people turn
+  // off, and this is the only input that could make it do that.
+  'repo',
+  'home',
+  'machine',
+  'redacted',
+  'internal',
+  'another',
 ]);
 
 /** Shortest name worth matching. Below this, false positives dominate. */

@@ -50,7 +50,19 @@ export const SECRET_VALUE_PATTERNS: Array<{ re: RegExp; what: string }> = [
   { re: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\./, what: 'a JWT' },
   { re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/, what: 'a private key' },
   // Credentials embedded in a URL: scheme://user:pass@host
-  { re: /[a-z][a-z0-9+.-]*:\/\/[^/\s:@]+:[^/\s@]+@/i, what: 'credentials inside a URL' },
+  //
+  // The scheme is bounded at 30 characters, and that bound is not cosmetic:
+  // with `[a-z0-9+.-]*` the engine matches an arbitrarily long run and then
+  // backtracks it one character at a time looking for `://`, from every
+  // starting position. That is quadratic, and measurably so — 2 ms at 2 KB,
+  // 413 ms at 32 KB, which extrapolates to about seven MINUTES on a 1 MB
+  // field, scanned twice per field. A note with a large body hung
+  // `promote_observation` outright.
+  //
+  // Bounded, the engine tries at most 31 lengths per position instead of n.
+  // Nothing is lost: the longest scheme IANA has registered is well under
+  // thirty characters.
+  { re: /[a-z][a-z0-9+.-]{0,30}:\/\/[^/\s:@]+:[^/\s@]+@/i, what: 'credentials inside a URL' },
 ];
 
 export interface SecretFinding {

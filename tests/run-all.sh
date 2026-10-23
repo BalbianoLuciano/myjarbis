@@ -73,6 +73,7 @@ SUITES=(
   v050-wdd
   v050-perf-budget
   v050-stress
+  v050-hostile
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
