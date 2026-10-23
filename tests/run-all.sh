@@ -69,6 +69,7 @@ SUITES=(
   v050-org-identity
   v050-org-scrub
   v050-org-memory
+  v050-org-sync
 )
 
 # ─── what to print when a suite fails ─────────────────────────────

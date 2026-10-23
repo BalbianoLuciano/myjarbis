@@ -31,7 +31,7 @@ show_help() {
     echo -e "  ${BOLD}update${NC}     Update MyJarbis global installation"
     echo -e "  ${BOLD}import${NC}     Import a .md or .json into the project DB"
     echo -e "  ${BOLD}brain${NC}      Export/import the DB as tracked NDJSON (export|import|status)"
-    echo -e "  ${BOLD}org${NC}        Org packs: add a pack, list orgs, sync it to every project (add|list|sync|diff)"
+    echo -e "  ${BOLD}org${NC}        Packs down (add|list|sync|diff) and the shared memory both ways (pull|push|notes)"
     echo -e "  ${BOLD}kinds${NC}      List the allowed context kinds, or fold old labels onto them (list|migrate)"
     echo -e "  ${BOLD}workflow${NC}   Inspect resolved workflows (list|show)"
     echo -e "  ${BOLD}provider${NC}   Point tracker/forge/ci at a concrete tool (list|set)"

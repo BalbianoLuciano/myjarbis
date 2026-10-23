@@ -55,6 +55,8 @@ import {
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
 import { resolveIdentity, setIdentity, identityWarning } from './org/identity.js';
+import { transportFor } from './org/memory/transport.js';
+import { listOrgNotes } from './tools/orgMemory.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
 import {
   CLAUDE_HOOKS,
@@ -2789,8 +2791,127 @@ function runOrg(argv: string[]): void {
       return;
     }
 
+    // ── the shared memory, as opposed to the pack ──
+    //
+    // `add`/`sync`/`diff` move a PACK: skills, workflows, taxonomy — things an
+    // org decides and hands down. `pull`/`push` move the MEMORY: what the team
+    // found out, flowing both ways. Same subcommand, two different objects,
+    // and worth saying so in the help text rather than letting someone
+    // discover it by running the wrong one.
+    case 'pull': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const res = transportFor(ctx).pull(ctx, {
+          dir: flags.dir ? String(flags.dir) : undefined,
+        });
+        if (wantsJson(flags)) return printJson(res);
+        ptySection('MyJarbis · org pull');
+        ptyKV('Org', `${bold(res.org.slug)} (${res.org.name})`);
+        ptyKV('Dir', res.dir);
+        ptyKV(
+          'Rows',
+          `read ${res.read}  ${red(bold(`added ${res.added}`))}  ` +
+            `already had ${res.duplicates}` +
+            (res.governanceUpdated > 0 ? `  updated ${res.governanceUpdated}` : ''),
+        );
+        if (res.orgRegistered) {
+          console.log('');
+          ptyLine('  ' + bold('This project just joined the org.') + ' Its notes now ride `search`.');
+        }
+        for (const w of res.warnings) {
+          console.log('');
+          ptyLine('  ' + w);
+        }
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
+    case 'push': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const res = transportFor(ctx).push(ctx, {
+          dir: flags.dir ? String(flags.dir) : undefined,
+        });
+        if (wantsJson(flags)) return printJson(res);
+        ptySection('MyJarbis · org push');
+        ptyKV('Dir', res.dir);
+        if (!res.changed) {
+          ptyKV('Files', dim('unchanged'));
+          console.log('');
+          ptyDim('  Nothing to commit.');
+          console.log('');
+          return;
+        }
+        ptyKV('Files', res.filesWritten.join('  '));
+        ptyKV(
+          'Rows',
+          `${red(bold(`appended ${res.appended}`))}` +
+            (res.rewritten > 0 ? `  rewritten ${res.rewritten}` : ''),
+        );
+        console.log('');
+        // Printed, never run. A tool cannot write the Why/What for/Where body
+        // the conventions require, and `git add -A` is forbidden.
+        ptyLine('  ' + res.stageCommand);
+        ptyDim('  then commit it yourself — the message is yours to write.');
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
+    case 'notes': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const all = truthy(flags.all);
+        const res = listOrgNotes(ctx, {
+          status: all ? ['active', 'stale', 'superseded', 'deleted'] : undefined,
+          limit: flags.limit ? Number(flags.limit) : undefined,
+        });
+        if (wantsJson(flags)) return printJson(res);
+        if (!res.org) {
+          ptySection('MyJarbis · org notes');
+          ptyLine('  This project belongs to no org.');
+          console.log('');
+          return;
+        }
+        ptySection(`MyJarbis · org notes of ${bold(res.org.slug)}`);
+        if (res.count === 0) {
+          ptyLine('  ' + dim('nothing promoted yet'));
+          console.log('');
+          return;
+        }
+        for (const n of res.notes) {
+          const marks = [
+            n.confidence === 'verified' ? 'verified' : 'assumed',
+            n.status !== 'active' ? n.status : null,
+            n.expired ? 'expired' : null,
+            n.orgWide ? 'org-wide' : null,
+            n.drift !== null && n.drift > 0 ? `${n.drift} file(s) moved` : null,
+          ].filter(Boolean);
+          ptyLine(`  #${n.id} ${n.question}`);
+          ptyDim(`      ${n.author} · ${n.promotedAt} · ${marks.join(' · ')}`);
+        }
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
     default:
-      fail('Usage: myjarbis org <add|list|sync|diff>');
+      fail(
+        'Usage: myjarbis org <add|list|sync|diff|pull|push|notes>\n' +
+          '  add|sync|diff   move a PACK: skills, workflows, taxonomy (org → project)\n' +
+          '  pull|push       move the MEMORY: what the team found out (both ways)\n' +
+          '  notes           what the org memory holds for this project',
+      );
   }
 }
 

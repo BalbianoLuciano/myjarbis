@@ -155,6 +155,24 @@ export function codeRefsFor(cwd: string, files: string | null): string | null {
 // ─────────────────────────────────────────────────────────────────────
 
 /**
+ * The org this project belongs to, read LIVE rather than from the cached
+ * project row.
+ *
+ * `ctx.requireProject()` hands back a row read when the connection was bound,
+ * and `org_id` is the one field on it that changes during a process's life: a
+ * pull joins the project to an org, and anything afterwards that trusted the
+ * cached row would be told the project has no org. Invisible in the CLI, where
+ * every subcommand is a fresh process; live in the MCP server, which holds one
+ * context for the whole session. Found by pulling and promoting in one process.
+ */
+function orgOf(ctx: ServerContext): { id: number; slug: string; name: string } | null {
+  const orgId = ctx.db.scopedOrgId;
+  if (orgId === null) return null;
+  const org = ctx.db.orgs.findById(orgId);
+  return org ? { id: org.id, slug: org.slug, name: org.name } : null;
+}
+
+/**
  * What the scrub needs to know in order to recognise a leak.
  *
  * The other-projects list comes from the registry, with each project's module
@@ -273,7 +291,7 @@ export function proposePromotions(
   opts: { sessionId?: number; observationIds?: number[] } = {},
 ): ProposePromotionsResult {
   const project = ctx.requireProject();
-  const org = project.org_id === null ? null : ctx.db.orgs.findById(project.org_id);
+  const org = orgOf(ctx);
 
   if (!org) {
     return {
@@ -461,19 +479,13 @@ export function promoteObservation(ctx: ServerContext, rawArgs: unknown): Promot
   const args = promoteArgsZ.parse(rawArgs);
   const project = ctx.requireProject();
 
-  if (project.org_id === null) {
+  const org = orgOf(ctx);
+  if (!org) {
     throw new MyJarbisError(
       ErrorType.NO_ORG,
       'This project belongs to no org, so there is no org memory to promote into. ' +
         'Join one with `myjarbis org add <slug> <pack-path>` or `myjarbis org pull`.',
       { project: project.name },
-    );
-  }
-  const org = ctx.db.orgs.findById(project.org_id);
-  if (!org) {
-    throw new MyJarbisError(
-      ErrorType.ORG_NOT_FOUND,
-      `This project references org ${project.org_id}, which is not in this brain.`,
     );
   }
 
@@ -665,10 +677,10 @@ export function listOrgNotes(ctx: ServerContext, rawArgs: unknown = {}): ListOrg
     .parse(rawArgs ?? {});
 
   const project = ctx.requireProject();
-  if (project.org_id === null) {
+  const org = orgOf(ctx);
+  if (!org) {
     return { org: null, count: 0, notes: [], hint: 'This project belongs to no org.' };
   }
-  const org = ctx.db.orgs.findById(project.org_id)!;
   const rows = ctx.db.orgNotes.listByOrg(org.id, {
     projectId: project.id,
     status: args.status ?? ['active', 'stale'],

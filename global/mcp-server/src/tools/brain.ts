@@ -39,6 +39,7 @@ import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
 import { SCHEMA_VERSION, FTS_TABLES } from '../db/schema.js';
 import { findSecrets, SECRET_GUIDANCE } from '../org/secrets.js';
+import { writeIfChanged, parseNdjson } from '../ndjson.js';
 
 /** Directory name under `.myjarbis/` holding the dump. */
 export const BRAIN_DIRNAME = 'brain';
@@ -241,36 +242,6 @@ function serializeRow(row: Record<string, unknown>, cols: string[]): string {
 
 /** Write only when the bytes differ, so untouched tables keep their mtime and
  *  git sees no spurious change. Returns true when the file was rewritten. */
-function writeIfChanged(file: string, contents: string): boolean {
-  if (fs.existsSync(file)) {
-    const current = fs.readFileSync(file, 'utf-8');
-    if (current === contents) return false;
-  }
-  fs.writeFileSync(file, contents, 'utf-8');
-  return true;
-}
-
-function parseNdjson(file: string): Array<Record<string, unknown>> {
-  if (!fs.existsSync(file)) return [];
-  const raw = fs.readFileSync(file, 'utf-8');
-  const out: Array<Record<string, unknown>> = [];
-  const lines = raw.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    try {
-      out.push(JSON.parse(line) as Record<string, unknown>);
-    } catch {
-      throw new MyJarbisError(
-        ErrorType.INVALID_INPUT,
-        `${path.basename(file)}:${i + 1} is not valid JSON — the dump is corrupt or a merge conflict was left unresolved.`,
-        { file, line: i + 1, snippet: line.slice(0, 120) },
-      );
-    }
-  }
-  return out;
-}
-
 /**
  * Row counts for THIS project only, using the same scope clauses the export
  * uses. Counting whole tables would report drift forever in a shared brain:
