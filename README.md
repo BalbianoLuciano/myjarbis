@@ -321,6 +321,54 @@ of this repo.
 </details>
 
 <details>
+<summary><b>A second memory, for the team</b></summary>
+
+Your brain is yours: sessions, handoffs, half-finished thinking, the living
+state. None of it should travel. But a gotcha that cost you two hours is
+something the whole team re-learns if nobody writes it where they can read
+it.
+
+So there is a second, much smaller memory, scoped to an org:
+
+```bash
+myjarbis org push      # writes <project>/.myjarbis/org/*.ndjson — you commit them
+myjarbis org pull      # a teammate clones, pulls, and inherits all of it
+myjarbis org notes     # what the team already knows, with who found it
+```
+
+The transport is the repository you already share. No server, no new repo, no
+access to grant.
+
+**What can never cross is a property of the schema, not a setting.** The org
+table has no `session_id`, no `summary`, no `next_session` and no free-text
+body, and the only door in takes a single note id. A conversation has nowhere
+to go.
+
+**Promotion is proposed, never automatic.** At a session close you are shown
+what might belong to the team and you pick:
+
+```
+Promote to the "acme" memory?
+
+  [ ] #1551 gotcha   An UPDATE corrupts a contentless FTS5 index
+  [!] #1552 error    The deploy fails without DATABASE_URL
+  [=] #1553 gotcha   already in the org memory — nothing to do
+
+  never promoted: the handoff, the session summary, the conversation
+```
+
+`[!]` means it would leak something — a credential, a local path, an internal
+host, a real client's project name — and it is **refused** with the offending
+line and a proposed rewrite until you accept one.
+
+Each note carries who found it, when, whether it was `verified` against a
+commit or merely `assumed`, and a drift signal: how many of the files it cited
+have changed since. An old note that describes code nobody has touched and an
+old note that is still true look identical otherwise.
+
+</details>
+
+<details>
 <summary><b>Workflows as data, not prose</b></summary>
 
 Process written as prose gets duplicated and then contradicted. Workflows
@@ -342,6 +390,37 @@ and MyJarbis never learns a vendor's name.
 `gate=approve` means *stop and ask*. Conditions are decidable
 (`branch ~= release/*`, `framework in [laravel, express]`), not free text
 for the agent to interpret differently each session.
+
+**A workflow can be made of other workflows.** A step carrying
+`uses: commit-ritual` splices that whole ritual in, and the resolution stays
+one flat ordered list with the child's steps namespaced:
+
+```
+myjarbis workflow show session-close
+
+  1  look-at-the-real-state              session-close
+  2  save-the-observations               session-close
+  3  commit-ritual/stage-by-name         commit-ritual
+  4  commit-ritual/write-the-subject     commit-ritual
+  5  commit-ritual/write-the-body        commit-ritual
+  6  pre-push-checks/run-the-suite       pre-push-checks
+  7  pre-push-checks/confirm-green       pre-push-checks   gate: approve
+  8  commit-ritual/push                  commit-ritual     gate: approve
+  9  write-the-living-state              session-close
+ 10  offer-the-team-what-is-theirs       session-close     gate: on-request
+ 11  end-the-session                     session-close
+```
+
+The layers resolve **before** the expansion, which is the point: turn the
+push gate off in `commit-ritual` once and every ritual that invokes it
+follows. One rule, one place — including the two levels down.
+
+**And a run records where you got to.** `start_workflow_run` snapshots the
+resolution; `advance_workflow_step` takes no arguments in the common case.
+Per-step times are measured, so "how long does our release actually take" is
+a query. A compaction keeps almost none of the commands an agent ran — "I
+have done steps one through four" is exactly the sentence that does not
+survive one, and a row survives it perfectly.
 
 ```bash
 myjarbis provider set tracker acme-tracker --config='{"base_url":"https://..."}'
