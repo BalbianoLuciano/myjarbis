@@ -54,6 +54,7 @@ import {
 } from './activeModules.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
+import { resolveIdentity, setIdentity, identityWarning } from './org/identity.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
 import {
   CLAUDE_HOOKS,
@@ -420,7 +421,7 @@ function runModule(argv: string[]): void {
 function runConfig(argv: string[]): void {
   const [sub, ...rest] = argv;
   if (!sub) {
-    fail('Usage: myjarbis config <list|language|persona> [value]');
+    fail('Usage: myjarbis config <list|language|persona|dev|diagram> [value]');
   }
   const ctx = ServerContext.initialize();
   try {
@@ -438,11 +439,20 @@ function runConfig(argv: string[]): void {
         search_default_scope: settings.search_default_scope ?? 'module',
         story_pattern: settings.story_pattern ?? null,
         nudges: settings.nudges ?? null,
+        dev: resolveIdentity(ctx.projectPath),
       };
       if (wantsJson(flags)) { printJson(data); return; }
       ptySection('MyJarbis · config of ' + bold(project.name));
       ptyKV('Language', red(bold(String(data.language).toUpperCase())));
       ptyKV('Persona', red(bold(data.persona)));
+      // The source matters as much as the handle: a fallback is a guess, and
+      // it would otherwise read as a name somebody chose.
+      ptyKV(
+        'Dev',
+        data.dev.source === 'fallback'
+          ? dim(data.dev.handle) + ' ' + dim('(no identity configured)')
+          : data.dev.handle + ' ' + dim('(' + data.dev.source + ')'),
+      );
       ptyKV('Shared', data.shared ? red('true') : 'false');
       ptyKV('Scope', data.search_default_scope);
       if (data.story_pattern) ptyKV('Stories', dim(data.story_pattern));
@@ -502,7 +512,36 @@ function runConfig(argv: string[]): void {
       console.log('');
       return;
     }
-    fail(`Unknown config subcommand: ${sub}. Use list | language | persona | diagram.`);
+    if (sub === 'dev') {
+      const { positional, flags } = parseFlags(rest);
+      const handle = positional[0];
+      // With no argument this reports rather than fails: "who am I to this
+      // project" is a question worth being able to ask.
+      if (!handle) {
+        const current = resolveIdentity(ctx.projectPath);
+        if (wantsJson(flags)) { printJson(current); return; }
+        ptySection('MyJarbis · dev identity');
+        ptyKV('Handle', bold(current.handle));
+        ptyKV('Email', current.email ?? dim('(none)'));
+        ptyKV('Source', current.source);
+        const warn = identityWarning(current);
+        if (warn) { console.log(''); ptyLine('  ' + warn); }
+        console.log('');
+        ptyDim('Set with: myjarbis config dev <handle> [--email=<address>]');
+        console.log('');
+        return;
+      }
+      const next = setIdentity(ctx.projectPath, handle, flags.email ? String(flags.email) : undefined);
+      if (wantsJson(flags)) { printJson(next); return; }
+      ptySection('MyJarbis · config');
+      ptyLine('  ' + `Dev identity set to ${bold(next.handle)}`);
+      if (next.email) ptyDim('  ' + next.email);
+      console.log('');
+      ptyDim('  Org notes promoted from this project will carry it as their author.');
+      console.log('');
+      return;
+    }
+    fail(`Unknown config subcommand: ${sub}. Use list | language | persona | dev | diagram.`);
   } finally {
     ctx.close();
   }
