@@ -70,12 +70,18 @@ fail() { echo -e "       ${RED}${BOLD}FAIL${NC}  $1"; }
 # covered without its author knowing any of the above.
 #
 # Deliberately NOT used for the global/* trees, and the reason is the same
-# mechanism rather than an exception to it: those are mcp-server/ (node_modules
-# and symlinks included, ~1600 files), core/ and templates/, and nothing in
-# them is executed incrementally by bash. Node reads a module file whole, so a
-# replaced build/*.js either loads or fails loudly at import. The project hook
-# refresh at step 5 is safe for the same reason this helper is: it `rm -rf`s
-# before copying, and unlinking leaves the running process on the old inode.
+# mechanism rather than an exception to it: those are mcp-server/, core/ and
+# templates/, and nothing in them is executed incrementally by bash. Node
+# reads a module file whole, so a replaced build/*.js either loads or fails
+# loudly at import. The project hook refresh at step 5 is safe for the same
+# reason this helper is: it `rm -rf`s before copying, and unlinking leaves the
+# running process on the old inode.
+#
+# One correction to the above, paid for in a dead session: that reasoning is
+# true of JavaScript and FALSE of a mapped native module. node_modules used to
+# be copied with the rest of this tree, and better_sqlite3.node is mmap'd by
+# the running server — replacing a mapped file in place is a SIGBUS, not a
+# loud import failure. Step 3 excludes node_modules for exactly that reason.
 sync_executables() {
     local src_dir="$1" dest_dir="$2" f base dest staged
     mkdir -p "$dest_dir"
@@ -168,8 +174,9 @@ for arg in "$@"; do
             echo "                   working. Use this to fix unwired projects."
             echo "  --no-pull        Re-sync from the local checkout without pulling."
             echo "  --dry-run, -n    Report what WOULD change, per project, writing nothing."
-            echo "                   Run this first: the real run rebuilds the MCP"
-            echo "                   server a running Claude session is attached to."
+            echo "                   Worth running first, though a running Claude"
+            echo "                   session now survives the real run unless the"
+            echo "                   dependencies themselves changed."
             echo "  --yes, -y        Do not ask anything, even with Claude Code running."
             echo "  --from=<path>    Use this checkout as the source and remember it."
             exit 0
@@ -192,36 +199,72 @@ if [ ! -d "$INSTALL_DIR" ]; then
     exit 1
 fi
 
-# ─── preflight: a running Claude session is about to lose its tools ──
+# ─── preflight: can a running Claude session survive this run? ───────
 #
-# Updating rebuilds mcp-server/build in place, and that is the exact build a
-# running Claude session is attached to. The old process keeps running against
-# files that changed underneath it, so every mcp__myjarbis__* call starts
-# failing with "Connection closed" — mid-session, with no explanation. The
-# closing message already says to restart Claude Code; what it never said is
-# that the session open RIGHT NOW is the one being broken, and by then it is
-# too late to choose.
+# It can, now, in the ordinary case — and working out WHY it used to die is
+# what made that true. Three claims, in the order they were tested:
 #
-# This runs before step 1 on purpose: nothing has been touched yet, so
-# answering "no" leaves the installation exactly as it was.
+#   · Replacing build/*.js under the live server does nothing to it. Every
+#     import in the server is static, so all modules are resolved and in
+#     memory at startup (`grep -rn 'await import(' src/` finds none).
+#   · What killed it is node_modules/better-sqlite3/.../better_sqlite3.node,
+#     which the process has MAPPED — `grep better_sqlite3 /proc/<pid>/maps`.
+#     Replacing a mapped file in place is a SIGBUS for its reader. That is the
+#     "Connection closed" everyone blamed on the JavaScript.
+#   · And `cp -r global/mcp-server` was enough to cause it by itself, since
+#     the checkout tree carries node_modules. npm install never had to run.
+#
+# So step 3 excludes node_modules, step 4 skips npm install when the
+# dependency list is unchanged and builds beside the live build before
+# swapping by rename. What remains is the one case that genuinely cannot be
+# made safe: a dependency actually changing, which has to rewrite the mapped
+# module. That is what this now warns about — and only that.
+#
+# A warning that fires on every run is a warning people learn to skip, which
+# is the same failure as `doctor` passing green on hooks that never ran.
+#
+# Still before step 1: nothing has been written yet, so answering "no" leaves
+# the installation exactly as it was. The source is resolved read-only here
+# for the dependency comparison; step 1 is what records it.
 #
 # `pgrep -x` matches the process name exactly, which is what keeps this from
 # matching the shell running the update, or the grep itself. Absent pgrep
 # (unlikely on Linux/macOS, possible in a bare container), the check is
 # skipped rather than guessed at.
 #
-# Skipped entirely for --projects-only: that path never rebuilds, so the
-# running session keeps the build it is attached to. Warning anyway would
-# train people to ignore the warning on the run that does matter.
+# Skipped entirely for --projects-only: that path never rebuilds.
+DEPS_CHANGED=""
 if [ -z "$PROJECTS_ONLY" ] && [ -z "$DRY_RUN" ] && command -v pgrep >/dev/null 2>&1; then
     CLAUDE_PIDS="$(pgrep -x claude 2>/dev/null | tr '\n' ' ' | sed 's/ $//')" || CLAUDE_PIDS=""
     if [ -n "$CLAUDE_PIDS" ]; then
+        PREFLIGHT_SOURCE=""
+        if [ -n "$SOURCE_OVERRIDE" ]; then
+            PREFLIGHT_SOURCE="$SOURCE_OVERRIDE"
+        elif [ -f "$INSTALL_DIR/.source" ]; then
+            PREFLIGHT_SOURCE="$(cat "$INSTALL_DIR/.source")"
+        fi
+        DEPS_CHANGED="$(node -e "
+          const read = (p) => { try { return JSON.parse(require('fs').readFileSync(p,'utf8')).dependencies || {}; } catch { return null; } };
+          const a = read('$INSTALL_DIR/mcp-server/package.json');
+          const b = read('$PREFLIGHT_SOURCE/global/mcp-server/package.json');
+          console.log(a && b && JSON.stringify(a) === JSON.stringify(b) ? '' : 'yes');
+        " 2>/dev/null || echo yes)"
+        # Tri-state on purpose: an EMPTY DEPS_CHANGED means "compared, and they
+        # match", which step 4 must not confuse with "never compared".
+        DEPS_CHECKED=1
+    fi
+    if [ -n "$CLAUDE_PIDS" ] && [ -z "$DEPS_CHANGED" ]; then
+        note "Claude Code is running (PID ${CLAUDE_PIDS}) — and can keep running:"
+        note "dependencies are unchanged, so nothing it has mapped gets replaced."
+        note "the new build lands by rename; restart when convenient to pick it up."
+        echo
+    elif [ -n "$CLAUDE_PIDS" ]; then
         # The warning prints even with --yes. That flag says "do not ask me",
         # not "do not tell me" — someone running this from a script still
         # needs to know a session is about to lose its tools.
         warn "Claude Code is running (PID ${CLAUDE_PIDS})"
-        note "updating replaces the MCP server build that session is attached"
-        note "to: it will lose every myjarbis tool and has to be restarted."
+        note "dependencies CHANGED, so npm install has to replace the native"
+        note "module that session has mapped: it will lose every myjarbis tool."
         if [ -z "$ASSUME_YES" ] && [ -t 0 ]; then
             # Same idiom as bin/myjarbis-init: ask only when someone is there
             # to answer. Non-interactive callers — the agent running this from
@@ -339,9 +382,23 @@ note "version: installed $INSTALLED_VER → source $SOURCE_VER"
 ok
 
 step 4 "Install dependencies and rebuild"
-note "would run npm install and npm run build in $INSTALL_DIR/mcp-server"
-warn "that is the step a running Claude session cannot survive"
-note "it replaces the build the session is attached to; close Claude first"
+# Reported from the same comparison the real run acts on, not from a guess
+# about it: the two must not be able to disagree.
+DRY_DEPS_CHANGED="$(node -e "
+  const read = (p) => { try { return JSON.parse(require('fs').readFileSync(p,'utf8')).dependencies || {}; } catch { return null; } };
+  const a = read('$INSTALL_DIR/mcp-server/package.json');
+  const b = read('$SOURCE/global/mcp-server/package.json');
+  console.log(a && b && JSON.stringify(a) === JSON.stringify(b) ? '' : 'yes');
+" 2>/dev/null || echo yes)"
+if [ -n "$DRY_DEPS_CHANGED" ]; then
+    note "would run npm install in $INSTALL_DIR/mcp-server (dependencies changed)"
+    warn "that is the step a running Claude session cannot survive"
+    note "npm install replaces the native module the session has mapped"
+else
+    note "would skip npm install — dependencies are unchanged"
+    note "a running Claude session survives this run; node_modules is not touched"
+fi
+note "would build into mcp-server/build.next, then swap it in by rename"
 ok
 
 else
@@ -367,6 +424,20 @@ ok
 
 # ─── [3/5] sync files ─────────────────────────────────────────────
 step 3 "Sync code, templates and CLI"
+# Answered BEFORE the sync, because the sync overwrites the very file the
+# answer is read from. `npm install` is the one step that can replace the
+# mapped native module, so whether it is needed decides whether a running
+# session is at risk at all — see the preflight, which asks this first when
+# a session is open and records that it did.
+if [ -z "${DEPS_CHECKED:-}" ]; then
+    DEPS_CHANGED="$(node -e "
+      const read = (p) => { try { return JSON.parse(require('fs').readFileSync(p,'utf8')).dependencies || {}; } catch { return null; } };
+      const a = read('$INSTALL_DIR/mcp-server/package.json');
+      const b = read('$SOURCE/global/mcp-server/package.json');
+      // A missing or unreadable manifest counts as changed: unknown is not safe.
+      console.log(a && b && JSON.stringify(a) === JSON.stringify(b) ? '' : 'yes');
+    " 2>/dev/null || echo yes)"
+fi
 # The registry is state owned by this installation, and a developer's
 # checkout can contain a stale copy of it. Never overwrite it.
 REGISTRY_BACKUP=""
@@ -379,7 +450,31 @@ for item in "$SOURCE"/global/*; do
     base="$(basename "$item")"
     [ "$base" = "projects-registry.json" ] && continue
     rm -rf "$INSTALL_DIR/$base.old" 2>/dev/null || true
-    cp -r "$item" "$INSTALL_DIR/"
+    if [ "$base" = "mcp-server" ]; then
+        # Everything EXCEPT node_modules/ and build/, and the exclusion is the
+        # whole reason this update no longer needs Claude closed.
+        #
+        # node_modules: the live server has
+        # node_modules/better-sqlite3/build/Release/better_sqlite3.node MAPPED
+        # into its address space — `grep better_sqlite3 /proc/<pid>/maps` shows
+        # it. Overwriting a mapped file in place is a SIGBUS for the reader, and
+        # that is the "Connection closed" this script used to cause, wrongly
+        # attributed to the JavaScript. `cp -r` of the source tree was enough to
+        # do it on its own, before npm install ever ran.
+        #
+        # build: it is produced by step 4, which stages and renames rather than
+        # writing in place. Copying the checkout's build over it here would undo
+        # that and reintroduce a window where the directory is half-replaced.
+        mkdir -p "$INSTALL_DIR/mcp-server"
+        for sub in "$item"/*; do
+            case "$(basename "$sub")" in
+                node_modules|build) continue ;;
+            esac
+            cp -r "$sub" "$INSTALL_DIR/mcp-server/"
+        done
+    else
+        cp -r "$item" "$INSTALL_DIR/"
+    fi
 done
 # By rename, not in place: this is the copy that used to kill the running
 # update. See sync_executables at the top for why.
@@ -408,17 +503,89 @@ ok
 # ─── [4/5] dependencies + build ───────────────────────────────────
 step 4 "Install dependencies and rebuild"
 cd "$INSTALL_DIR/mcp-server"
-npm install --silent 2>&1 | grep -v "npm WARN" || true
-if npm run build 2>&1 | tail -1 | sed 's/^/       /'; then
-    if [ -f "build/index.js" ]; then
+
+# Only when the dependency list actually changed. Skipping it is not an
+# optimisation: npm install rewrites better_sqlite3.node, which a running
+# server has mapped, and a mapped file replaced under its reader is a SIGBUS.
+if [ -n "$DEPS_CHANGED" ]; then
+    warn "dependencies changed — npm install will replace the native module"
+    note "a running Claude session cannot survive this one; it must restart"
+    npm install --silent 2>&1 | grep -v "npm WARN" || true
+else
+    note "dependencies unchanged — npm install skipped (nothing to install)"
+fi
+
+# Built BESIDE the live build, then swapped by rename. tsc writing straight
+# into build/ leaves it half-replaced for as long as the compile takes, and
+# that is the window a running session reads in. A rename is atomic, and the
+# running process holds the old inode, so it keeps the build it started with
+# until it restarts.
+rm -rf build.next
+# The package's own `build` script stays the source of truth for HOW to
+# build — hardcoding `tsc` here broke the sandbox install in
+# tests/v045-update-self-overwrite.sh, which declares a dependency-free build
+# script on purpose so step 4 is a real run without reaching the network.
+# What changes is only WHERE the output lands.
+BUILD_SCRIPT="$(node -e "try{process.stdout.write(String((require('$INSTALL_DIR/mcp-server/package.json').scripts||{}).build||''))}catch(e){}" 2>/dev/null || true)"
+
+case "$BUILD_SCRIPT" in
+    tsc|tsc\ *)
+        # tsc takes --outDir, so the new build can be compiled BESIDE the live
+        # one and renamed in. No window at all: build/ is a complete build
+        # before the swap and a complete build after it, which matters because
+        # a project's hooks resolve <install>/mcp-server/build/cli.js by path
+        # and one firing mid-compile would otherwise find half a directory.
+        BUILD_MODE="staged"
+        BUILD_CMD="npm run build -- --outDir build.next"
+        ;;
+    *)
+        # Anything else: move the live build aside, build, and restore it if
+        # the build fails. The running server is still safe — it holds the old
+        # inode, which is now called build.prev — but there IS a window with no
+        # build/ on disk, for as long as the build takes.
+        BUILD_MODE="aside"
+        BUILD_CMD="npm run build"
+        ;;
+esac
+
+build_failed() {
+    if [ "$BUILD_MODE" = "aside" ] && [ -d build.prev ] && [ ! -f build/index.js ]; then
+        rm -rf build
+        mv build.prev build
+        note "the previous build was restored"
+    fi
+    rm -rf build.next
+    fail "$1 — the live build was left untouched"
+    exit 1
+}
+
+if [ "$BUILD_MODE" = "aside" ]; then
+    rm -rf build.prev
+    [ -d build ] && mv build build.prev
+fi
+
+if $BUILD_CMD 2>&1 | tail -1 | sed 's/^/       /'; then
+    if [ "$BUILD_MODE" = "staged" ]; then
+        if [ -f "build.next/index.js" ]; then
+            rm -rf build.prev
+            # Two renames. The first keeps the previous build as the rollback
+            # rather than deleting it: a build that compiles is not yet a build
+            # that runs, and `mv build.prev build` is the whole way back.
+            [ -d build ] && mv build build.prev
+            mv build.next build
+            note "build swapped by rename · rollback in build.prev"
+            ok
+        else
+            build_failed "build produced no index.js"
+        fi
+    elif [ -f "build/index.js" ]; then
+        note "built fresh · previous build kept in build.prev"
         ok
     else
-        fail "build produced no index.js"
-        exit 1
+        build_failed "build produced no index.js"
     fi
 else
-    fail "build failed"
-    exit 1
+    build_failed "build failed"
 fi
 
 VERSION=$(node -e "console.log(require('$INSTALL_DIR/mcp-server/package.json').version)" 2>/dev/null || echo '?')
@@ -756,9 +923,14 @@ process.stdin.on('end', () => {
                 note "  $MAT_WOULD project(s) would get new skill files"
             fi
             echo
-            note "NOTHING WAS WRITTEN. Re-run without --dry-run to apply,"
-            note "with Claude Code closed — step 4 replaces the build a running"
-            note "session is attached to."
+            note "NOTHING WAS WRITTEN. Re-run without --dry-run to apply."
+            if [ -n "${DRY_DEPS_CHANGED:-}" ]; then
+                note "Close Claude Code first: the dependencies changed, so step 4"
+                note "has to replace the native module a running session mapped."
+            else
+                note "Claude Code can stay open — step 4 touches no node_modules"
+                note "and swaps the build by rename."
+            fi
         else
             note "  $MAT_OK project(s) re-materialized$([ "$MAT_FAIL" -gt 0 ] && echo ", $MAT_FAIL failed")"
             note "  $PERM_OK project(s) have the read-only permission baseline"
@@ -784,10 +956,13 @@ echo
 if [ -n "$DRY_RUN" ]; then
     echo -e "${RED}${BOLD}Dry run${NC}"
     echo
-    echo -e "  Nothing was written. Close Claude Code, then: ${BOLD}myjarbis update${NC}"
+    echo -e "  Nothing was written. To apply: ${BOLD}myjarbis update${NC}"
 else
     echo -e "${RED}${BOLD}Done${NC}"
     echo
-    echo -e "  Restart Claude Code to pick up the new server and hooks."
+    # "when convenient" rather than "now": a session still attached to the old
+    # build keeps working, it just does not have the new one yet. Telling
+    # someone they are broken when they are not is how a message stops being read.
+    echo -e "  Restart Claude Code when convenient to pick up the new server and hooks."
 fi
 echo

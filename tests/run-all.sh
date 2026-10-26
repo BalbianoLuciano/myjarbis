@@ -75,6 +75,7 @@ SUITES=(
   v050-stress
   v050-hostile
   v050-update-dryrun
+  v051-update-live-session
 )
 
 # ─── what to print when a suite fails ─────────────────────────────

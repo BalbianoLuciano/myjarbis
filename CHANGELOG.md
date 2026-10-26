@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`myjarbis update` no longer needs Claude Code closed.** For three releases
+  the instruction was "close Claude first", carried as a rule without its
+  mechanism. The mechanism turned out to be narrower than the rule, and
+  measuring it is what made the rule removable.
+
+  Three claims, in the order they were tested:
+
+  · Replacing `build/*.js` under the live server does **nothing** to it. Every
+    import in the server is static (`grep -rn 'await import(' src/` finds
+    none), so all modules are resolved and in memory at startup.
+  · What killed it is `node_modules/better-sqlite3/.../better_sqlite3.node`,
+    which the process has **mapped** — visible in `/proc/<pid>/maps`.
+    Replacing a mapped file in place is a fatal signal for its reader.
+  · And `cp -r "$SOURCE/global/mcp-server"` was enough to cause it on its own,
+    because the checkout tree carries `node_modules`. `npm install` never had
+    to run.
+
+  Caught in the act while verifying the fix, with kernel evidence: the old
+  path rewrote the mapped module at 16:57:27 and this session's server died
+  with signal 11 at **16:58:12** — 45 seconds later, on its next access to a
+  replaced page. A second server against the same install survived with 33
+  ticks of CPU to its name: it was idle and never faulted. That lag is why the
+  failure read as random, and why the old warning could only say that calls
+  "start failing" without saying when.
+
+  So: step 3 excludes `node_modules` from the sync, step 4 skips `npm install`
+  when the dependency list is unchanged and builds into `build.next` before
+  swapping by rename, and the previous build is kept as `build.prev` — the way
+  back is one rename. A build that fails never touches the live one.
+
+  The `build` script declared in `package.json` is still the source of truth
+  for HOW to build; only WHERE the output lands changed. Hardcoding `tsc` here
+  broke the sandbox install in `tests/v045-update-self-overwrite.sh`, which
+  declares a dependency-free build script on purpose.
+
+- **The preflight stopped crying wolf.** It asked permission to break a
+  running session on every run. Now it says so only when the dependencies
+  actually changed, which is the one case that cannot be made safe, and
+  otherwise says the session can keep running. A warning that fires every time
+  is a warning people learn to skip — the same failure as `doctor` passing
+  green on hooks that never ran.
+
+  One honest consequence, and there is no way around it: `myjarbis update`
+  execs the **installed** `bin/myjarbis-update`, so this fix cannot take
+  effect until it is installed, and installing it means running the old script
+  once. Run the checkout's copy directly for that one hop:
+  `bash bin/myjarbis-update`.
+
+### Tested
+
+- `tests/v051-update-live-session.sh`, 22 assertions, with a real process
+  named `claude` so the `pgrep -x claude` branch is the one under test rather
+  than a mock of it.
+
+  Two of its assertions were worthless until a revert proved otherwise, which
+  is the only way that gets found. Checking `node_modules` by **inode** passes
+  on the bug: `cp` overwrites in place, so the inode survives and the content
+  can be byte-identical — and that is exactly the dangerous case. The
+  **mtime** is what catches it. And the first version of the failed-build
+  section passed with the fix reverted, because `tsc` emits output for the
+  files it can compile even when the build fails overall, and `index.js` came
+  out identical since `index.ts` had not changed; it now fingerprints every
+  file's mtime under `build/`.
+
 ## v0.5.0 — org memory and workflow-driven development (schema v5)
 
 Two features, and both of them are about the same thing: knowledge that
