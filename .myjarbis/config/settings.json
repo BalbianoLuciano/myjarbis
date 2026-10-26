@@ -18,5 +18,6 @@
   "skills": {
     "materialize_on_session_start": true,
     "cleanup_module_skills_on_session_end": false
-  }
+  },
+  "language": "en"
 }
