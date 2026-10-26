@@ -98,10 +98,22 @@ grep -qi 'dry run' "$CLEAN" && pass "and says it is a dry run" \
   || oops "the output never says it is a dry run"
 grep -qi 'NOTHING WAS WRITTEN' "$CLEAN" && pass "and that nothing was written" \
   || oops "the output does not say nothing was written"
-# Being run first is the point, so the hazard of the real run has to be here.
-grep -qi 'running Claude session cannot survive' "$CLEAN" \
-  && pass "and warns that the real run kills a running Claude session" \
-  || oops "the rebuild warning is missing from the dry run"
+# Being run first is the point, so the real run's effect on an open session
+# has to be stated here — and the honest answer now depends on the dependency
+# list, since the run became survivable in the ordinary case. This fixture
+# feeds the install from this same checkout, so the dependencies always match
+# and the dry run must say the session survives. The warning that used to be
+# asserted here is now asserted by tests/v051-update-live-session.sh, on a
+# fixture where the dependencies really do differ.
+grep -qi 'dependencies are unchanged' "$CLEAN" \
+  && pass "and reports that npm install would be skipped" \
+  || oops "the dry run does not report the dependency comparison"
+grep -qi 'survives this run' "$CLEAN" \
+  && pass "and that a running Claude session survives it" \
+  || oops "the dry run does not say whether an open session survives"
+grep -qi 'swap it in by rename' "$CLEAN" \
+  && pass "and that the build lands by rename" \
+  || oops "the dry run does not mention the rename swap"
 
 echo "→ [2] it wrote nothing"
 [ "$(cat "$INSTALL/.source")" = "$SOURCE_BEFORE" ] \

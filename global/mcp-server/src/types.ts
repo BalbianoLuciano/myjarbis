@@ -143,6 +143,12 @@ export enum ErrorType {
    *  write. Separate from ORG_NOT_FOUND, which is a named org that does not
    *  exist: this one is "you have not joined one". */
   NO_ORG = 'NO_ORG',
+  /** The feature needs a newer schema than this brain has. Distinct from
+   *  DB_ERROR because the remedy is one specific command, `myjarbis migrate`,
+   *  and because the alternative — letting SQLite answer — produces "table
+   *  workflows has no column named standalone", which names a column when
+   *  what the reader needs is the fix. */
+  SCHEMA_TOO_OLD = 'SCHEMA_TOO_OLD',
 }
 
 /**

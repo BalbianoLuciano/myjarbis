@@ -313,6 +313,33 @@ export class MyJarbisDB {
     this._schemaVersion = undefined;
   }
 
+  /**
+   * Refuse a feature whose tables or columns this brain does not have yet,
+   * and name the remedy.
+   *
+   * Written after a v5 feature was shipped with no such check anywhere: on a
+   * v4 brain the baseline workflow reseed failed for all 23 projects with
+   * `table workflows has no column named standalone`, which the propagation
+   * step then reported as "nothing to change". The raw SQLite message is both
+   * true and useless — it names a column, when what the reader needs is the
+   * one command that fixes it.
+   *
+   * The guard goes on the ACCESSOR rather than on each method, so a method
+   * added to `orgNotes` or `workflowRuns` tomorrow is covered without its
+   * author knowing any of this — the same reasoning as `sync_executables`
+   * owning the rename in bin/myjarbis-update.
+   */
+  private requireSchema(min: number, feature: string): void {
+    if (this.schemaVersion < min) {
+      throw new MyJarbisError(
+        ErrorType.SCHEMA_TOO_OLD,
+        `${feature} needs schema v${min}; this brain is on v${this.schemaVersion}. ` +
+          'Run `myjarbis migrate` first — it backs the brain up, and `--dry-run` upgrades a copy.',
+        { brainSchema: this.schemaVersion, required: min, feature },
+      );
+    }
+  }
+
   private _schemaVersion?: number;
 
   /** The schema version recorded in the file. 0 for a DB with no meta row. */
@@ -1914,7 +1941,13 @@ export class MyJarbisDB {
   // can legitimately change mid-ritual when somebody edits a step. A run that
   // referenced step ids would silently re-point at a different process.
   // ─────────────────────────────────────────────────────────────────
-  workflowRuns = {
+  /** Guarded accessor: see requireSchema. `workflow_runs` arrived in v5. */
+  get workflowRuns() {
+    this.requireSchema(5, 'workflow runs');
+    return this._workflowRuns;
+  }
+
+  private _workflowRuns = {
     open: (params: {
       projectId: number;
       slug: string;
@@ -2194,7 +2227,13 @@ export class MyJarbisDB {
     }
   }
 
-  orgNotes = {
+  /** Guarded accessor: see requireSchema. `org_notes` arrived in v5. */
+  get orgNotes() {
+    this.requireSchema(5, 'the org memory');
+    return this._orgNotes;
+  }
+
+  private _orgNotes = {
     /** Days before a note is treated as possibly rotten. */
     ttlDays: DEFAULT_ORG_NOTE_TTL_DAYS,
 

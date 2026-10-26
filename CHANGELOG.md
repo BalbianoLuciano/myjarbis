@@ -1,5 +1,123 @@
 # Changelog
 
+## v0.5.1 — the update stops breaking the session that runs it
+
+### Fixed
+
+- **`myjarbis update` no longer needs Claude Code closed.** For three releases
+  the instruction was "close Claude first", carried as a rule without its
+  mechanism. The mechanism turned out to be narrower than the rule, and
+  measuring it is what made the rule removable.
+
+  Three claims, in the order they were tested:
+
+  · Replacing `build/*.js` under the live server does **nothing** to it. Every
+    import in the server is static (`grep -rn 'await import(' src/` finds
+    none), so all modules are resolved and in memory at startup.
+  · What killed it is `node_modules/better-sqlite3/.../better_sqlite3.node`,
+    which the process has **mapped** — visible in `/proc/<pid>/maps`.
+    Replacing a mapped file in place is a fatal signal for its reader.
+  · And `cp -r "$SOURCE/global/mcp-server"` was enough to cause it on its own,
+    because the checkout tree carries `node_modules`. `npm install` never had
+    to run.
+
+  Caught in the act while verifying the fix, with kernel evidence: the old
+  path rewrote the mapped module at 16:57:27 and this session's server died
+  with signal 11 at **16:58:12** — 45 seconds later, on its next access to a
+  replaced page. A second server against the same install survived with 33
+  ticks of CPU to its name: it was idle and never faulted. That lag is why the
+  failure read as random, and why the old warning could only say that calls
+  "start failing" without saying when.
+
+  So: step 3 excludes `node_modules` from the sync, step 4 skips `npm install`
+  when the dependency list is unchanged and builds into `build.next` before
+  swapping by rename, and the previous build is kept as `build.prev` — the way
+  back is one rename. A build that fails never touches the live one.
+
+  The `build` script declared in `package.json` is still the source of truth
+  for HOW to build; only WHERE the output lands changed. Hardcoding `tsc` here
+  broke the sandbox install in `tests/v045-update-self-overwrite.sh`, which
+  declares a dependency-free build script on purpose.
+
+- **The preflight stopped crying wolf.** It asked permission to break a
+  running session on every run. Now it says so only when the dependencies
+  actually changed, which is the one case that cannot be made safe, and
+  otherwise says the session can keep running. A warning that fires every time
+  is a warning people learn to skip — the same failure as `doctor` passing
+  green on hooks that never ran.
+
+  One honest consequence, and there is no way around it: `myjarbis update`
+  execs the **installed** `bin/myjarbis-update`, so this fix cannot take
+  effect until it is installed, and installing it means running the old script
+  once. Run the checkout's copy directly for that one hop:
+  `bash bin/myjarbis-update`.
+
+- **A propagation step that fails is no longer reported as success.** Found by
+  running the real thing on the real fleet: `update --dry-run` promised
+  "4 created" for every project, `update --projects-only` then printed
+  "nothing to change", and `SELECT COUNT(*) FROM workflows` returned **0**.
+
+  Three independent faults lined up, and any one of them is enough to hide a
+  total failure:
+
+  1. The brain was on v4, where `workflows.standalone` and
+     `workflow_steps.uses` do not exist, so every INSERT failed with
+     `table workflows has no column named standalone` — true, and useless to
+     the person reading it.
+  2. `workflow reseed` exited **0** anyway, so no caller could detect it.
+  3. `bin/myjarbis-update` discarded the status with `|| true` AND filtered
+     the output through a vocabulary of SUCCESS words
+     (`created|extended|left alone|unchanged`), so every error line was
+     dropped and the fallback message was printed.
+
+  A dry run cannot catch this by construction: comparing needs no INSERT, so
+  the dry run was honest and the real run was not.
+
+  Now: the reseed refuses before writing and names the remedy, both reseeds
+  exit 4 when any project failed, `report_lines` prints the command's real
+  output unfiltered when the status is non-zero, and the run ends with
+  `Done, with N failed propagation step(s)` and exit 5 instead of `Done`.
+
+- **No v5 feature had a schema check — the audit found them before users
+  did.** `org/sync.ts` guards on v4, which is right for the `orgs` table and
+  wrong for `org_notes`; the org memory and workflow runs had no guard at all.
+  So anybody who installed 0.5.0 and did not migrate got a raw SQLite column
+  error from whichever feature they touched first.
+
+  The guard went on the ACCESSOR rather than on each method —
+  `db.orgNotes` and `db.workflowRuns` now refuse with `SCHEMA_TOO_OLD` and
+  name `myjarbis migrate` — so a method added to either tomorrow is covered
+  without its author knowing any of this. Same reasoning as `sync_executables`
+  owning the rename.
+
+### Tested
+
+- `tests/v051-update-live-session.sh`, 22 assertions, with a real process
+  named `claude` so the `pgrep -x claude` branch is the one under test rather
+  than a mock of it.
+
+- `tests/v051-propagation-failures.sh`, 28 assertions, on a fixture that is a
+  genuine v4 brain in BOTH senses — the meta row says 4 and the v5 columns are
+  actually dropped. That matters: if the schema guard is removed the INSERT
+  still fails, so the assertions hold for the right reason instead of passing
+  because the guard was the only thing being tested. Verified by reverting
+  each of the three fixes separately and watching a different group go red.
+
+  It also caught an error in its own assertions, which is the argument for
+  reverting: a check for `no such column` could never have fired, because that
+  is SQLite's phrasing on the SELECT side. A failing INSERT says
+  `table workflows has no column named standalone`.
+
+  Two of its assertions were worthless until a revert proved otherwise, which
+  is the only way that gets found. Checking `node_modules` by **inode** passes
+  on the bug: `cp` overwrites in place, so the inode survives and the content
+  can be byte-identical — and that is exactly the dangerous case. The
+  **mtime** is what catches it. And the first version of the failed-build
+  section passed with the fix reverted, because `tsc` emits output for the
+  files it can compile even when the build fails overall, and `index.js` came
+  out identical since `index.ts` had not changed; it now fingerprints every
+  file's mtime under `build/`.
+
 ## v0.5.0 — org memory and workflow-driven development (schema v5)
 
 Two features, and both of them are about the same thing: knowledge that
