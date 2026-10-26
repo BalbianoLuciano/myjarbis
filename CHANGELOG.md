@@ -52,11 +52,61 @@
   once. Run the checkout's copy directly for that one hop:
   `bash bin/myjarbis-update`.
 
+- **A propagation step that fails is no longer reported as success.** Found by
+  running the real thing on the real fleet: `update --dry-run` promised
+  "4 created" for every project, `update --projects-only` then printed
+  "nothing to change", and `SELECT COUNT(*) FROM workflows` returned **0**.
+
+  Three independent faults lined up, and any one of them is enough to hide a
+  total failure:
+
+  1. The brain was on v4, where `workflows.standalone` and
+     `workflow_steps.uses` do not exist, so every INSERT failed with
+     `table workflows has no column named standalone` — true, and useless to
+     the person reading it.
+  2. `workflow reseed` exited **0** anyway, so no caller could detect it.
+  3. `bin/myjarbis-update` discarded the status with `|| true` AND filtered
+     the output through a vocabulary of SUCCESS words
+     (`created|extended|left alone|unchanged`), so every error line was
+     dropped and the fallback message was printed.
+
+  A dry run cannot catch this by construction: comparing needs no INSERT, so
+  the dry run was honest and the real run was not.
+
+  Now: the reseed refuses before writing and names the remedy, both reseeds
+  exit 4 when any project failed, `report_lines` prints the command's real
+  output unfiltered when the status is non-zero, and the run ends with
+  `Done, with N failed propagation step(s)` and exit 5 instead of `Done`.
+
+- **No v5 feature had a schema check — the audit found them before users
+  did.** `org/sync.ts` guards on v4, which is right for the `orgs` table and
+  wrong for `org_notes`; the org memory and workflow runs had no guard at all.
+  So anybody who installed 0.5.0 and did not migrate got a raw SQLite column
+  error from whichever feature they touched first.
+
+  The guard went on the ACCESSOR rather than on each method —
+  `db.orgNotes` and `db.workflowRuns` now refuse with `SCHEMA_TOO_OLD` and
+  name `myjarbis migrate` — so a method added to either tomorrow is covered
+  without its author knowing any of this. Same reasoning as `sync_executables`
+  owning the rename.
+
 ### Tested
 
 - `tests/v051-update-live-session.sh`, 22 assertions, with a real process
   named `claude` so the `pgrep -x claude` branch is the one under test rather
   than a mock of it.
+
+- `tests/v051-propagation-failures.sh`, 28 assertions, on a fixture that is a
+  genuine v4 brain in BOTH senses — the meta row says 4 and the v5 columns are
+  actually dropped. That matters: if the schema guard is removed the INSERT
+  still fails, so the assertions hold for the right reason instead of passing
+  because the guard was the only thing being tested. Verified by reverting
+  each of the three fixes separately and watching a different group go red.
+
+  It also caught an error in its own assertions, which is the argument for
+  reverting: a check for `no such column` could never have fired, because that
+  is SQLite's phrasing on the SELECT side. A failing INSERT says
+  `table workflows has no column named standalone`.
 
   Two of its assertions were worthless until a revert proved otherwise, which
   is the only way that gets found. Checking `node_modules` by **inode** passes

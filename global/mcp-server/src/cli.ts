@@ -3100,6 +3100,29 @@ function runWorkflowReseed(argv: string[]): void {
     const preserved: string[] = [];
     let unchanged = 0;
 
+    // Refused BEFORE writing, with the remedy named. The baseline steps carry
+    // `uses`, and the workflow rows carry `standalone`, and both columns
+    // arrived in v5 — so on a v4 brain every INSERT here fails. It used to
+    // fail as a caught `no such column: standalone`, which the propagation
+    // step then reported as "nothing to change": a write that could not
+    // succeed, reported as success, which is the shape this repo has paid for
+    // before. A dry run compares without inserting, so it cheerfully promised
+    // four workflows the real run could never create.
+    if (db.schemaVersion < 5) {
+      results.push({
+        project: project.name,
+        created: [],
+        updated: [],
+        preserved: [],
+        unchanged: 0,
+        error:
+          `brain is on schema v${db.schemaVersion}; workflows need v5. ` +
+          'Run `myjarbis migrate` first (it backs up, and --dry-run upgrades a copy).',
+      });
+      db.close();
+      continue;
+    }
+
     try {
       for (const wf of BASELINE_WORKFLOWS) {
         const existing = db.workflows.find(wf.slug, 'project', project.id);
@@ -3185,14 +3208,21 @@ function runWorkflowReseed(argv: string[]): void {
     db.close();
   }
 
+  // A reseed where every project failed used to exit 0, so no caller could
+  // tell. `bin/myjarbis-update` discarded the status with `|| true` AND
+  // filtered the output through a success vocabulary, so the one run that
+  // mattered printed "nothing to change". The exit code is the contract now.
+  const failed = results.filter((r) => r.error);
+
   if (wantsJson(flags)) {
-    printJson({ applied: apply, projects: results });
+    printJson({ applied: apply, projects: results, failed: failed.length });
+    if (failed.length) process.exitCode = 4;
     return;
   }
   ptySection(`MyJarbis · workflow reseed${apply ? '' : ' ' + dim('(dry run)')}`);
   for (const r of results) {
     const summary = r.error
-      ? red(r.error)
+      ? red(`FAILED: ${r.error}`)
       : [
           r.created.length ? `${r.created.length} created` : null,
           r.updated.length ? `${r.updated.length} extended` : null,
@@ -3204,7 +3234,10 @@ function runWorkflowReseed(argv: string[]): void {
     ptyKV(r.project, summary);
   }
   console.log('');
-  if (!apply) ptyDim('  Nothing was written. Re-run with --apply.');
+  if (failed.length) {
+    ptyDim(`  ${failed.length} of ${results.length} project(s) FAILED — nothing was written for those.`);
+    process.exitCode = 4;
+  } else if (!apply) ptyDim('  Nothing was written. Re-run with --apply.');
   else ptyDim('  Steps you had overridden were left exactly as they were.');
   console.log('');
 }
@@ -3753,8 +3786,13 @@ function runSkillReseed(argv: string[]): void {
     }
   }
 
+  // Same contract as the workflow reseed: a failure a caller cannot detect is
+  // a failure that gets reported as success one layer up.
+  const failedSkills = results.filter((r) => r.error);
+
   if (wantsJson(flags)) {
-    printJson({ applied: apply, results });
+    printJson({ applied: apply, results, failed: failedSkills.length });
+    if (failedSkills.length) process.exitCode = 4;
     return;
   }
 
@@ -3763,7 +3801,7 @@ function runSkillReseed(argv: string[]): void {
   for (const r of results) {
     const n = r.updated.length + r.inserted.length;
     if (r.error) {
-      console.log('  ' + bold(clip(r.project, 26)) + red(r.error));
+      console.log('  ' + bold(clip(r.project, 26)) + red(`FAILED: ${r.error}`));
       continue;
     }
     if (n === 0) continue;
@@ -3779,9 +3817,13 @@ function runSkillReseed(argv: string[]): void {
     for (const s of [...r.updated, ...r.inserted].slice(0, 6)) ptyDim(`  ${s}`);
   }
   console.log('');
-  if (touched === 0) {
+  if (failedSkills.length) {
+    ptyDim(`${failedSkills.length} of ${results.length} project(s) FAILED — nothing was written for those.`);
+    process.exitCode = 4;
+  }
+  if (touched === 0 && !failedSkills.length) {
     ptyDim('Every baseline is already current.');
-  } else {
+  } else if (touched > 0) {
     ptyKV('Projects', `${touched} of ${results.length} out of date`);
     if (!force) {
       ptyDim(`Skipped (the project owns these): ${[...RESEED_EXCLUDED].join(', ')}`);

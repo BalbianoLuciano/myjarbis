@@ -112,7 +112,30 @@ sync_executables() {
 # A bare header with nothing under it reads as a bug in the reporter rather
 # than as "there is nothing to do", which is the usual answer.
 report_lines() {
-    local out="$1" pattern="$2" empty="$3" n=0
+    local out="$1" pattern="$2" empty="$3" rc="${4:-0}" n=0
+
+    # A non-zero status means the step failed, and then the success vocabulary
+    # below is the wrong filter entirely: it can only ever pass good news.
+    # That is not hypothetical. `workflow reseed --all --apply` on a v4 brain
+    # failed for all 23 projects with `table workflows has no column named
+    # standalone`, the status
+    # was discarded by `|| true`, every error line was dropped because it
+    # matched none of "created|extended|left alone|unchanged", and the step
+    # printed "nothing to change". Zero rows were written and the update said
+    # it was done.
+    #
+    # So: on failure, print what the command actually said, unfiltered, and
+    # say plainly that this part did not happen.
+    if [ "$rc" != "0" ]; then
+        fail "this step FAILED (exit $rc) — nothing was propagated for it"
+        while read -r l; do
+            [ -z "$l" ] && continue
+            note "  $l"
+        done < <(printf '%s\n' "$out" | sed 's/\x1b\[[0-9;]*m//g' | grep -vE '^\s*$' | head -12)
+        STEP5_FAILURES=$((STEP5_FAILURES + 1))
+        return 0
+    fi
+
     while read -r l; do
         [ -z "$l" ] && continue
         note "  $l"
@@ -121,6 +144,10 @@ report_lines() {
     [ "$n" = "0" ] && note "  $empty"
     return 0
 }
+
+# Counted rather than fatal: one sub-step failing should not abandon the
+# others, but the run must not end with "Done" as though it all worked.
+STEP5_FAILURES=0
 
 # Propagation is ON by default.
 #
@@ -791,8 +818,8 @@ process.stdin.on('end', () => {
         else
             note "syncing slash commands..."
         fi
-        CMD_OUT=$("${MJ_CLI[@]}" commands sync --all $APPLY_FLAG 2>&1 || true)
-        report_lines "$CMD_OUT" "updated|wrote|current|diverged|Nothing|Every project" "nothing to change"
+        CMD_OUT=$("${MJ_CLI[@]}" commands sync --all $APPLY_FLAG 2>&1) && CMD_RC=0 || CMD_RC=$?
+        report_lines "$CMD_OUT" "updated|wrote|current|diverged|Nothing|Every project" "nothing to change" "$CMD_RC"
 
         # ── Baseline skills ─────────────────────────────────────────
         #
@@ -831,8 +858,8 @@ process.stdin.on('end', () => {
         else
             note "reseeding baseline skills..."
         fi
-        SKILL_OUT=$("${MJ_CLI[@]}" skill reseed --all $APPLY_FLAG 2>&1 || true)
-        report_lines "$SKILL_OUT" "updated|inserted|unchanged|project" "nothing to change"
+        SKILL_OUT=$("${MJ_CLI[@]}" skill reseed --all $APPLY_FLAG 2>&1) && SKILL_RC=0 || SKILL_RC=$?
+        report_lines "$SKILL_OUT" "updated|inserted|unchanged|project" "nothing to change" "$SKILL_RC"
 
         # ── Baseline workflows ──────────────────────────────────────
         #
@@ -851,8 +878,8 @@ process.stdin.on('end', () => {
         else
             note "reseeding baseline workflows..."
         fi
-        WF_OUT=$("${MJ_CLI[@]}" workflow reseed --all $APPLY_FLAG 2>&1 || true)
-        report_lines "$WF_OUT" "created|extended|left alone|unchanged|nothing to do" "nothing to change"
+        WF_OUT=$("${MJ_CLI[@]}" workflow reseed --all $APPLY_FLAG 2>&1) && WF_RC=0 || WF_RC=$?
+        report_lines "$WF_OUT" "created|extended|left alone|unchanged|nothing to do" "nothing to change" "$WF_RC"
 
         # ── And onto disk ───────────────────────────────────────────
         #
@@ -957,6 +984,16 @@ if [ -n "$DRY_RUN" ]; then
     echo -e "${RED}${BOLD}Dry run${NC}"
     echo
     echo -e "  Nothing was written. To apply: ${BOLD}myjarbis update${NC}"
+elif [ "$STEP5_FAILURES" -gt 0 ]; then
+    # Not "Done". The installation was updated, but something it was asked to
+    # propagate did not happen, and the exit code says so — a wrapper or a CI
+    # step that trusted exit 0 is exactly how this went unnoticed the first time.
+    echo -e "${RED}${BOLD}Done, with ${STEP5_FAILURES} failed propagation step(s)${NC}"
+    echo
+    echo -e "  The installation is updated. Read the FAIL lines above: those"
+    echo -e "  projects were NOT propagated to, and re-running is safe."
+    echo
+    exit 5
 else
     echo -e "${RED}${BOLD}Done${NC}"
     echo
