@@ -990,7 +990,7 @@ myjarbis import <file.json> --target=... --kind=<kind> --mapping='items[]'
 <summary><b>Tests</b></summary>
 
 ```bash
-bash tests/run-all.sh          # 31 suites, 711 assertions, each builds its own fixture
+bash tests/run-all.sh          # 35 suites, 849 assertions, each builds its own fixture
 ```
 
 ```bash

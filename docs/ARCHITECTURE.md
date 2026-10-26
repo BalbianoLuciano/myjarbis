@@ -1,6 +1,6 @@
 # MyJarbis Architecture
 
-What MyJarbis is and what it is built with, as of **v0.4.6 + the v0.5 work (schema v5)**.
+What MyJarbis is and what it is built with, as of **v0.5.0 (schema v5)**.
 
 This file replaces a version that described v0.1 — MCP *resources* under
 `myjarbis://{project}/memory/...` and three tools — an API removed in v0.2.
@@ -325,7 +325,7 @@ global/mcp-server/src/    the server
   workflows/              resolve.ts, condition.ts, baseline.ts
   health.ts gc.ts review.ts commands.ts
 global/templates/         .claude-plugin (hooks) + .claude/commands (es/en/pt)
-tests/                    31 E2E suites, 711 assertions — bash, own fixtures
+tests/                    35 E2E suites, 849 assertions — bash, own fixtures
 ```
 
 Tests build their own fixtures and run on any checkout: `bash
