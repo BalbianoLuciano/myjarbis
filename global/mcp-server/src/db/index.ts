@@ -42,9 +42,44 @@ import {
   StepGate,
   ProviderRow,
   ProviderRole,
+  FTS_TABLES,
+  OrgNoteRow,
+  OrgNoteContentRow,
+  OrgNoteStatus,
+  OrgNoteConfidence,
+  AuthorSource,
+  WorkflowRunRow,
+  WorkflowRunStatus,
+  WorkflowRunStepRow,
+  RunStepStatus,
   AUTO_MARKER,
 } from './schema.js';
 import { MyJarbisError, ErrorType } from '../types.js';
+
+/**
+ * How long an org note is assumed good for.
+ *
+ * 180 days, borrowed from the one shipped prior art that bothers to pick a
+ * number and say why: knowledge about infrastructure rots, and a store with no
+ * expiry serves a confidently wrong answer forever. Expiry is a WARNING and
+ * not a removal — an expired note still answers, it just says it is old.
+ */
+const DEFAULT_ORG_NOTE_TTL_DAYS = 180;
+
+/**
+ * How much an org note is pushed down relative to local knowledge.
+ *
+ * bm25 `rank` is negative and more negative is better, so a penalty is a
+ * multiplier TOWARD zero. An org note is general advice that happens to match;
+ * a project_context row or an observation is about THIS project. When both
+ * answer, the specific one should be read first.
+ */
+const ORG_RANK_PENALTY = 0.7;
+
+/** A second penalty for a note that is stale, expired, or sitting on files
+ *  that have changed since it was written. Downranked, never hidden: the
+ *  reader decides, with the reason attached to the hit. */
+const ORG_DEGRADED_PENALTY = 0.5;
 
 // ───────────────────────────────────────────────────────────────────
 // Helpers
@@ -143,7 +178,28 @@ export type SearchScope =
   | 'project'       // all module contexts of project + project core
   | 'module_only'   // only the given module context
   | 'observations'  // observations in module sessions
-  | 'skills';       // skills (project + module-level)
+  | 'skills'        // skills (project + module-level)
+  | 'org';          // only the org memory, when this project belongs to one
+
+/**
+ * Scopes that ALSO return org notes alongside their own corpus.
+ *
+ * Org notes ride the default search rather than hiding behind their own
+ * scope value, and that is the whole adoption argument: a scope the caller
+ * has to opt into is a corpus the caller keeps forgetting, which is the
+ * failure mode of every "lessons learned" store anybody has written about.
+ *
+ * `module_only` is excluded on purpose — its documented contract is "one
+ * module, excluding the project core", and an org note is wider than the
+ * project, so including it would contradict the one scope whose point is
+ * narrowness. `skills` is excluded because it is a different corpus.
+ */
+const ORG_AWARE_SCOPES: ReadonlySet<SearchScope> = new Set<SearchScope>([
+  'module',
+  'project',
+  'observations',
+  'org',
+]);
 
 /** Chronological event in a module's timeline (sessions + observations).
  *  Ordered newest first by `at` when returned from `MyJarbisDB.timeline`. */
@@ -168,7 +224,7 @@ export type TimelineEvent =
     };
 
 export interface SearchHit {
-  source: 'project_context' | 'module_context' | 'observation' | 'skill';
+  source: 'project_context' | 'module_context' | 'observation' | 'skill' | 'org_note';
   rowid: number;
   title: string;
   snippet: string;
@@ -308,6 +364,44 @@ export class MyJarbisDB {
     return this._scope;
   }
 
+  /**
+   * Every project name in this brain with its module count, crossing the
+   * tenant boundary on purpose.
+   *
+   * This is the ONLY read in the codebase that deliberately leaves the bound
+   * scope without rebinding, and it exists for one caller: the scrub that
+   * refuses to let those names travel into a shared repository. Knowing all of
+   * them is the whole job — a scrub that only knew the current project's name
+   * would let every other client's name through.
+   *
+   * So the exemption is not hidden. It takes a `reason`, the way
+   * `bindScope({ kind: 'all', reason })` does, and `grep -rn
+   * 'namesAcrossProjects'` finds every place the boundary is crossed. A
+   * cross-project read that looks like an ordinary one is how the boundary
+   * stops meaning anything.
+   *
+   * ONE query, not one per project. The previous version looped the registry
+   * and issued a `SELECT COUNT(*)` per entry — 23 statements on every session
+   * close of an org project, through the raw handle.
+   */
+  namesAcrossProjects(reason: string): Array<{ name: string; modules: number }> {
+    if (!reason.trim()) {
+      throw new MyJarbisError(
+        ErrorType.INVALID_INPUT,
+        'namesAcrossProjects requires a reason: it crosses the tenant boundary, ' +
+          'and an unexplained crossing is the thing the scope mechanism exists ' +
+          'to make impossible.',
+      );
+    }
+    return this.prep(
+      `SELECT p.name AS name, COUNT(m.id) AS modules
+         FROM projects p
+         LEFT JOIN modules m ON m.project_id = p.id
+        GROUP BY p.id, p.name
+        ORDER BY p.name`,
+    ).all() as Array<{ name: string; modules: number }>;
+  }
+
   /** The bound scope, or a hard failure. Every scoped read goes through here. */
   private get scope(): Scope {
     if (!this._scope) {
@@ -369,9 +463,37 @@ export class MyJarbisDB {
     return s;
   }
 
-  /** Run inside an immediate transaction. */
+  /**
+   * Run inside a DEFERRED transaction.
+   *
+   * The docstring here used to say "immediate" and it was wrong, which matters
+   * more than a wording slip: `db.transaction(fn)()` issues a bare `BEGIN`,
+   * and a bare `BEGIN` in SQLite is `BEGIN DEFERRED`. Under WAL a deferred
+   * transaction that reads and THEN writes can fail its write with
+   * `SQLITE_BUSY_SNAPSHOT` — and SQLite does not run the busy handler for that
+   * code, so the driver's 5 s `busy_timeout` does not help. The whole
+   * transaction has to be retried from the start.
+   *
+   * Fine for the existing callers, which are bulk imports and merges that run
+   * alone. Use `txImmediate` for anything that reads a value and then writes a
+   * row derived from it.
+   */
   tx<T>(fn: () => T): T {
     const wrapped = this.db.transaction(fn);
+    return wrapped();
+  }
+
+  /**
+   * Run inside an IMMEDIATE transaction: the write lock is taken up front.
+   *
+   * For the read-then-write sequences where a deferred transaction is a race:
+   * "the highest seq in this org, plus one", "no open run for this slug, so
+   * open one". Those read a value and write a row that is only correct if the
+   * value has not moved, and under WAL the deferred version fails late with a
+   * code the busy handler ignores rather than waiting at the start.
+   */
+  txImmediate<T>(fn: () => T): T {
+    const wrapped = this.db.transaction(fn).immediate;
     return wrapped();
   }
 
@@ -1590,16 +1712,30 @@ export class MyJarbisDB {
       scope: WorkflowScope;
       scopeId: number;
       extends?: number | null;
+      standalone?: boolean;
     }): WorkflowRow => {
       if (params.scope === 'project') {
         this.assertInScope(params.scopeId, 'workflow');
       }
+      // `standalone` is only written when the caller said something. Omitting
+      // it on an update must not flip a child back into a top-level ritual
+      // just because somebody edited one of its steps.
       this.prep(
-        `INSERT INTO workflows(slug, name, scope, scope_id, extends)
-         VALUES (?, ?, ?, ?, ?)
+        `INSERT INTO workflows(slug, name, scope, scope_id, extends, standalone)
+         VALUES (?, ?, ?, ?, ?, COALESCE(?, 1))
          ON CONFLICT(slug, scope, scope_id) DO UPDATE SET
-           name = excluded.name, extends = excluded.extends`,
-      ).run(params.slug, params.name, params.scope, params.scopeId, params.extends ?? null);
+           name       = excluded.name,
+           extends    = excluded.extends,
+           standalone = COALESCE(?, workflows.standalone)`,
+      ).run(
+        params.slug,
+        params.name,
+        params.scope,
+        params.scopeId,
+        params.extends ?? null,
+        params.standalone === undefined ? null : params.standalone ? 1 : 0,
+        params.standalone === undefined ? null : params.standalone ? 1 : 0,
+      );
       return this.workflows.find(params.slug, params.scope, params.scopeId)!;
     },
 
@@ -1612,16 +1748,38 @@ export class MyJarbisDB {
       (this.prep('SELECT * FROM workflows WHERE id = ?').get(id) as WorkflowRow | undefined) ??
       null,
 
-    /** Every slug reachable from a project: its own, its org's, the user's. */
-    listSlugs: (projectId: number, orgId: number | null): string[] => {
+    /**
+     * Every slug reachable from a project: its own, its org's, the user's.
+     *
+     * `scope = 'user'` is filtered by scope_id like the other two, and that
+     * is a FIX rather than a detail. `set_workflow_step` has always written
+     * user-scope rows with `scope_id = project.id` — there is no user table,
+     * and the comment at its write site says a per-user layer leaking across
+     * projects would be worse than none — but both reads here carried a bare
+     * `OR scope = 'user'`. In a shared brain that made a user-scope workflow
+     * written in one project resolvable from every other project in the file.
+     * Latent only because the table has never held a row.
+     *
+     * `standalone = 0` rows are hidden unless asked for: a workflow that only
+     * ever runs as a fragment of another should not be offered as a ritual of
+     * its own. It stays fully resolvable by slug, which is how a parent's
+     * `uses` step reaches it.
+     */
+    listSlugs: (
+      projectId: number,
+      orgId: number | null,
+      opts: { includeNonStandalone?: boolean } = {},
+    ): string[] => {
       this.assertInScope(projectId, 'workflow listing');
+      const standaloneFilter = opts.includeNonStandalone ? '' : ' AND standalone = 1';
       const rows = this.prep(
         `SELECT DISTINCT slug FROM workflows
-          WHERE (scope = 'project' AND scope_id = ?)
-             OR (scope = 'org'     AND scope_id = ?)
-             OR  scope = 'user'
+          WHERE ( (scope = 'project' AND scope_id = ?)
+               OR (scope = 'org'     AND scope_id = ?)
+               OR (scope = 'user'    AND scope_id = ?) )
+            ${standaloneFilter}
           ORDER BY slug`,
-      ).all(projectId, orgId ?? -1) as Array<{ slug: string }>;
+      ).all(projectId, orgId ?? -1, projectId) as Array<{ slug: string }>;
       return rows.map((r) => r.slug);
     },
 
@@ -1633,12 +1791,53 @@ export class MyJarbisDB {
           WHERE slug = ?
             AND ( (scope = 'org'     AND scope_id = ?)
                OR (scope = 'project' AND scope_id = ?)
-               OR  scope = 'user' )
+               OR (scope = 'user'    AND scope_id = ?) )
           ORDER BY CASE scope WHEN 'org' THEN 1 WHEN 'project' THEN 2 ELSE 3 END`,
-      ).all(slug, orgId ?? -1, projectId) as WorkflowRow[];
+      ).all(slug, orgId ?? -1, projectId, projectId) as WorkflowRow[];
     },
 
-    delete: (id: number): void => {
+    /**
+     * Remove a workflow row and, by cascade, its steps.
+     *
+     * Refuses an org-scope row: those come from a pack, `applyPack` is their
+     * only writer, and deleting one here would be undone by the next sync
+     * while looking like it worked.
+     *
+     * Refuses a workflow some other workflow invokes, naming the parent. A
+     * parent whose child is gone resolves to WORKFLOW_NOT_FOUND at the worst
+     * possible moment — mid-ritual, with the first steps already done.
+     */
+    delete: (id: number, opts: { force?: boolean } = {}): void => {
+      const row = this.workflows.findById(id);
+      if (!row) return;
+      if (row.scope === 'project') this.assertInScope(row.scope_id, 'workflow');
+      if (row.scope === 'org' && !opts.force) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `"${row.slug}" is an org-scope workflow: it comes from the org pack, and ` +
+            'removing it here would be restored by the next `org sync`. Remove it ' +
+            'from the pack instead.',
+          { slug: row.slug, scope: row.scope },
+        );
+      }
+      if (!opts.force) {
+        const parents = this.prep(
+          `SELECT DISTINCT w.slug AS parent, s.name AS step
+             FROM workflow_steps s
+             JOIN workflows w ON w.id = s.workflow_id
+            WHERE s.uses = ? AND s.disabled = 0`,
+        ).all(row.slug) as Array<{ parent: string; step: string }>;
+        if (parents.length > 0) {
+          throw new MyJarbisError(
+            ErrorType.INVALID_INPUT,
+            `"${row.slug}" is invoked by ${parents
+              .map((p) => `${p.parent} (step "${p.step}")`)
+              .join(', ')}. Removing it would break those mid-ritual. Remove the ` +
+              'invoking step first, or pass force.',
+            { slug: row.slug, parents },
+          );
+        }
+      }
       this.prep('DELETE FROM workflows WHERE id = ?').run(id);
     },
   };
@@ -1651,21 +1850,29 @@ export class MyJarbisDB {
       actor: string;
       gate?: StepGate;
       capability?: string | null;
+      uses?: string | null;
       condition?: string | null;
       notes?: string | null;
       overrides?: number | null;
       disabled?: boolean;
     }): WorkflowStepRow => {
+      if (params.uses && params.capability) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `step "${params.name}" cannot both delegate (uses) and act (capability).`,
+        );
+      }
       this.prep(
         `INSERT INTO workflow_steps(
-           workflow_id, position, name, actor, gate, capability,
+           workflow_id, position, name, actor, gate, capability, uses,
            condition, notes, overrides, disabled)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(workflow_id, name) DO UPDATE SET
            position   = excluded.position,
            actor      = excluded.actor,
            gate       = excluded.gate,
            capability = excluded.capability,
+           uses       = excluded.uses,
            condition  = excluded.condition,
            notes      = excluded.notes,
            overrides  = excluded.overrides,
@@ -1677,6 +1884,7 @@ export class MyJarbisDB {
         params.actor,
         params.gate ?? 'none',
         params.capability ?? null,
+        params.uses ?? null,
         params.condition ?? null,
         params.notes ?? null,
         params.overrides ?? null,
@@ -1694,6 +1902,643 @@ export class MyJarbisDB {
 
     delete: (id: number): void => {
       this.prep('DELETE FROM workflow_steps WHERE id = ?').run(id);
+    },
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // Workflow runs — where a ritual got to, and how long each step took.
+  //
+  // A run is a SNAPSHOT of a resolution, not a pointer into it. Steps are
+  // stored by name, with the workflow that owned them, because the resolution
+  // has no row: it is computed from three layers plus any expansion, and it
+  // can legitimately change mid-ritual when somebody edits a step. A run that
+  // referenced step ids would silently re-point at a different process.
+  // ─────────────────────────────────────────────────────────────────
+  workflowRuns = {
+    open: (params: {
+      projectId: number;
+      slug: string;
+      sessionId: number | null;
+      steps: Array<{ position: number; name: string; fromWorkflow: string; actor: string }>;
+    }): { run: WorkflowRunRow; steps: WorkflowRunStepRow[] } => {
+      this.assertInScope(params.projectId, 'workflow run');
+      // One transaction, because a half-opened run is worse than none.
+      //
+      // The run row and its steps were separate commits, so any failure in the
+      // step loop left a `status='open'` run holding a PREFIX of its steps —
+      // and `findOpen` then returns it forever, so every later
+      // `start_workflow_run` answers "already in progress" about a ritual that
+      // can never be advanced or closed. `reconcileOrphanedRuns` does not help:
+      // it only touches runs whose session is gone.
+      //
+      // Immediate for the same reason as `orgNotes.add`: the caller has just
+      // read "no open run for this slug" and is writing a row that is only
+      // correct if that is still true.
+      return this.txImmediate(() => {
+      const info = this.prep(
+        `INSERT INTO workflow_runs(project_id, slug, session_id) VALUES (?, ?, ?)`,
+      ).run(params.projectId, params.slug, params.sessionId);
+      const runId = Number(info.lastInsertRowid);
+
+      // The first step is 'active' from the start: a run whose every step is
+      // 'pending' cannot answer "where was I", which is the only question it
+      // exists to answer.
+      params.steps.forEach((s, i) => {
+        this.prep(
+          `INSERT INTO workflow_run_steps(
+             run_id, position, step_name, from_workflow, status, started_at, actor)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          runId,
+          s.position,
+          s.name,
+          s.fromWorkflow,
+          i === 0 ? 'active' : 'pending',
+          i === 0 ? new Date().toISOString().replace('T', ' ').slice(0, 19) : null,
+          s.actor,
+        );
+      });
+
+      return {
+        run: this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(runId) as WorkflowRunRow,
+        steps: this.workflowRunSteps.listByRun(runId),
+      };
+      });
+    },
+
+    findOpen: (projectId: number, slug?: string): WorkflowRunRow | null => {
+      this.assertInScope(projectId, 'workflow run');
+      const sql = slug
+        ? `SELECT * FROM workflow_runs WHERE project_id = ? AND slug = ? AND status = 'open'
+             ORDER BY id DESC LIMIT 1`
+        : `SELECT * FROM workflow_runs WHERE project_id = ? AND status = 'open'
+             ORDER BY id DESC LIMIT 1`;
+      const row = slug
+        ? this.prep(sql).get(projectId, slug)
+        : this.prep(sql).get(projectId);
+      return (row as WorkflowRunRow | undefined) ?? null;
+    },
+
+    findById: (id: number): WorkflowRunRow | null => {
+      const row = this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(id) as
+        | WorkflowRunRow
+        | undefined;
+      if (!row) return null;
+      this.assertInScope(row.project_id, 'workflow run');
+      return row;
+    },
+
+    listByProject: (
+      projectId: number,
+      opts: { status?: WorkflowRunStatus[]; limit?: number } = {},
+    ): WorkflowRunRow[] => {
+      this.assertInScope(projectId, 'workflow run');
+      const where = ['project_id = ?'];
+      const params: unknown[] = [projectId];
+      if (opts.status && opts.status.length > 0) {
+        where.push(`status IN (${opts.status.map(() => '?').join(',')})`);
+        params.push(...opts.status);
+      }
+      params.push(opts.limit ?? 50);
+      return this.prep(
+        `SELECT * FROM workflow_runs WHERE ${where.join(' AND ')} ORDER BY id DESC LIMIT ?`,
+      ).all(...params) as WorkflowRunRow[];
+    },
+
+    close: (id: number, status: 'done' | 'abandoned'): WorkflowRunRow => {
+      const run = this.workflowRuns.findById(id);
+      if (!run) {
+        throw new MyJarbisError(ErrorType.RESOURCE_NOT_FOUND, `No workflow run with id ${id}.`);
+      }
+      this.prep(`UPDATE workflow_runs SET status = ?, ended_at = datetime('now') WHERE id = ?`).run(
+        status,
+        id,
+      );
+      return this.prep('SELECT * FROM workflow_runs WHERE id = ?').get(id) as WorkflowRunRow;
+    },
+
+    /**
+     * Open runs whose session is closed or gone.
+     *
+     * The session dying is the normal way a ritual ends unfinished — the editor
+     * was closed, the machine slept — and a run left 'open' forever would make
+     * the next `start_workflow_run` refuse to start anything, which is a wedged
+     * ritual rather than a recorded one.
+     */
+    listOrphaned: (projectId: number): WorkflowRunRow[] => {
+      this.assertInScope(projectId, 'workflow run');
+      return this.prep(
+        `SELECT r.* FROM workflow_runs r
+           LEFT JOIN sessions s ON s.id = r.session_id
+          WHERE r.project_id = ?
+            AND r.status = 'open'
+            AND (r.session_id IS NULL OR s.id IS NULL OR s.ended_at IS NOT NULL)
+          ORDER BY r.id`,
+      ).all(projectId) as WorkflowRunRow[];
+    },
+  };
+
+  workflowRunSteps = {
+    listByRun: (runId: number): WorkflowRunStepRow[] =>
+      this.prep(
+        'SELECT * FROM workflow_run_steps WHERE run_id = ? ORDER BY position, id',
+      ).all(runId) as WorkflowRunStepRow[],
+
+    current: (runId: number): WorkflowRunStepRow | null =>
+      (this.prep(
+        `SELECT * FROM workflow_run_steps WHERE run_id = ? AND status = 'active'
+           ORDER BY position, id LIMIT 1`,
+      ).get(runId) as WorkflowRunStepRow | undefined) ?? null,
+
+    advance: (params: {
+      runId: number;
+      stepName: string;
+      status: 'done' | 'skipped' | 'blocked';
+      note?: string | null;
+      actor?: string | null;
+    }): { completed: WorkflowRunStepRow; next: WorkflowRunStepRow | null } => {
+      const run = this.workflowRuns.findById(params.runId);
+      if (!run) {
+        throw new MyJarbisError(
+          ErrorType.RESOURCE_NOT_FOUND,
+          `No workflow run with id ${params.runId}.`,
+        );
+      }
+      const step = this.prep(
+        'SELECT * FROM workflow_run_steps WHERE run_id = ? AND step_name = ?',
+      ).get(params.runId, params.stepName) as WorkflowRunStepRow | undefined;
+      if (!step) {
+        const names = this.workflowRunSteps
+          .listByRun(params.runId)
+          .map((s) => s.step_name)
+          .join(', ');
+        throw new MyJarbisError(
+          ErrorType.RESOURCE_NOT_FOUND,
+          `Run ${params.runId} has no step "${params.stepName}". It has: ${names}.`,
+        );
+      }
+      // A skip with no reason is the thing that makes a run log worthless
+      // later: "step 3 skipped" answers nothing a month afterwards.
+      if (params.status === 'skipped' && !params.note) {
+        throw new MyJarbisError(
+          ErrorType.INVALID_INPUT,
+          `Skipping "${params.stepName}" needs a reason. A run log that records ` +
+            'what was skipped without why cannot be read later.',
+        );
+      }
+
+      this.prep(
+        `UPDATE workflow_run_steps
+            SET status = ?, completed_at = datetime('now'),
+                note = COALESCE(?, note), actor = COALESCE(?, actor),
+                started_at = COALESCE(started_at, datetime('now'))
+          WHERE id = ?`,
+      ).run(params.status, params.note ?? null, params.actor ?? null, step.id);
+
+      const next =
+        (this.prep(
+          `SELECT * FROM workflow_run_steps
+            WHERE run_id = ? AND status = 'pending'
+            ORDER BY position, id LIMIT 1`,
+        ).get(params.runId) as WorkflowRunStepRow | undefined) ?? null;
+      if (next) {
+        this.prep(
+          `UPDATE workflow_run_steps SET status = 'active', started_at = datetime('now')
+            WHERE id = ?`,
+        ).run(next.id);
+      }
+
+      return {
+        completed: this.prep('SELECT * FROM workflow_run_steps WHERE id = ?').get(
+          step.id,
+        ) as WorkflowRunStepRow,
+        next: next
+          ? (this.prep('SELECT * FROM workflow_run_steps WHERE id = ?').get(
+              next.id,
+            ) as WorkflowRunStepRow)
+          : null,
+      };
+    },
+
+    /**
+     * Seconds per step. The "split the hours" query.
+     *
+     * Measured, not estimated: `completed_at - started_at` on rows a human
+     * actually walked through. `null` for a step that has not finished, which
+     * is different from zero.
+     */
+    timings: (
+      runId: number,
+    ): Array<{ stepName: string; fromWorkflow: string; status: string; seconds: number | null }> =>
+      this.prep(
+        `SELECT step_name AS stepName, from_workflow AS fromWorkflow, status,
+                CASE WHEN completed_at IS NOT NULL AND started_at IS NOT NULL
+                     THEN CAST(ROUND((julianday(completed_at) - julianday(started_at)) * 86400) AS INTEGER)
+                     ELSE NULL END AS seconds
+           FROM workflow_run_steps
+          WHERE run_id = ?
+          ORDER BY position, id`,
+      ).all(runId) as Array<{
+        stepName: string;
+        fromWorkflow: string;
+        status: string;
+        seconds: number | null;
+      }>,
+  };
+
+  // ─────────────────────────────────────────────────────────────────
+  // Org memory
+  //
+  // The tenant here is the ORG, and it is DERIVED from the bound project
+  // rather than accepted as an argument. That is not a stylistic choice:
+  // graphiti ships `group_id` as a parameter and has six open issues where
+  // it leaks — UUID-addressed reads and deletes crossing groups, an
+  // unknown group silently reading the default one, a shared driver
+  // answering from whichever group was written last. A scope the caller
+  // supplies is a scope the caller can get wrong.
+  //
+  // `project_id IS NULL` means "true across the org", so this is the one
+  // place in this file where a row is legitimately reachable with no
+  // project — `assertInScope` would reject it, and the next reader would
+  // reasonably assume that is a bug. It is not: the org filter is what
+  // bounds these reads, and the project filter only narrows them.
+  // ─────────────────────────────────────────────────────────────────
+
+  /** The org of the bound project, or null when it belongs to none. */
+  get scopedOrgId(): number | null {
+    const projectId = this.scopedProjectId;
+    if (projectId === null) return null;
+    const row = this.prep('SELECT org_id FROM projects WHERE id = ?').get(projectId) as
+      | { org_id: number | null }
+      | undefined;
+    return row?.org_id ?? null;
+  }
+
+  /** Throw unless `orgId` is the org of the bound project. */
+  private assertOrgInScope(orgId: number, what: string): void {
+    if (this.scope.kind === 'all') return;
+    const mine = this.scopedOrgId;
+    if (mine === null) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        `${what} belongs to org ${orgId}, but this project belongs to no org.`,
+        { requested: orgId, scopedTo: null },
+      );
+    }
+    if (mine !== orgId) {
+      throw new MyJarbisError(
+        ErrorType.OUT_OF_SCOPE,
+        `${what} belongs to org ${orgId}, but this project belongs to org ${mine}.`,
+        { requested: orgId, scopedTo: mine },
+      );
+    }
+  }
+
+  orgNotes = {
+    /** Days before a note is treated as possibly rotten. */
+    ttlDays: DEFAULT_ORG_NOTE_TTL_DAYS,
+
+    /**
+     * The identity of a lesson: a hash over the org, the project scope and
+     * the seven content fields.
+     *
+     * Author and dates are deliberately NOT in it. The same lesson written
+     * by two people is one lesson — which is also what makes a pull
+     * idempotent across machines, since the row either is or is not already
+     * there regardless of who promoted it first.
+     */
+    hashOf: (params: {
+      orgSlug: string;
+      projectName: string | null;
+      draft: {
+        question: string;
+        answer: string;
+        workingExample?: string | null;
+        caveats?: string | null;
+        toolTags?: string | null;
+        typeTags?: string | null;
+        linkedIds?: string | null;
+      };
+    }): string => {
+      const d = params.draft;
+      // Joined on NUL, which cannot occur in any of these fields, so that
+      // moving text across a field boundary changes the hash: an empty
+      // separator would make {question:"ab", answer:"c"} collide with
+      // {question:"a", answer:"bc"}.
+      //
+      // Written as an escape rather than as a literal byte. A raw NUL in a
+      // source file makes it binary to grep, to diff and to every review
+      // tool, which costs more than the two characters it saves.
+      const SEP = '\u0000';
+      const parts = [
+        params.orgSlug,
+        params.projectName ?? '',
+        d.question,
+        d.answer,
+        d.workingExample ?? '',
+        d.caveats ?? '',
+        d.toolTags ?? '',
+        d.typeTags ?? '',
+        d.linkedIds ?? '',
+      ];
+      return crypto.createHash('sha256').update(parts.join(SEP)).digest('hex');
+    },
+
+    /**
+     * Insert, or hand back the row that already carries this hash.
+     *
+     * `ON CONFLICT DO NOTHING` then SELECT, and never check-then-insert:
+     * mem0 has an open bug (#6515) where exactly that pattern produces
+     * PERMANENTLY duplicated memories under concurrency, because the gap
+     * between the check and the insert is a window two writers fit through.
+     * A constraint has no window.
+     */
+    add: (params: {
+      orgId: number;
+      projectId: number | null;
+      sourceObservationId?: number | null;
+      author: { handle: string; email: string | null; source: AuthorSource };
+      draft: {
+        question: string;
+        answer: string;
+        workingExample?: string | null;
+        caveats?: string | null;
+        toolTags?: string | null;
+        typeTags?: string | null;
+        linkedIds?: string | null;
+      };
+      contentHash: string;
+      createdAt?: string;
+      promotedAt?: string;
+      status?: OrgNoteStatus;
+      expiresAt?: string | null;
+      /** Omitted = 180 days from now. Explicit null = never expires. */
+      expiresInDays?: number;
+      confidence?: OrgNoteConfidence;
+      evidence?: string | null;
+      codeRefs?: string | null;
+      seq?: number;
+    }): { row: OrgNoteRow; content: OrgNoteContentRow; status: 'inserted' | 'duplicate' } => {
+      this.assertOrgInScope(params.orgId, 'org note');
+      if (params.projectId !== null) this.assertInScope(params.projectId, 'org note');
+
+      // IMMEDIATE, and ALL of it inside one transaction.
+      //
+      // Two defects in the unwrapped version, both real. The note and its
+      // content were two separate commits, so there was a window in which
+      // `org_notes` held a row and `org_note_content` did not — and
+      // `listByOrg` INNER JOINs them, so a concurrent reader silently did not
+      // see the note, while the duplicate path below read a content row that
+      // was not there yet and returned `undefined` typed as a row. And `seq`
+      // was `MAX(seq) + 1` read outside any transaction, so two writers
+      // inserting different notes both got the same number, which makes an
+      // incremental `sinceSeq` read skip or re-deliver rows.
+      //
+      // Immediate rather than deferred because this reads a value and then
+      // writes a row derived from it: the deferred version fails that write
+      // with SQLITE_BUSY_SNAPSHOT, a code the busy handler does not retry.
+      return this.txImmediate(() => {
+      const existing = this.prep(
+        'SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?',
+      ).get(params.orgId, params.contentHash) as OrgNoteRow | undefined;
+      if (existing) {
+        return {
+          row: existing,
+          content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+            existing.id,
+          ) as OrgNoteContentRow,
+          status: 'duplicate' as const,
+        };
+      }
+
+      const expiresAt =
+        params.expiresAt !== undefined
+          ? params.expiresAt
+          : (
+              this.prep(
+                `SELECT datetime('now', '+' || ? || ' days') AS d`,
+              ).get(params.expiresInDays ?? DEFAULT_ORG_NOTE_TTL_DAYS) as { d: string }
+            ).d;
+
+      const seq = params.seq ?? this.orgNotes.maxSeq(params.orgId) + 1;
+      const d = params.draft;
+
+      const info = this.prep(
+        `INSERT INTO org_notes(
+           org_id, project_id, source_observation_id, author_handle, author_email,
+           author_source, created_at, promoted_at, status, expires_at, confidence,
+           evidence, code_refs, content_hash, seq)
+         VALUES (?, ?, ?, ?, ?, ?,
+                 COALESCE(?, datetime('now')), COALESCE(?, datetime('now')),
+                 ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(org_id, content_hash) DO NOTHING`,
+      ).run(
+        params.orgId,
+        params.projectId,
+        params.sourceObservationId ?? null,
+        params.author.handle,
+        params.author.email,
+        params.author.source,
+        params.createdAt ?? null,
+        params.promotedAt ?? null,
+        params.status ?? 'active',
+        expiresAt,
+        params.confidence ?? 'assumed',
+        params.evidence ?? null,
+        params.codeRefs ?? null,
+        params.contentHash,
+        seq,
+      );
+
+      // DO NOTHING means another writer won the race between the SELECT
+      // above and this INSERT. Their row is the row.
+      if (info.changes === 0) {
+        const won = this.prep(
+          'SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?',
+        ).get(params.orgId, params.contentHash) as OrgNoteRow;
+        return {
+          row: won,
+          content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+            won.id,
+          ) as OrgNoteContentRow,
+          status: 'duplicate' as const,
+        };
+      }
+
+      const noteId = Number(info.lastInsertRowid);
+      this.prep(
+        `INSERT INTO org_note_content(
+           note_id, question, answer, working_example, caveats,
+           tool_tags, type_tags, linked_ids)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        noteId,
+        d.question,
+        d.answer,
+        d.workingExample ?? null,
+        d.caveats ?? null,
+        d.toolTags ?? null,
+        d.typeTags ?? null,
+        d.linkedIds ?? null,
+      );
+      return {
+        row: this.prep('SELECT * FROM org_notes WHERE id = ?').get(noteId) as OrgNoteRow,
+        content: this.prep('SELECT * FROM org_note_content WHERE note_id = ?').get(
+          noteId,
+        ) as OrgNoteContentRow,
+        status: 'inserted' as const,
+      };
+      });
+    },
+
+    /**
+     * One note by id, scope-checked.
+     *
+     * Checked even though the id is unambiguous, because "it is addressed by
+     * id so it must be mine" is precisely the reasoning behind graphiti
+     * #2020, where a UUID-addressed read and delete crossed tenants.
+     */
+    findById: (id: number): (OrgNoteRow & OrgNoteContentRow) | null => {
+      const row = this.prep(
+        `SELECT n.*, c.question, c.answer, c.working_example, c.caveats,
+                c.tool_tags, c.type_tags, c.linked_ids
+           FROM org_notes n
+           JOIN org_note_content c ON c.note_id = n.id
+          WHERE n.id = ?`,
+      ).get(id) as (OrgNoteRow & OrgNoteContentRow) | undefined;
+      if (!row) return null;
+      this.assertOrgInScope(row.org_id, 'org note');
+      return row;
+    },
+
+    findByHash: (orgId: number, hash: string): OrgNoteRow | null => {
+      this.assertOrgInScope(orgId, 'org note');
+      return (
+        (this.prep('SELECT * FROM org_notes WHERE org_id = ? AND content_hash = ?').get(
+          orgId,
+          hash,
+        ) as OrgNoteRow | undefined) ?? null
+      );
+    },
+
+    listByOrg: (
+      orgId: number,
+      opts: {
+        /** `undefined` = the whole org. `null` = org-wide notes only. */
+        projectId?: number | null;
+        status?: OrgNoteStatus[];
+        sinceSeq?: number;
+        limit?: number;
+      } = {},
+    ): Array<OrgNoteRow & OrgNoteContentRow> => {
+      this.assertOrgInScope(orgId, 'org note');
+      const where: string[] = ['n.org_id = ?'];
+      const params: unknown[] = [orgId];
+
+      if (opts.projectId === null) where.push('n.project_id IS NULL');
+      else if (opts.projectId !== undefined) {
+        // An org-wide note applies to every project, so narrowing to a
+        // project includes them rather than excluding them.
+        where.push('(n.project_id IS NULL OR n.project_id = ?)');
+        params.push(opts.projectId);
+      }
+      if (opts.status && opts.status.length > 0) {
+        where.push(`n.status IN (${opts.status.map(() => '?').join(',')})`);
+        params.push(...opts.status);
+      }
+      if (opts.sinceSeq !== undefined) {
+        where.push('n.seq > ?');
+        params.push(opts.sinceSeq);
+      }
+      params.push(opts.limit ?? 200);
+
+      return this.prep(
+        `SELECT n.*, c.question, c.answer, c.working_example, c.caveats,
+                c.tool_tags, c.type_tags, c.linked_ids
+           FROM org_notes n
+           JOIN org_note_content c ON c.note_id = n.id
+          WHERE ${where.join(' AND ')}
+          ORDER BY n.promoted_at, n.content_hash
+          LIMIT ?`,
+      ).all(...params) as Array<OrgNoteRow & OrgNoteContentRow>;
+    },
+
+    /**
+     * Move a note along its lifecycle. There is no delete.
+     *
+     * `deleted` is logical and keeps the row, its author and its provenance:
+     * a lesson that turned out to be wrong is the most useful thing in the
+     * store, because the alternative is the next person learning it again
+     * and recording it again.
+     */
+    setStatus: (id: number, status: OrgNoteStatus, supersededBy?: number): OrgNoteRow => {
+      const note = this.orgNotes.findById(id);
+      if (!note) {
+        throw new MyJarbisError(ErrorType.RESOURCE_NOT_FOUND, `No org note with id ${id}.`);
+      }
+      if (supersededBy !== undefined) {
+        const successor = this.orgNotes.findById(supersededBy);
+        if (!successor) {
+          throw new MyJarbisError(
+            ErrorType.RESOURCE_NOT_FOUND,
+            `No org note with id ${supersededBy} to supersede ${id} with.`,
+          );
+        }
+        // The pointer goes on the SUCCESSOR, pointing back at what it
+        // replaced, so a chain can be walked in the direction it was built.
+        this.prep(
+          `UPDATE org_notes SET supersedes_id = ?, updated_at = datetime('now') WHERE id = ?`,
+        ).run(id, supersededBy);
+      }
+      this.prep(`UPDATE org_notes SET status = ?, updated_at = datetime('now') WHERE id = ?`).run(
+        status,
+        id,
+      );
+      return this.prep('SELECT * FROM org_notes WHERE id = ?').get(id) as OrgNoteRow;
+    },
+
+    /**
+     * Point one note at the one it replaces, by id.
+     *
+     * A named accessor rather than a raw `UPDATE` at the call site, because
+     * the call site is a loop over a file: through `prep` the statement is
+     * compiled once for the whole pull instead of once per row.
+     */
+    setSupersedes: (noteId: number, supersedesId: number): void => {
+      this.prep('UPDATE org_notes SET supersedes_id = ? WHERE id = ?').run(supersedesId, noteId);
+    },
+
+    /** Cache the drift count. Local-only, never exported. */
+    setDrift: (id: number, changed: number): void => {
+      this.prep(
+        `UPDATE org_notes
+            SET drift_changed = ?, drift_checked_at = datetime('now')
+          WHERE id = ?`,
+      ).run(changed, id);
+    },
+
+    maxSeq: (orgId: number): number => {
+      const row = this.prep('SELECT MAX(seq) AS m FROM org_notes WHERE org_id = ?').get(orgId) as
+        | { m: number | null }
+        | undefined;
+      return row?.m ?? 0;
+    },
+
+    countByOrg: (orgId: number, status?: OrgNoteStatus[]): number => {
+      this.assertOrgInScope(orgId, 'org note');
+      if (!status || status.length === 0) {
+        return (
+          this.prep('SELECT COUNT(*) AS c FROM org_notes WHERE org_id = ?').get(orgId) as {
+            c: number;
+          }
+        ).c;
+      }
+      return (
+        this.prep(
+          `SELECT COUNT(*) AS c FROM org_notes
+            WHERE org_id = ? AND status IN (${status.map(() => '?').join(',')})`,
+        ).get(orgId, ...status) as { c: number }
+      ).c;
     },
   };
 
@@ -1982,6 +2827,87 @@ export class MyJarbisDB {
       }
     }
 
+    // ─── the org memory ───
+    //
+    // Skipped ENTIRELY when the project belongs to no org. Not run with a
+    // sentinel org id, not run and discarded: no query at all. Every project
+    // on this machine is org-less today, so this whole path is inert for all
+    // of them — which is what keeps a feature nobody has opted into from
+    // changing what `search` returns for everybody.
+    const orgId = ORG_AWARE_SCOPES.has(scope) ? this.scopedOrgId : null;
+    if (orgId !== null) {
+      const rows = this.prep(
+        `SELECT n.id AS rowid, c.question AS title,
+                snippet(org_note_content_fts, 1, '«', '»', '…', 12) AS snippet,
+                rank,
+                n.author_handle, n.promoted_at, n.status, n.confidence,
+                n.expires_at, n.drift_changed, n.drift_checked_at,
+                n.project_id,
+                CASE WHEN n.expires_at IS NOT NULL AND n.expires_at < datetime('now')
+                     THEN 1 ELSE 0 END AS expired
+           FROM org_note_content_fts
+           JOIN org_note_content c ON c.note_id = org_note_content_fts.rowid
+           JOIN org_notes n ON n.id = c.note_id
+          WHERE org_note_content_fts MATCH ?
+            AND n.org_id = ?
+            AND (n.project_id IS NULL OR n.project_id = ?)
+            AND n.status IN ('active', 'stale')
+          ORDER BY rank
+          LIMIT ?`,
+      ).all(ftsQuery, orgId, scopedProjectId, limit) as Array<{
+        rowid: number;
+        title: string;
+        snippet: string;
+        rank: number;
+        author_handle: string;
+        promoted_at: string;
+        status: OrgNoteStatus;
+        confidence: OrgNoteConfidence;
+        expires_at: string | null;
+        drift_changed: number | null;
+        drift_checked_at: string | null;
+        project_id: number | null;
+        expired: number;
+      }>;
+
+      for (const r of rows) {
+        // Downranked relative to local knowledge, and the SIGN matters:
+        // bm25 `rank` is NEGATIVE and more negative is better, so pushing a
+        // hit down means multiplying TOWARD zero. Getting this backwards
+        // promotes every org note above everything local and reads as a
+        // feature rather than as a bug.
+        //
+        // Local knowledge wins ties because it is about this project
+        // specifically; the org note is general advice that happens to
+        // match. And a note that is stale, expired or sitting on files that
+        // have since changed is downranked again rather than hidden — the
+        // reader decides, with the reason in front of them.
+        const degraded = r.status === 'stale' || r.expired === 1 || (r.drift_changed ?? 0) > 0;
+        hits.push({
+          source: 'org_note',
+          rowid: r.rowid,
+          title: r.title,
+          snippet: r.snippet,
+          rank: r.rank * (degraded ? ORG_RANK_PENALTY * ORG_DEGRADED_PENALTY : ORG_RANK_PENALTY),
+          meta: {
+            source: 'org',
+            author: r.author_handle,
+            promotedAt: r.promoted_at,
+            status: r.status,
+            confidence: r.confidence,
+            expired: r.expired === 1,
+            orgWide: r.project_id === null,
+            // `null` when it has never been checked, which is the honest
+            // answer to "did the ground move" and NOT the same as zero.
+            drift:
+              r.drift_checked_at === null
+                ? null
+                : { changed: r.drift_changed ?? 0, checkedAt: r.drift_checked_at },
+          },
+        });
+      }
+    }
+
     return hits.sort((a, b) => a.rank - b.rank).slice(0, limit);
   }
 
@@ -1994,12 +2920,7 @@ export class MyJarbisDB {
    * no index, because the hit looks legitimate.
    */
   rebuildFts(): void {
-    for (const t of [
-      'project_context_fts',
-      'module_context_fts',
-      'skills_fts',
-      'observations_fts',
-    ]) {
+    for (const t of FTS_TABLES) {
       this.db.exec(`INSERT INTO ${t}(${t}) VALUES('rebuild')`);
     }
   }

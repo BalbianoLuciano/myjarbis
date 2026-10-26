@@ -37,6 +37,10 @@ export const COUNTED_TABLES = [
   'workflows',
   'workflow_steps',
   'providers',
+  'org_notes',
+  'org_note_content',
+  'workflow_runs',
+  'workflow_run_steps',
 ] as const;
 
 export interface BackupResult {

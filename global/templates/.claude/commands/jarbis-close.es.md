@@ -63,10 +63,40 @@ este comando viene a evitar.
   sin verificar, va acá; omitirlo es lo que hace que la próxima sesión
   crea que estaba hecho. ≤ 10 líneas.
 
+### 3.5 Si este proyecto está en una org: ofrecé lo que el equipo debería tener
+
+`end_session` vuelve con `promotionProposals` cuando el proyecto pertenece
+a una org y esta sesión produjo algo que vale compartir. Cuando eso pasa:
+
+1. Imprimí su `display` **textual**. Viene renderizado del servidor: ya
+   nombra la org, marca lo que necesita reescritura y dice qué nunca
+   viaja. Reconstruirlo cuesta tokens para producir algo menos parejo.
+2. Preguntá cuáles promover. **Nunca promuevas sin preguntar**, y nunca
+   promuevas todo porque todo fue ofrecido — aproximadamente la mitad de
+   lo que se ofrece a una memoria compartida ya está ahí, y ese es el
+   filtro funcionando.
+3. Por cada confirmación, llamá a `promote_observation`. Pasá `caveats`
+   —CUÁNDO aplica— porque es el campo que no tiene origen mecánico y el
+   que más vale: es lo que evita que una lección verdadera acá se aplique
+   en todas partes. Agregá `working_example` si hay uno.
+4. Si vuelve `ORG_NOTE_UNSAFE`, la nota carga algo que no debe salir de
+   esta máquina: una credencial, un path local, un host interno o el
+   nombre real de un proyecto. **Mostrá la línea exacta y la reescritura
+   propuesta, y preguntá.** No esquives el rechazo ni la reescribas por
+   tu cuenta para promoverla en silencio: el usuario es quien sabe si ese
+   nombre importa.
+5. Aclarale que promover escribe solo en el espejo local. `myjarbis org
+   push` escribe los archivos que lee el equipo, y los commitea una
+   persona.
+
+Si `promotionProposals` no viene, acá no hay nada que hacer. No menciones
+la memoria de la org.
+
 ### 4. Recapitulá en corto
 
-Mostrale: qué notas guardaste (títulos), el `next_session` textual, y
-una línea ofreciéndote a reescribir cualquiera de los dos si no le cierra.
+Mostrale: qué notas guardaste (títulos), el `next_session` textual, qué
+se promovió a la org si hubo algo, y una línea ofreciéndote a reescribir
+cualquiera de ellos si no le cierra.
 
 ---
 

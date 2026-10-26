@@ -134,6 +134,15 @@ export enum ErrorType {
   INVALID_CONTEXT_KIND = 'INVALID_CONTEXT_KIND',
   STATE_LOCKED = 'STATE_LOCKED',
   WORKFLOW_NOT_FOUND = 'WORKFLOW_NOT_FOUND',
+  // v0.5 additions
+  /** A promotion to the org memory carried something that must not leave
+   *  this machine: a credential, a local path, an internal host, or a real
+   *  project name. Blocking, with the offending line and a rewrite. */
+  ORG_NOTE_UNSAFE = 'ORG_NOTE_UNSAFE',
+  /** The project belongs to no org, so there is no org memory to read or
+   *  write. Separate from ORG_NOT_FOUND, which is a named org that does not
+   *  exist: this one is "you have not joined one". */
+  NO_ORG = 'NO_ORG',
 }
 
 /**

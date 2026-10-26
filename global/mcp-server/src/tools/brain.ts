@@ -37,8 +37,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ServerContext } from '../context.js';
 import { MyJarbisError, ErrorType } from '../types.js';
-import { SCHEMA_VERSION } from '../db/schema.js';
+import { SCHEMA_VERSION, FTS_TABLES } from '../db/schema.js';
 import { findSecrets, SECRET_GUIDANCE } from '../org/secrets.js';
+import { writeIfChanged, parseNdjson } from '../ndjson.js';
 
 /** Directory name under `.myjarbis/` holding the dump. */
 export const BRAIN_DIRNAME = 'brain';
@@ -108,7 +109,43 @@ const TABLES: ReadonlyArray<DumpTable> = [
       "(scope IN ('project','user') AND scope_id = ?) OR " +
       "(scope = 'org' AND scope_id IN (SELECT org_id FROM projects WHERE id = ?)))",
   },
+  // The org memory travels in its own format too (see org/memory/), which is
+  // the one the team reads. It is dumped here as well because this dump is a
+  // backup of one project's rows, and a backup that silently omits a table is
+  // not one. Appended at the end so importBrain's reverse-order delete, which
+  // relies on this being FK-dependency order, stays correct.
+  {
+    name: 'org_notes',
+    orderBy: 'id',
+    scope:
+      'org_id IN (SELECT org_id FROM projects WHERE id = ?) ' +
+      'AND (project_id IS NULL OR project_id = ?)',
+  },
+  {
+    name: 'org_note_content',
+    orderBy: 'note_id',
+    scope:
+      'note_id IN (SELECT id FROM org_notes WHERE ' +
+      'org_id IN (SELECT org_id FROM projects WHERE id = ?) ' +
+      'AND (project_id IS NULL OR project_id = ?))',
+  },
+  { name: 'workflow_runs', orderBy: 'id', scope: 'project_id = ?' },
+  {
+    name: 'workflow_run_steps',
+    orderBy: 'id',
+    scope: 'run_id IN (SELECT id FROM workflow_runs WHERE project_id = ?)',
+  },
 ];
+
+/**
+ * The same list, exported under the name the convention uses.
+ *
+ * Exported so a test can assert that every non-FTS table in `sqlite_master`
+ * appears both here and in `COUNTED_TABLES`. A new table has to be registered
+ * in several places, and "remember to add it in all of them" is not a
+ * mechanism — a failing assertion is.
+ */
+export const DUMP_TABLES = TABLES;
 
 /** How many times `?` appears in a table's scope clause. */
 function scopeArity(t: DumpTable): number {
@@ -205,36 +242,6 @@ function serializeRow(row: Record<string, unknown>, cols: string[]): string {
 
 /** Write only when the bytes differ, so untouched tables keep their mtime and
  *  git sees no spurious change. Returns true when the file was rewritten. */
-function writeIfChanged(file: string, contents: string): boolean {
-  if (fs.existsSync(file)) {
-    const current = fs.readFileSync(file, 'utf-8');
-    if (current === contents) return false;
-  }
-  fs.writeFileSync(file, contents, 'utf-8');
-  return true;
-}
-
-function parseNdjson(file: string): Array<Record<string, unknown>> {
-  if (!fs.existsSync(file)) return [];
-  const raw = fs.readFileSync(file, 'utf-8');
-  const out: Array<Record<string, unknown>> = [];
-  const lines = raw.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    try {
-      out.push(JSON.parse(line) as Record<string, unknown>);
-    } catch {
-      throw new MyJarbisError(
-        ErrorType.INVALID_INPUT,
-        `${path.basename(file)}:${i + 1} is not valid JSON — the dump is corrupt or a merge conflict was left unresolved.`,
-        { file, line: i + 1, snippet: line.slice(0, 120) },
-      );
-    }
-  }
-  return out;
-}
-
 /**
  * Row counts for THIS project only, using the same scope clauses the export
  * uses. Counting whole tables would report drift forever in a shared brain:
@@ -452,6 +459,25 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
   let rebasedFrom: string | undefined;
 
   ctx.db.tx(() => {
+    // SELF-REFERENCES cannot be ordered, so their enforcement is deferred to
+    // the COMMIT — and only to the commit, which is what keeps the guarantee
+    // the comment below describes.
+    //
+    // `org_notes.supersedes_id` and `observations.supersedes` both point at
+    // their own table. Row order within a table is by id, which is fine when a
+    // pointer always goes backwards — and it does not. `org pull` resolves
+    // `supersedes_hash` AFTER inserting every row in file order, which is
+    // `(promoted_at, content_hash)`, so a pulled note can legitimately end up
+    // superseding a note with a HIGHER id. Export that brain and import it
+    // again and the insert hits `FOREIGN KEY constraint failed` halfway
+    // through, on a dump that is perfectly valid.
+    //
+    // `defer_foreign_keys` is per-transaction and resets itself at commit, so
+    // this is not the same thing as turning foreign keys off: every constraint
+    // is still checked, just at the end. A dump with a genuinely dangling
+    // reference still fails, and still fails the whole transaction.
+    ctx.db.db.pragma('defer_foreign_keys = ON');
+
     // Foreign keys are ON: children first on the way out, parents first on the
     // way in. Deferring instead would let a bad dump land half-applied.
     for (const t of [...TABLES].reverse()) {
@@ -518,7 +544,7 @@ export function importBrain(ctx: ServerContext, opts: { dir?: string } = {}): Im
 
   // FTS5 mirrors are rebuilt by the schema triggers during the inserts above.
   // Ask SQLite to verify rather than trusting it.
-  for (const ftsTable of ['project_context_fts', 'module_context_fts', 'observations_fts', 'skills_fts']) {
+  for (const ftsTable of FTS_TABLES) {
     if (!tableExists(ctx, ftsTable)) continue;
     try {
       ctx.db.db.prepare(`INSERT INTO ${ftsTable}(${ftsTable}) VALUES ('rebuild')`).run();

@@ -187,7 +187,7 @@ org (optional — owns the pack: skills, workflows, taxonomy)
   │     │           ├── topic_key (new in v0.3 — identity; saving again updates it)
   │     │           └── refs      (new in v0.3 — links to commits / MRs / tickets)
   │     └── skills (module-level — only when this module is active)
-  └── skills (project-level — always loaded: 10 baselines + any org pack)
+  └── skills (project-level — always loaded: 11 baselines + any org pack)
 ```
 
 When you open Claude, the SessionStart hook asks which vertical you want.
@@ -321,6 +321,54 @@ of this repo.
 </details>
 
 <details>
+<summary><b>A second memory, for the team</b></summary>
+
+Your brain is yours: sessions, handoffs, half-finished thinking, the living
+state. None of it should travel. But a gotcha that cost you two hours is
+something the whole team re-learns if nobody writes it where they can read
+it.
+
+So there is a second, much smaller memory, scoped to an org:
+
+```bash
+myjarbis org push      # writes <project>/.myjarbis/org/*.ndjson — you commit them
+myjarbis org pull      # a teammate clones, pulls, and inherits all of it
+myjarbis org notes     # what the team already knows, with who found it
+```
+
+The transport is the repository you already share. No server, no new repo, no
+access to grant.
+
+**What can never cross is a property of the schema, not a setting.** The org
+table has no `session_id`, no `summary`, no `next_session` and no free-text
+body, and the only door in takes a single note id. A conversation has nowhere
+to go.
+
+**Promotion is proposed, never automatic.** At a session close you are shown
+what might belong to the team and you pick:
+
+```
+Promote to the "acme" memory?
+
+  [ ] #1551 gotcha   An UPDATE corrupts a contentless FTS5 index
+  [!] #1552 error    The deploy fails without DATABASE_URL
+  [=] #1553 gotcha   already in the org memory — nothing to do
+
+  never promoted: the handoff, the session summary, the conversation
+```
+
+`[!]` means it would leak something — a credential, a local path, an internal
+host, a real client's project name — and it is **refused** with the offending
+line and a proposed rewrite until you accept one.
+
+Each note carries who found it, when, whether it was `verified` against a
+commit or merely `assumed`, and a drift signal: how many of the files it cited
+have changed since. An old note that describes code nobody has touched and an
+old note that is still true look identical otherwise.
+
+</details>
+
+<details>
 <summary><b>Workflows as data, not prose</b></summary>
 
 Process written as prose gets duplicated and then contradicted. Workflows
@@ -342,6 +390,37 @@ and MyJarbis never learns a vendor's name.
 `gate=approve` means *stop and ask*. Conditions are decidable
 (`branch ~= release/*`, `framework in [laravel, express]`), not free text
 for the agent to interpret differently each session.
+
+**A workflow can be made of other workflows.** A step carrying
+`uses: commit-ritual` splices that whole ritual in, and the resolution stays
+one flat ordered list with the child's steps namespaced:
+
+```
+myjarbis workflow show session-close
+
+  1  look-at-the-real-state              session-close
+  2  save-the-observations               session-close
+  3  commit-ritual/stage-by-name         commit-ritual
+  4  commit-ritual/write-the-subject     commit-ritual
+  5  commit-ritual/write-the-body        commit-ritual
+  6  pre-push-checks/run-the-suite       pre-push-checks
+  7  pre-push-checks/confirm-green       pre-push-checks   gate: approve
+  8  commit-ritual/push                  commit-ritual     gate: approve
+  9  write-the-living-state              session-close
+ 10  offer-the-team-what-is-theirs       session-close     gate: on-request
+ 11  end-the-session                     session-close
+```
+
+The layers resolve **before** the expansion, which is the point: turn the
+push gate off in `commit-ritual` once and every ritual that invokes it
+follows. One rule, one place — including the two levels down.
+
+**And a run records where you got to.** `start_workflow_run` snapshots the
+resolution; `advance_workflow_step` takes no arguments in the common case.
+Per-step times are measured, so "how long does our release actually take" is
+a query. A compaction keeps almost none of the commands an agent ran — "I
+have done steps one through four" is exactly the sentence that does not
+survive one, and a row survives it perfectly.
 
 ```bash
 myjarbis provider set tracker acme-tracker --config='{"base_url":"https://..."}'
@@ -448,7 +527,7 @@ schema until you run `myjarbis migrate`, which backs up first.
 
 ```bash
 cd ~/projects/my-app
-myjarbis init                          # creates memory.db + 10 baselines + plugin hooks
+myjarbis init                          # creates memory.db + 11 baselines + 4 workflows + hooks
 ```
 
 `myjarbis init` is **interactive** — it asks two questions to personalize
@@ -521,7 +600,7 @@ and Anthropic's prompt cache survives between calls.
 
 You say *"let's work on backend"* → the agent calls
 `start_session("backend")` and gets project_core + backend context + the
-previous `next_session`. Only the 10 baselines + backend's module-level
+previous `next_session`. Only the 11 baselines + backend's module-level
 skills are materialized to `.claude/skills/`. Frontend's are not on disk.
 
 Name two and you get both: *"backend and frontend"* →
@@ -585,7 +664,7 @@ into one call.
 </details>
 
 <details>
-<summary><b>The 10 baseline skills</b></summary>
+<summary><b>The 11 baseline skills</b></summary>
 
 Materialized to `.claude/skills/myjarbis-<name>/SKILL.md` and loaded at
 session start.
@@ -825,7 +904,7 @@ sees hits from the one you're in.
 
 **v0.1 → v0.2** (markdown → SQLite) runs automatically on first open:
 `knowledge-base.md` → observations, `daily.md` → workflow,
-`project-summary.md` → functional spec, 10 baselines seeded. Auto-backup
+`project-summary.md` → functional spec, 11 baselines seeded. Auto-backup
 at `~/.myjarbis-global/backups/<project>/<ts>/`. Legacy aliases
 (`search_code`, `get_context`, `update_memory`) still work.
 
@@ -911,7 +990,7 @@ myjarbis import <file.json> --target=... --kind=<kind> --mapping='items[]'
 <summary><b>Tests</b></summary>
 
 ```bash
-bash tests/run-all.sh          # 18 suites, 302 assertions, each builds its own fixture
+bash tests/run-all.sh          # 35 suites, 849 assertions, each builds its own fixture
 ```
 
 ```bash
@@ -957,7 +1036,7 @@ snapshot instead of `bin/` and passes regardless of the source.
 
 <p align="center">
   <b>Three slash commands: <code>/jarbis</code> to open, <code>/jarbis-save</code> to write it down, <code>/jarbis-close</code> to close.</b> Everything else is conversation or a quick CLI verb.<br>
-  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 10 baseline skills let the agent infer all of it.<br>
+  No <code>/plan</code>, <code>/implement</code>, <code>/complete</code> — the 11 baseline skills let the agent infer all of it.<br>
   None of the three is a new capability. They are the rituals worth having a key for: the <code>SessionEnd</code> hook always closes the session, but only a written handoff tells the next one what to do — and <code>/jarbis-save</code> writes that handoff without ending anything, for the sessions that stop without being closed.
 </p>
 

@@ -48,6 +48,7 @@ import { ObservationRow, SessionRow } from '../db/schema.js';
  *  and re-exported here because this is where it is stamped. */
 export { AUTO_MARKER } from '../db/schema.js';
 import { AUTO_MARKER } from '../db/schema.js';
+import { reconcileRunsForSession } from './workflowRuns.js';
 
 export interface AutoCloseResult {
   sessionId: number;
@@ -58,6 +59,8 @@ export interface AutoCloseResult {
   nextSession: string;
   /** Where the "resume here" text came from. */
   nextSessionSource: 'project_state' | 'progress_note' | 'latest_note' | 'none';
+  /** Workflow runs this session was following, marked abandoned. */
+  runsAbandoned?: number;
 }
 
 /** Minutes between a stored timestamp and now. */
@@ -275,6 +278,19 @@ export function autoCloseSession(
 
   ctx.db.sessions.end(session.id, summary, next.text);
 
+  // A workflow run this session was following has to be closed with it, or it
+  // stays 'open' forever and the next start_workflow_run answers "already in
+  // progress" about a ritual nobody is running. Hung off this funnel because
+  // both the SessionEnd hook and start_session reach the close through here.
+  //
+  // Best-effort: a session must close even if the run bookkeeping cannot.
+  let runsAbandoned = 0;
+  try {
+    runsAbandoned = reconcileRunsForSession(ctx, session.id);
+  } catch {
+    // Nothing here is worth failing a session close over.
+  }
+
   return {
     sessionId: session.id,
     module: moduleRow.name,
@@ -283,6 +299,7 @@ export function autoCloseSession(
     summary,
     nextSession: next.text,
     nextSessionSource: next.source,
+    runsAbandoned: runsAbandoned > 0 ? runsAbandoned : undefined,
   };
 }
 

@@ -25,6 +25,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { homedir } from 'os';
 import { MyJarbisDB } from './index.js';
+import { BASELINE_WORKFLOWS } from '../workflows/baseline.js';
 import { globalDbPath, siloDbPath } from '../resolve.js';
 import { SCHEMA_VERSION } from './schema.js';
 
@@ -216,6 +217,20 @@ Format:
 - **content**: WHY first, then WHAT, then HOW.
 - **files**: comma-separated list of paths touched, if any.
 - **tags**: free-form, used for grouping in search.
+
+## When the project is in an org
+
+A \`gotcha\` or an \`error\` is what a whole team re-learns if nobody writes it
+where they can read it. When the project belongs to an org, those two come
+back from \`save_observation\` with \`promotable: true\`.
+
+That is a flag, not a cue to act. **You propose, the user decides**, and the
+moment to propose is the close — \`end_session\` returns
+\`promotionProposals\`, and interrupting mid-task to ask about sharing is how
+people learn to ignore the question.
+
+Two things never cross to the org memory, and neither is a judgement call:
+the session summary and the handoff. There is no tool that takes them.
 
 ## Triggers conversacionales
 
@@ -716,6 +731,71 @@ Before \`git commit\`:
   did → see the language section; the convention decides, not the log
 `,
   },
+  {
+    name: 'workflow-driven',
+    description: 'Follow the project process from rows, and record where you got to',
+    triggerPattern:
+      'before committing, before pushing, before opening a PR, before closing a ' +
+      'session, before a release, any multi-step ritual',
+    content: `---
+name: workflow-driven
+description: Follow the project's process from rows, not from prose
+---
+
+# Workflow-driven work
+
+\`start_session\` hands you a \`workflows\` list: the slugs of the rituals this
+project has. Before starting that KIND of work — committing, pushing, opening
+a merge request, closing a session, cutting a release — call
+\`get_workflow(slug)\` and follow what it returns.
+
+Do not infer the process from prose, from the last few commits, or from what
+usually works. That is what this exists to replace: the process used to live
+in a skill, a project_context row and a second skill, with nothing to say
+which one won, and three consecutive sessions once contradicted each other
+about when to stop and ask.
+
+## What the resolved list means
+
+- It is already FLAT and already in order. Follow it top to bottom.
+- A step name with a **\`/\`** came from the workflow before the slash. Do not
+  go looking for that workflow; its steps are already in your list. To CHANGE
+  one of them, change it there — \`set_workflow_step({ slug: "<the part before
+  the slash>", ... })\` — and every ritual that invokes it follows.
+- **\`gate: "approve"\` is a stop.** Ask the user and wait. It is not a
+  suggestion to consider consulting someone.
+- \`gate: "on-request"\` means do it only if they ask for it.
+- \`applies: false\` means its condition did not match here. Skip it, and say so
+  if it mattered.
+- \`provider: null\` on a step whose capability names a role means the project
+  has not configured that tool. **Ask**, do not guess which one they meant.
+
+## Rituals longer than three steps
+
+Open a run: \`start_workflow_run(slug)\`, then \`advance_workflow_step\` as each
+one completes — the common call takes no arguments at all, because it defaults
+to the open run and its active step.
+
+Why bother: a compaction keeps almost none of the commands you ran. "I have
+done steps one through four" is exactly the kind of sentence that does not
+survive one, and a row survives it perfectly. After a compaction,
+\`get_workflow_run()\` tells you where you actually were.
+
+Skipping a step needs a reason. A log that records what was skipped without
+why answers nothing a month later.
+
+If the session dies mid-ritual, the run is marked abandoned and the step it
+died on is marked blocked. That is a record, not a failure — say so rather
+than starting again as if nothing happened.
+
+## What this does not authorise
+
+A workflow step is a process rule. It does not override safety: it cannot
+authorise deleting without a backup, pushing to the default branch unasked, or
+skipping a confirmation the user would want. If a step appears to ask for one
+of those, say so and stop.
+`,
+  },
 ];
 
 // ─────────────────────────────────────────────────────────────────────
@@ -895,7 +975,13 @@ export function seedNewProject(
     gitRemote?: string | null;
     isolation?: 'silo' | 'shared';
   },
-): { projectId: number; moduleId: number; skills: number; dbPath: string } {
+): {
+  projectId: number;
+  moduleId: number;
+  skills: number;
+  workflows: number;
+  dbPath: string;
+} {
   // 'shared' projects live in the global brain; 'silo' keeps its own file
   // next to the project, which is what every pre-v0.3 project already has.
   const isolation = opts.isolation ?? 'silo';
@@ -904,6 +990,7 @@ export function seedNewProject(
   let projectId = 0;
   let moduleId = 0;
   let skills = 0;
+  let workflows = 0;
 
   db.tx(() => {
     const project = db.projects.upsertByPath({
@@ -934,10 +1021,40 @@ export function seedNewProject(
       });
       if (r.status !== 'unchanged') skills++;
     }
+
+    // Baseline workflows, at PROJECT scope.
+    //
+    // Not org scope: a new project starts with `org_id = NULL`, so an
+    // org-scope baseline would be unreachable from every project on the
+    // machine — which is how this table stayed empty in every brain for two
+    // releases while being fully implemented and tested.
+    for (const wf of BASELINE_WORKFLOWS) {
+      const row = db.workflows.upsert({
+        slug: wf.slug,
+        name: wf.name,
+        scope: 'project',
+        scopeId: project.id,
+        standalone: wf.standalone,
+      });
+      wf.steps.forEach((st, i) => {
+        db.workflowSteps.upsert({
+          workflowId: row.id,
+          position: (i + 1) * 10,
+          name: st.name,
+          actor: st.actor,
+          gate: st.gate,
+          capability: st.capability,
+          uses: st.uses,
+          condition: st.condition,
+          notes: st.notes,
+        });
+      });
+      workflows++;
+    }
   });
 
   db.close();
-  return { projectId, moduleId, skills, dbPath };
+  return { projectId, moduleId, skills, workflows, dbPath };
 }
 
 // ─────────────────────────────────────────────────────────────────────

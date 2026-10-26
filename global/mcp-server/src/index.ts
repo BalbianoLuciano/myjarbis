@@ -109,6 +109,22 @@ import {
   listContextKinds,
   listContextKindsInputSchema,
 } from './tools/kinds.js';
+import {
+  promoteObservation,
+  promoteObservationInputSchema,
+  listOrgNotes,
+  listOrgNotesInputSchema,
+} from './tools/orgMemory.js';
+import {
+  startWorkflowRun,
+  startWorkflowRunInputSchema,
+  advanceWorkflowStep,
+  advanceWorkflowStepInputSchema,
+  closeWorkflowRun,
+  closeWorkflowRunInputSchema,
+  getWorkflowRun,
+  getWorkflowRunInputSchema,
+} from './tools/workflowRuns.js';
 
 // ─────────────────────────────────────────────────────────────────────
 // Tool registry
@@ -352,6 +368,32 @@ function buildToolRegistry(): RegisteredTool[] {
       handler: (ctx, args) => setProjectState(ctx, args),
     },
     {
+      // NOT deferred, unlike most write tools. A tool the agent is supposed to
+      // call at the end of a session is a tool it will skip if the schema has
+      // to be fetched first — and the whole feature rests on it being offered
+      // at the one moment the user is already stopping.
+      name: 'promote_observation',
+      description:
+        'Promote ONE personal note into the org memory, where the whole team ' +
+        'reads it. Takes an observation id and nothing else: there is no path ' +
+        'for a session, a summary, a handoff or a conversation. Propose first ' +
+        'and let the user confirm — never promote on your own judgement. A note ' +
+        'carrying a credential, a local path, an internal host or a real project ' +
+        'name is REFUSED with the offending line and a rewrite.',
+      inputSchema: promoteObservationInputSchema,
+      handler: (ctx, args) => promoteObservation(ctx, args),
+    },
+    {
+      name: 'list_org_notes',
+      description:
+        'What the org memory already holds for this project, with authors, ' +
+        'confidence and staleness. Read it before promoting: roughly half of ' +
+        'what gets offered to a shared store is already in it.',
+      inputSchema: listOrgNotesInputSchema,
+      handler: (ctx, args) => listOrgNotes(ctx, args),
+      deferred: true,
+    },
+    {
       name: 'get_workflow',
       description:
         'The process for a kind of work, resolved from org + project + user ' +
@@ -363,9 +405,53 @@ function buildToolRegistry(): RegisteredTool[] {
     },
     {
       name: 'list_workflows',
-      description: 'Workflow slugs reachable from this project, with their layers.',
+      description:
+        'Workflow slugs reachable from this project, with their layers and which ' +
+        'child workflows each one invokes. Children are not listed on their own.',
       inputSchema: listWorkflowsInputSchema,
       handler: (ctx) => listWorkflowsTool(ctx),
+    },
+    {
+      // Not deferred: the whole point is that "where was I" survives a
+      // compaction, and a tool whose schema has to be fetched first is a tool
+      // the agent skips exactly when the context is already tight.
+      name: 'start_workflow_run',
+      description:
+        'Begin following a workflow, recording where you get to. Use it for any ' +
+        'ritual longer than three steps: a compaction keeps almost none of the ' +
+        'commands you ran, and "I have done steps 1-4" is the kind of sentence ' +
+        'that does not survive one. Refuses to start a second run of the same ' +
+        'workflow and tells you where the first one got to instead.',
+      inputSchema: startWorkflowRunInputSchema,
+      handler: (ctx, args) => startWorkflowRun(ctx, args),
+    },
+    {
+      name: 'advance_workflow_step',
+      description:
+        'Record the current step as done, skipped or blocked, and activate the ' +
+        'next. "skipped" requires a reason. Defaults to the open run and its ' +
+        'active step, so the common call takes no arguments at all.',
+      inputSchema: advanceWorkflowStepInputSchema,
+      handler: (ctx, args) => advanceWorkflowStep(ctx, args),
+    },
+    {
+      name: 'close_workflow_run',
+      description:
+        'Finish a run. "done" is refused while steps are unfinished; ' +
+        '"abandoned" is always allowed and is the honest record when the ritual ' +
+        'was not completed.',
+      inputSchema: closeWorkflowRunInputSchema,
+      handler: (ctx, args) => closeWorkflowRun(ctx, args),
+      deferred: true,
+    },
+    {
+      name: 'get_workflow_run',
+      description:
+        'Where a ritual got to and how long each step took. The answer to ' +
+        '"where was I" as a row rather than as prose.',
+      inputSchema: getWorkflowRunInputSchema,
+      handler: (ctx, args) => getWorkflowRun(ctx, args),
+      deferred: true,
     },
     {
       name: 'set_workflow_step',
@@ -455,7 +541,7 @@ async function main(): Promise<void> {
   const toolMap = new Map(tools.map((t) => [t.name, t]));
 
   const server = new Server(
-    { name: 'myjarbis-mcp-server', version: '0.4.6' },
+    { name: 'myjarbis-mcp-server', version: '0.5.0' },
     { capabilities: { tools: {} } },
   );
 

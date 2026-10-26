@@ -65,6 +65,16 @@ SUITES=(
   v045-update-observation-files
   v046-multi-module
   v046-bootstrap-size
+  v050-schema-v5
+  v050-org-identity
+  v050-org-scrub
+  v050-org-memory
+  v050-org-sync
+  v050-wdd
+  v050-perf-budget
+  v050-stress
+  v050-hostile
+  v050-update-dryrun
 )
 
 # ─── what to print when a suite fails ─────────────────────────────

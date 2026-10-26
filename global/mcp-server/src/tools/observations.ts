@@ -113,6 +113,10 @@ export interface SaveObservationResult {
   createdAt: string;
   /** 'updated' when an existing topic row was rewritten. */
   status: 'inserted' | 'updated';
+  /** Present only when the project is in an org AND this kind is one the
+   *  team re-learns without it. A flag, not a prompt: the offer belongs at
+   *  the close, where the user is already stopping. */
+  promotable?: true;
   topicKey?: string;
   hint?: string;
 }
@@ -186,7 +190,27 @@ export function saveObservation(
   // Keep the living diagram in sync (best-effort; honours the toggle).
   maybeRegenerateDiagram(ctx);
 
+  // A gotcha or an error is what a team re-learns if nobody writes it down
+  // where they can read it. Flagged, not acted on — and only when there IS an
+  // org, so the field is absent for every project that has not joined one.
+  //
+  // Deliberately a flag and not a prompt: the offer belongs at the close,
+  // where the user is already stopping. Interrupting mid-task to ask about
+  // sharing is how people learn to ignore the question.
+  let promotable: true | undefined;
+  try {
+    if (
+      (args.kind === 'gotcha' || args.kind === 'error') &&
+      ctx.db.scopedOrgId !== null
+    ) {
+      promotable = true;
+    }
+  } catch {
+    // Not knowing is the same as not offering.
+  }
+
   return {
+    promotable,
     observationId: obs.id,
     sessionId,
     module: { id: module.id, name: module.name },

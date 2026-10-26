@@ -50,7 +50,7 @@ import {
 } from './yaml.js';
 
 /** Bumped with the release; packs may require a minimum. */
-export const MYJARBIS_VERSION = '0.4.6';
+export const MYJARBIS_VERSION = '0.5.0';
 
 export type ApplyStatus = 'created' | 'updated' | 'unchanged';
 
@@ -76,6 +76,8 @@ export interface PackWorkflowStep {
   actor: string;
   gate: StepGate;
   capability?: string;
+  /** Slug of another workflow to run here. Excludes `capability`. */
+  uses?: string;
   condition?: string;
   notes?: string;
   disabled?: boolean;
@@ -84,6 +86,8 @@ export interface PackWorkflowStep {
 export interface PackWorkflow {
   slug: string;
   name: string;
+  /** False = a child, invocable only from a parent and hidden from the menu. */
+  standalone: boolean;
   steps: PackWorkflowStep[];
   sourceFile: string;
 }
@@ -242,6 +246,7 @@ function readWorkflowFile(dir: string, file: string): PackWorkflow {
   );
   const slug = optString(parsed.slug) ?? path.basename(file, path.extname(file));
   const name = optString(parsed.name) ?? slug;
+  const standalone = optBool(parsed.standalone) ?? true;
   const steps: PackWorkflowStep[] = [];
 
   for (const [i, raw] of asList(parsed.steps, `workflows/${file}: steps`).entries()) {
@@ -261,11 +266,38 @@ function readWorkflowFile(dir: string, file: string): PackWorkflow {
       // author sees now, not an ambiguity the agent reinterprets later.
       assertCondition(condition, `workflows/${file}: step "${stepName}"`);
     }
+    const capability = optString(s.capability);
+    const uses = optString(s.uses);
+    // Same rule as the tool and the repository, checked at the earliest of the
+    // three: a pack author finds out when they write the file, not when
+    // somebody's session resolves it.
+    if (uses && capability) {
+      throw new MyJarbisError(
+        ErrorType.PACK_ERROR,
+        `workflows/${file}: step "${stepName}" has both uses="${uses}" and ` +
+          `capability="${capability}". A step either runs another workflow or ` +
+          'does something itself, never both.',
+      );
+    }
+    if (uses === slug) {
+      throw new MyJarbisError(
+        ErrorType.PACK_ERROR,
+        `workflows/${file}: step "${stepName}" makes "${slug}" invoke itself.`,
+      );
+    }
+    if (stepName.includes('/')) {
+      throw new MyJarbisError(
+        ErrorType.PACK_ERROR,
+        `workflows/${file}: step "${stepName}" contains "/", which is reserved ` +
+          'for the names of steps that came from an invoked workflow.',
+      );
+    }
     steps.push({
       name: stepName,
       actor: optString(s.actor) ?? 'agent',
       gate,
-      capability: optString(s.capability),
+      capability,
+      uses,
       condition,
       notes: optString(s.notes),
       disabled: optBool(s.disabled),
@@ -278,7 +310,7 @@ function readWorkflowFile(dir: string, file: string): PackWorkflow {
       `workflows/${file}: a workflow needs at least one step.`,
     );
   }
-  return { slug, name, steps, sourceFile: `workflows/${file}` };
+  return { slug, name, standalone, steps, sourceFile: `workflows/${file}` };
 }
 
 /** Parse and validate a pack directory. Touches no database. */
@@ -369,6 +401,44 @@ export function readPack(packPathRaw: string): Pack {
     }
     seenSlugs.add(w.slug);
   }
+
+  // A `uses` target must exist, and the check happens HERE rather than per
+  // file, because every slug in the pack is only known once all of them are
+  // read — validating one workflow at a time would reject a parent whose
+  // child's file sorts after it.
+  //
+  // A target outside the pack is allowed and reported as a warning instead of
+  // an error: a pack can legitimately invoke a workflow the project defines
+  // itself, and refusing that would make a pack unable to extend a project.
+  // Unresolvable at run time, it is caught by the resolver, which names the
+  // parent step rather than only the missing slug.
+  for (const w of workflows) {
+    for (const s of w.steps) {
+      if (!s.uses || seenSlugs.has(s.uses)) continue;
+      warnings.push(
+        `${w.sourceFile}: step "${s.name}" invokes "${s.uses}", which this pack ` +
+          'does not define. It has to exist in the project, or the workflow will ' +
+          'fail to resolve.',
+      );
+    }
+  }
+
+  // Cycles, over the pack's own graph. Caught here as well as in the resolver
+  // because a pack is authored once and read by everyone: the author should
+  // find this, not twenty-three projects.
+  const usesOf = new Map<string, string[]>(
+    workflows.map((w) => [w.slug, w.steps.filter((s) => s.uses).map((s) => s.uses!)]),
+  );
+  const walk = (slug: string, pathSoFar: string[]): void => {
+    if (pathSoFar.includes(slug)) {
+      throw new MyJarbisError(
+        ErrorType.PACK_ERROR,
+        `workflow cycle in this pack: ${[...pathSoFar, slug].join(' → ')}.`,
+      );
+    }
+    for (const child of usesOf.get(slug) ?? []) walk(child, [...pathSoFar, slug]);
+  };
+  for (const w of workflows) walk(w.slug, []);
 
   // Provider templates.
   const providers: PackProvider[] = [];
@@ -493,6 +563,11 @@ export function applyPack(
 
     // 3. Org-scope workflows. Steps are replaced wholesale per workflow so a
     //    step removed from the pack disappears instead of lingering.
+    //
+    //    A step's `uses` target is NOT validated here against the rest of the
+    //    pack. It is validated in readPack, where every file has been read and
+    //    the whole set of slugs is known — checking it one workflow at a time
+    //    would reject a parent that happens to be applied before its child.
     for (const w of pack.workflows) {
       const existed = ctx.db.workflows.find(w.slug, 'org', org.id) !== null;
       const wf = ctx.db.workflows.upsert({
@@ -500,6 +575,7 @@ export function applyPack(
         name: w.name,
         scope: 'org',
         scopeId: org.id,
+        standalone: w.standalone,
       });
       const keep = new Set(w.steps.map((s) => s.name));
       for (const existing of ctx.db.workflowSteps.listByWorkflow(wf.id)) {
@@ -513,6 +589,7 @@ export function applyPack(
           actor: s.actor,
           gate: s.gate,
           capability: s.capability,
+          uses: s.uses,
           condition: s.condition,
           notes: s.notes,
           disabled: s.disabled,

@@ -63,10 +63,42 @@ command exists to avoid.
   unverified belongs here; leaving it out is what makes the next session
   believe it was done. ≤ 10 lines.
 
+### 3.5 If this project is in an org: offer what the team should have
+
+`end_session` comes back with `promotionProposals` when the project
+belongs to an org and this session produced something worth sharing. When
+it does:
+
+1. Print its `display` **verbatim**. It is rendered server-side and
+   already names the org, marks what needs a rewrite, and states what can
+   never travel. Rebuilding it costs tokens to produce something less
+   consistent.
+2. Ask which to promote. **Never promote without asking**, and never
+   promote everything because it was all offered — roughly half of what
+   gets offered to a shared store is already in it, and that is the
+   filter working.
+3. Per confirmation, call `promote_observation`. Supply `caveats` —
+   WHEN this applies — because it is the field with no mechanical source
+   and the most value, and the one that stops a lesson that is true here
+   from being applied everywhere. Add `working_example` where there is
+   one.
+4. If it comes back `ORG_NOTE_UNSAFE`, the note carries something that
+   must not leave this machine: a credential, a local path, an internal
+   host or a real project name. **Show the offending line and the
+   proposed rewrite and ask.** Do not route around the refusal, and do
+   not re-word it yourself and promote quietly — the user is the one who
+   knows whether that name matters.
+5. Say that promoting writes to the local mirror only. `myjarbis org
+   push` writes the files the team reads, and a person commits them.
+
+If `promotionProposals` is absent, there is nothing to do here. Do not
+mention the org memory.
+
 ### 4. Recap, briefly
 
 Show them: which notes you saved (titles), the literal `next_session`
-text, and one line offering to rewrite either of them if it reads wrong.
+text, what (if anything) was promoted to the org, and one line offering
+to rewrite any of them if it reads wrong.
 
 ---
 

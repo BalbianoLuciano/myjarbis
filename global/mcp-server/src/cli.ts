@@ -24,6 +24,7 @@ import { listSkills, addSkill, materializeSkills } from './tools/skills.js';
 import { startSession, readStaleThreshold, computeStaleness } from './tools/session.js';
 import { applyInteractionStyle, inferCurrent } from './tools/interactionStyle.js';
 import { seedNewProject } from './db/migrate.js';
+import { BASELINE_WORKFLOWS } from './workflows/baseline.js';
 import { ModuleRow, SessionRow, SCHEMA_VERSION } from './db/schema.js';
 import {
   composeInteractionStyle,
@@ -54,6 +55,9 @@ import {
 } from './activeModules.js';
 import { readPack, applyPack, PackApplyReport } from './org/pack.js';
 import { syncOrg } from './org/sync.js';
+import { resolveIdentity, setIdentity, identityWarning } from './org/identity.js';
+import { transportFor } from './org/memory/transport.js';
+import { listOrgNotes, refreshDrift } from './tools/orgMemory.js';
 import { readRegistry, readRegistryRaw } from './org/registry.js';
 import {
   CLAUDE_HOOKS,
@@ -67,6 +71,7 @@ import { listContextKinds, migrateKinds } from './tools/kinds.js';
 import {
   listWorkflowsTool,
   getWorkflow,
+  setWorkflowStep,
   listProviders,
   setProvider,
 } from './tools/workflows.js';
@@ -420,7 +425,7 @@ function runModule(argv: string[]): void {
 function runConfig(argv: string[]): void {
   const [sub, ...rest] = argv;
   if (!sub) {
-    fail('Usage: myjarbis config <list|language|persona> [value]');
+    fail('Usage: myjarbis config <list|language|persona|dev|diagram> [value]');
   }
   const ctx = ServerContext.initialize();
   try {
@@ -438,11 +443,20 @@ function runConfig(argv: string[]): void {
         search_default_scope: settings.search_default_scope ?? 'module',
         story_pattern: settings.story_pattern ?? null,
         nudges: settings.nudges ?? null,
+        dev: resolveIdentity(ctx.projectPath),
       };
       if (wantsJson(flags)) { printJson(data); return; }
       ptySection('MyJarbis · config of ' + bold(project.name));
       ptyKV('Language', red(bold(String(data.language).toUpperCase())));
       ptyKV('Persona', red(bold(data.persona)));
+      // The source matters as much as the handle: a fallback is a guess, and
+      // it would otherwise read as a name somebody chose.
+      ptyKV(
+        'Dev',
+        data.dev.source === 'fallback'
+          ? dim(data.dev.handle) + ' ' + dim('(no identity configured)')
+          : data.dev.handle + ' ' + dim('(' + data.dev.source + ')'),
+      );
       ptyKV('Shared', data.shared ? red('true') : 'false');
       ptyKV('Scope', data.search_default_scope);
       if (data.story_pattern) ptyKV('Stories', dim(data.story_pattern));
@@ -502,7 +516,36 @@ function runConfig(argv: string[]): void {
       console.log('');
       return;
     }
-    fail(`Unknown config subcommand: ${sub}. Use list | language | persona | diagram.`);
+    if (sub === 'dev') {
+      const { positional, flags } = parseFlags(rest);
+      const handle = positional[0];
+      // With no argument this reports rather than fails: "who am I to this
+      // project" is a question worth being able to ask.
+      if (!handle) {
+        const current = resolveIdentity(ctx.projectPath);
+        if (wantsJson(flags)) { printJson(current); return; }
+        ptySection('MyJarbis · dev identity');
+        ptyKV('Handle', bold(current.handle));
+        ptyKV('Email', current.email ?? dim('(none)'));
+        ptyKV('Source', current.source);
+        const warn = identityWarning(current);
+        if (warn) { console.log(''); ptyLine('  ' + warn); }
+        console.log('');
+        ptyDim('Set with: myjarbis config dev <handle> [--email=<address>]');
+        console.log('');
+        return;
+      }
+      const next = setIdentity(ctx.projectPath, handle, flags.email ? String(flags.email) : undefined);
+      if (wantsJson(flags)) { printJson(next); return; }
+      ptySection('MyJarbis · config');
+      ptyLine('  ' + `Dev identity set to ${bold(next.handle)}`);
+      if (next.email) ptyDim('  ' + next.email);
+      console.log('');
+      ptyDim('  Org notes promoted from this project will carry it as their author.');
+      console.log('');
+      return;
+    }
+    fail(`Unknown config subcommand: ${sub}. Use list | language | persona | dev | diagram.`);
   } finally {
     ctx.close();
   }
@@ -573,7 +616,8 @@ function runStatus(argv: string[]): void {
       // Not a git repo
     }
 
-    const org = project.org_id === null ? null : ctx.db.orgs.findById(project.org_id);
+    const orgId = ctx.db.scopedOrgId;
+    const org = orgId === null ? null : ctx.db.orgs.findById(orgId);
     const brain = {
       path: ctx.db.dbPath,
       isolation: project.isolation,
@@ -845,6 +889,7 @@ function runSkill(argv: string[]): void {
         const result = materializeSkills(ctx, {
           module: flags.module as string | undefined,
           cleanup_stale: flags['no-cleanup'] !== true,
+          dry_run: truthy(flags['dry-run']) ? true : undefined,
         });
         printJson(result);
         return;
@@ -2750,8 +2795,138 @@ function runOrg(argv: string[]): void {
       return;
     }
 
+    // ── the shared memory, as opposed to the pack ──
+    //
+    // `add`/`sync`/`diff` move a PACK: skills, workflows, taxonomy — things an
+    // org decides and hands down. `pull`/`push` move the MEMORY: what the team
+    // found out, flowing both ways. Same subcommand, two different objects,
+    // and worth saying so in the help text rather than letting someone
+    // discover it by running the wrong one.
+    case 'pull': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const res = transportFor(ctx).pull(ctx, {
+          dir: flags.dir ? String(flags.dir) : undefined,
+        });
+        // The rows that just arrived cite files, and nobody has compared them
+        // against this checkout yet. Done here rather than in `search`, where
+        // it would spawn a git process per cited file per hit.
+        const drift = refreshDrift(ctx);
+        if (wantsJson(flags)) return printJson({ ...res, drift });
+        ptySection('MyJarbis · org pull');
+        ptyKV('Org', `${bold(res.org.slug)} (${res.org.name})`);
+        ptyKV('Dir', res.dir);
+        ptyKV(
+          'Rows',
+          `read ${res.read}  ${red(bold(`added ${res.added}`))}  ` +
+            `already had ${res.duplicates}` +
+            (res.governanceUpdated > 0 ? `  updated ${res.governanceUpdated}` : ''),
+        );
+        if (drift.drifted > 0) {
+          ptyKV(
+            'Drift',
+            `${drift.drifted} of ${drift.checked} note(s) cite files that have changed here`,
+          );
+        }
+        if (res.orgRegistered) {
+          console.log('');
+          ptyLine('  ' + bold('This project just joined the org.') + ' Its notes now ride `search`.');
+        }
+        for (const w of res.warnings) {
+          console.log('');
+          ptyLine('  ' + w);
+        }
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
+    case 'push': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const res = transportFor(ctx).push(ctx, {
+          dir: flags.dir ? String(flags.dir) : undefined,
+        });
+        if (wantsJson(flags)) return printJson(res);
+        ptySection('MyJarbis · org push');
+        ptyKV('Dir', res.dir);
+        if (!res.changed) {
+          ptyKV('Files', dim('unchanged'));
+          console.log('');
+          ptyDim('  Nothing to commit.');
+          console.log('');
+          return;
+        }
+        ptyKV('Files', res.filesWritten.join('  '));
+        ptyKV(
+          'Rows',
+          `${red(bold(`appended ${res.appended}`))}` +
+            (res.rewritten > 0 ? `  rewritten ${res.rewritten}` : ''),
+        );
+        console.log('');
+        // Printed, never run. A tool cannot write the Why/What for/Where body
+        // the conventions require, and `git add -A` is forbidden.
+        ptyLine('  ' + res.stageCommand);
+        ptyDim('  then commit it yourself — the message is yours to write.');
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
+    case 'notes': {
+      const { flags } = parseFlags(rest);
+      const ctx = ServerContext.initialize();
+      try {
+        const all = truthy(flags.all);
+        refreshDrift(ctx);
+        const res = listOrgNotes(ctx, {
+          status: all ? ['active', 'stale', 'superseded', 'deleted'] : undefined,
+          limit: flags.limit ? Number(flags.limit) : undefined,
+        });
+        if (wantsJson(flags)) return printJson(res);
+        if (!res.org) {
+          ptySection('MyJarbis · org notes');
+          ptyLine('  This project belongs to no org.');
+          console.log('');
+          return;
+        }
+        ptySection(`MyJarbis · org notes of ${bold(res.org.slug)}`);
+        if (res.count === 0) {
+          ptyLine('  ' + dim('nothing promoted yet'));
+          console.log('');
+          return;
+        }
+        for (const n of res.notes) {
+          const marks = [
+            n.confidence === 'verified' ? 'verified' : 'assumed',
+            n.status !== 'active' ? n.status : null,
+            n.expired ? 'expired' : null,
+            n.orgWide ? 'org-wide' : null,
+            n.drift !== null && n.drift > 0 ? `${n.drift} file(s) moved` : null,
+          ].filter(Boolean);
+          ptyLine(`  #${n.id} ${n.question}`);
+          ptyDim(`      ${n.author} · ${n.promotedAt} · ${marks.join(' · ')}`);
+        }
+        console.log('');
+        return;
+      } finally {
+        ctx.close();
+      }
+    }
+
     default:
-      fail('Usage: myjarbis org <add|list|sync|diff>');
+      fail(
+        'Usage: myjarbis org <add|list|sync|diff|pull|push|notes>\n' +
+          '  add|sync|diff   move a PACK: skills, workflows, taxonomy (org → project)\n' +
+          '  pull|push       move the MEMORY: what the team found out (both ways)\n' +
+          '  notes           what the org memory holds for this project',
+      );
   }
 }
 
@@ -2778,6 +2953,9 @@ function runKinds(argv: string[]): void {
 /** myjarbis workflow <list|show> [slug] */
 function runWorkflow(argv: string[]): void {
   const sub = argv[0] ?? 'list';
+  // Routed before a context is opened: reseed walks the registry and opens one
+  // brain per project itself.
+  if (sub === 'reseed') return runWorkflowReseed(argv.slice(1));
   const { positional, flags } = parseFlags(argv.slice(1));
   const ctx = ServerContext.initialize();
   try {
@@ -2791,10 +2969,244 @@ function runWorkflow(argv: string[]): void {
       printJson(getWorkflow(ctx, { slug, evaluate: !truthy(flags['no-evaluate']) }));
       return;
     }
-    fail('Usage: myjarbis workflow <list|show>');
+    if (sub === 'set') {
+      const [slug, name] = positional;
+      if (!slug || !name) {
+        fail(
+          'Usage: myjarbis workflow set <slug> <step> [--scope=project|user] ' +
+            '[--position=N] [--actor=] [--gate=none|approve|on-request] ' +
+            '[--capability=] [--uses=] [--condition=] [--notes=] [--name=] ' +
+            '[--standalone=false] [--disabled]',
+        );
+      }
+      // The SAME function the MCP tool calls. Two entry points, one
+      // implementation: the position-inheritance rule across layers has its
+      // own postmortem, and a second implementation of it would re-earn that
+      // bug rather than inherit the fix.
+      printJson(
+        setWorkflowStep(ctx, {
+          slug,
+          name,
+          scope: (flags.scope as string | undefined) ?? 'project',
+          position: flags.position === undefined ? undefined : Number(flags.position),
+          actor: flags.actor ? String(flags.actor) : undefined,
+          gate: flags.gate ? String(flags.gate) : undefined,
+          capability: flags.capability ? String(flags.capability) : undefined,
+          uses: flags.uses ? String(flags.uses) : undefined,
+          condition: flags.condition ? String(flags.condition) : undefined,
+          notes: flags.notes ? String(flags.notes) : undefined,
+          workflow_name: flags.name ? String(flags.name) : undefined,
+          standalone:
+            flags.standalone === undefined ? undefined : truthy(flags.standalone),
+          disabled: truthy(flags.disabled) ? true : undefined,
+        }),
+      );
+      return;
+    }
+    if (sub === 'delete') {
+      const slug = positional[0];
+      if (!slug) fail('Usage: myjarbis workflow delete <slug> [--scope=project|user] [--step=<name>] [--force]');
+      const project = ctx.requireProject();
+      const scope = ((flags.scope as string | undefined) ?? 'project') as 'project' | 'user';
+      const row = ctx.db.workflows.find(slug, scope, project.id);
+      if (!row) fail(`No ${scope}-scope workflow "${slug}" in this project.`);
+      if (flags.step) {
+        const step = ctx.db.workflowSteps
+          .listByWorkflow(row!.id)
+          .find((x) => x.name === String(flags.step));
+        if (!step) fail(`Workflow "${slug}" has no step "${String(flags.step)}" at ${scope} scope.`);
+        ctx.db.workflowSteps.delete(step!.id);
+        printJson({ deleted: { workflow: slug, step: String(flags.step), scope } });
+        return;
+      }
+      ctx.db.workflows.delete(row!.id, { force: truthy(flags.force) });
+      printJson({ deleted: { workflow: slug, scope } });
+      return;
+    }
+    if (sub === 'runs') {
+      const project = ctx.requireProject();
+      const runs = ctx.db.workflowRuns.listByProject(project.id, {
+        status: truthy(flags.open) ? ['open'] : undefined,
+        limit: flags.limit ? Number(flags.limit) : undefined,
+      });
+      printJson({
+        runs: runs.map((r) => ({
+          id: r.id,
+          slug: r.slug,
+          status: r.status,
+          startedAt: r.started_at,
+          endedAt: r.ended_at,
+          steps: ctx.db.workflowRunSteps.timings(r.id),
+          minutes: Math.round(
+            ctx.db.workflowRunSteps
+              .timings(r.id)
+              .reduce((acc, s) => acc + (s.seconds ?? 0), 0) / 60,
+          ),
+        })),
+      });
+      return;
+    }
+    fail('Usage: myjarbis workflow <list|show|set|delete|runs|reseed>');
   } finally {
     ctx.close();
   }
+}
+
+/**
+ * myjarbis workflow reseed [--all] [--apply]
+ *
+ * The same shape as `skill reseed`: dry by default, `--all` walks the
+ * registry, and the report is the list `--apply` would act on.
+ *
+ * The rule that decides whether anybody runs it twice: a step the user has
+ * overridden at project or user scope is NEVER touched. `skill reseed` learned
+ * this as `RESEED_EXCLUDED` for `interaction-style`, which every project
+ * legitimately differs on. Here it is per STEP rather than per workflow,
+ * because the whole point of the layers is that a project changes one gate and
+ * keeps the rest — and a reseed that reverted that gate would be a reseed
+ * nobody runs a second time.
+ */
+function runWorkflowReseed(argv: string[]): void {
+  const { flags } = parseFlags(argv);
+  const apply = truthy(flags.apply);
+  const all = truthy(flags.all);
+
+  const targets = all ? readRegistry().map((e) => e.path) : [process.cwd()];
+  const results: Array<{
+    project: string;
+    created: string[];
+    updated: string[];
+    preserved: string[];
+    unchanged: number;
+    error?: string;
+  }> = [];
+
+  for (const dir of targets) {
+    const resolution = resolveProject({ cwd: dir });
+    if (!resolution) {
+      results.push({
+        project: dir,
+        created: [],
+        updated: [],
+        preserved: [],
+        unchanged: 0,
+        error: 'no brain holds this project',
+      });
+      continue;
+    }
+    const { db, project } = resolution;
+    const created: string[] = [];
+    const updated: string[] = [];
+    const preserved: string[] = [];
+    let unchanged = 0;
+
+    try {
+      for (const wf of BASELINE_WORKFLOWS) {
+        const existing = db.workflows.find(wf.slug, 'project', project.id);
+        if (!existing) {
+          if (apply) {
+            const row = db.workflows.upsert({
+              slug: wf.slug,
+              name: wf.name,
+              scope: 'project',
+              scopeId: project.id,
+              standalone: wf.standalone,
+            });
+            wf.steps.forEach((st, i) => {
+              db.workflowSteps.upsert({
+                workflowId: row.id,
+                position: (i + 1) * 10,
+                name: st.name,
+                actor: st.actor,
+                gate: st.gate,
+                capability: st.capability,
+                uses: st.uses,
+                condition: st.condition,
+                notes: st.notes,
+              });
+            });
+          }
+          created.push(wf.slug);
+          continue;
+        }
+
+        // A workflow that exists: only MISSING steps are added. An existing
+        // step is left exactly as it is, whatever it now says.
+        const have = new Map(
+          db.workflowSteps.listByWorkflow(existing.id).map((s) => [s.name, s]),
+        );
+        const userLayer = db.workflows.find(wf.slug, 'user', project.id);
+        const userSteps = new Set(
+          userLayer ? db.workflowSteps.listByWorkflow(userLayer.id).map((s) => s.name) : [],
+        );
+
+        let addedHere = 0;
+        wf.steps.forEach((st, i) => {
+          if (userSteps.has(st.name)) {
+            preserved.push(`${wf.slug}/${st.name} (user)`);
+            return;
+          }
+          if (have.has(st.name)) {
+            preserved.push(`${wf.slug}/${st.name} (project)`);
+            return;
+          }
+          if (apply) {
+            db.workflowSteps.upsert({
+              workflowId: existing.id,
+              position: (i + 1) * 10,
+              name: st.name,
+              actor: st.actor,
+              gate: st.gate,
+              capability: st.capability,
+              uses: st.uses,
+              condition: st.condition,
+              notes: st.notes,
+            });
+          }
+          addedHere++;
+        });
+        if (addedHere > 0) updated.push(`${wf.slug} (+${addedHere} step)`);
+        else unchanged++;
+      }
+    } catch (err) {
+      results.push({
+        project: project.name,
+        created,
+        updated,
+        preserved,
+        unchanged,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      db.close();
+      continue;
+    }
+
+    results.push({ project: project.name, created, updated, preserved, unchanged });
+    db.close();
+  }
+
+  if (wantsJson(flags)) {
+    printJson({ applied: apply, projects: results });
+    return;
+  }
+  ptySection(`MyJarbis · workflow reseed${apply ? '' : ' ' + dim('(dry run)')}`);
+  for (const r of results) {
+    const summary = r.error
+      ? red(r.error)
+      : [
+          r.created.length ? `${r.created.length} created` : null,
+          r.updated.length ? `${r.updated.length} extended` : null,
+          r.preserved.length ? `${r.preserved.length} left alone` : null,
+          r.unchanged ? `${r.unchanged} unchanged` : null,
+        ]
+          .filter(Boolean)
+          .join('  ') || 'nothing to do';
+    ptyKV(r.project, summary);
+  }
+  console.log('');
+  if (!apply) ptyDim('  Nothing was written. Re-run with --apply.');
+  else ptyDim('  Steps you had overridden were left exactly as they were.');
+  console.log('');
 }
 
 /** myjarbis provider <list|set> */

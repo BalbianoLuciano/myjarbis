@@ -26,12 +26,66 @@ Three numbers that are often different and all matter:
 | skill content | rows inside each brain, not files | `myjarbis skill reseed` |
 | slash commands | files in each project's `.claude/commands/` | `myjarbis commands sync` |
 | hook wiring | a block in each project's `.claude/settings.local.json` | `myjarbis update --projects-only` |
+| workflow rows | rows inside each brain, three layers deep | `myjarbis workflow reseed` |
 
 Updating the code does **not** update the schema, and neither of them updates
-the skills, the slash commands or the hook wiring. Five separate steps,
-deliberately.
+the skills, the workflows, the slash commands or the hook wiring. Six separate
+steps, deliberately.
 
 The last row is the one that bites, because it fails silently — see §3.
+
+---
+
+## 0.5. Upgrading to schema v5 (org memory + workflow runs)
+
+Additive, with no backfill: four new tables, one FTS mirror, and two columns on
+`workflows` / `workflow_steps`, which hold no rows in any brain that exists.
+The migration cannot lose anything because it rewrites nothing.
+
+```bash
+cp ~/.myjarbis/memory.db ~/.myjarbis/memory.db.pre-v5.$(date -Is)
+myjarbis migrate --dry-run         # upgrades a COPY and reports
+myjarbis migrate                   # backs up on its own as well
+```
+
+Three things to know afterwards.
+
+**Nothing is shared until you share it.** A project belongs to no org after the
+migration, which means the org memory path is entirely inert: `search` does not
+even run the query, `promote_observation` refuses with `NO_ORG`, and the close
+ritual says nothing about it. That is the intended state for a project that is
+one person's.
+
+**`brain export` gained four tables.** A project with an existing dump will
+report drift in `brain status` until it is re-exported, and the new tables are
+empty, so the re-export is a formality — but `brain status` exits 3 on drift,
+so a script that checks it will notice.
+
+**Four baseline workflows reach EXISTING projects only through
+`myjarbis workflow reseed`**, the same way baseline skills reach them only
+through `skill reseed`: `init` seeds, and everything else needs a propagation
+step. The reseed is a dry run by default and never reverts a step you
+overrode.
+
+```bash
+myjarbis workflow reseed --all           # report, change nothing
+myjarbis workflow reseed --all --apply
+```
+
+Joining a project to an org, when you have one:
+
+```bash
+cd <project>
+myjarbis org pull            # reads .myjarbis/org/ from the repo and joins
+myjarbis org notes           # what the team already knows
+```
+
+`.myjarbis/` is gitignored by `init` as per-developer state, so a team that
+wants the org memory tracked has to un-ignore that one directory:
+
+```
+!.myjarbis/org/
+```
 
 ---
 

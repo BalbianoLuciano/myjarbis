@@ -240,6 +240,13 @@ export const materializeSkillsInputSchema = {
         'Module name. If omitted, uses the active session\'s module. If no ' +
         'session and no module, materializes ONLY project-level skills.',
     },
+    dry_run: {
+      type: 'boolean' as const,
+      description:
+        'Report what would be written and removed without touching the ' +
+        'filesystem. The lists are computed by the same comparison a real run ' +
+        'uses, so they are what a real run would act on.',
+    },
     cleanup_stale: {
       type: 'boolean' as const,
       description:
@@ -254,15 +261,20 @@ const materializeSkillsArgsZ = z
   .object({
     module: z.string().min(1).optional(),
     cleanup_stale: z.boolean().optional(),
+    dry_run: z.boolean().optional(),
   })
   .strict();
 
 export interface MaterializeResult {
   skills_dir: string;
   module: string | null;
+  /** Files that were written — or, under `dry_run`, that WOULD be. */
   written: string[];
   unchanged: string[];
+  /** Folders removed — or, under `dry_run`, that would be. */
   removed: string[];
+  /** True when nothing was touched. */
+  dryRun?: true;
 }
 
 export function materializeSkills(
@@ -288,8 +300,15 @@ export function materializeSkills(
         .listByProject(project.id, { onlyProjectLevel: true })
         .filter((s) => s.enabled === 1);
 
+  // `dry_run` reports the same lists a real run would act on, computed by the
+  // same comparison — the diff was always being computed here, only the guard
+  // was missing. That matters for `myjarbis update --dry-run`, which has to be
+  // able to say what each project would get WITHOUT a prediction path that can
+  // drift from the thing it predicts.
+  const dry = args.dry_run === true;
+
   const skillsDir = path.join(ctx.projectPath, '.claude', 'skills');
-  fs.mkdirSync(skillsDir, { recursive: true });
+  if (!dry) fs.mkdirSync(skillsDir, { recursive: true });
 
   const desiredFolders = new Set<string>();
   const written: string[] = [];
@@ -301,26 +320,26 @@ export function materializeSkills(
 
     const dir = path.join(skillsDir, folder);
     const filePath = path.join(dir, 'SKILL.md');
-    fs.mkdirSync(dir, { recursive: true });
+    if (!dry) fs.mkdirSync(dir, { recursive: true });
 
     const previous = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : null;
     if (previous === skill.content) {
       unchanged.push(skill.name);
     } else {
-      fs.writeFileSync(filePath, skill.content, 'utf-8');
+      if (!dry) fs.writeFileSync(filePath, skill.content, 'utf-8');
       written.push(skill.name);
     }
   }
 
   // Cleanup stale myjarbis-* folders.
   const removed: string[] = [];
-  if (args.cleanup_stale !== false) {
+  if (args.cleanup_stale !== false && fs.existsSync(skillsDir)) {
     for (const entry of fs.readdirSync(skillsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       if (!entry.name.startsWith(MANAGED_PREFIX)) continue;
       if (desiredFolders.has(entry.name)) continue;
       const dir = path.join(skillsDir, entry.name);
-      fs.rmSync(dir, { recursive: true, force: true });
+      if (!dry) fs.rmSync(dir, { recursive: true, force: true });
       removed.push(entry.name.slice(MANAGED_PREFIX.length));
     }
   }
@@ -331,5 +350,6 @@ export function materializeSkills(
     written,
     unchanged,
     removed,
+    dryRun: dry ? true : undefined,
   };
 }

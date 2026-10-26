@@ -3,7 +3,7 @@
 # E2E test: skills baseline + materialization + cleanup on module switch.
 #
 # Verifies:
-#   1. seedNewProject seeds 10 baseline skills as project-level rows.
+#   1. seedNewProject seeds 11 baseline skills as project-level rows.
 #   2. `myjarbis skill add` creates module-level skills.
 #   3. `myjarbis skill materialize` writes <project>/.claude/skills/
 #      myjarbis-<name>/SKILL.md only for the active module's set.
@@ -58,7 +58,7 @@ console.log('seeded:', JSON.stringify(r));
 cd "$WORK"
 
 # ─── 1. baseline skills count ───
-echo "→ verifying 10 baseline skills (project-level)"
+echo "→ verifying 11 baseline skills (project-level)"
 "$MJ" skill list --scope=project > "$WORK/proj-skills.json"
 node --input-type=module -e "
   import { readFileSync } from 'fs';
@@ -75,7 +75,7 @@ node --input-type=module -e "
       process.exit(1);
     }
   }
-  if (r.count !== 10) { console.error('✗ expected 10 baseline, got', r.count); process.exit(1); }
+  if (r.count !== 11) { console.error('✗ expected 11 baseline, got', r.count); process.exit(1); }
 "
 
 # ─── 2. add module-level skills ───
@@ -108,14 +108,14 @@ node --input-type=module -e "
   const dir = readdirSync('$WORK/.claude/skills').sort();
   console.log('  written:', m.written.sort().join(', '));
   console.log('  fs:     ', dir.join(', '));
-  // Should have 10 baselines + checkout-conventions (NO catalog-blocks)
+  // Should have 11 baselines + checkout-conventions (NO catalog-blocks)
   const expectedFolders = [
     'myjarbis-bitacora-progress', 'myjarbis-commit-hygiene',
     'myjarbis-compact-protocol', 'myjarbis-framework-detect',
     'myjarbis-interaction-style', 'myjarbis-checkout-conventions',
     'myjarbis-module-orchestration', 'myjarbis-observation-protocol',
     'myjarbis-session-protocol', 'myjarbis-story-driven',
-    'myjarbis-subagent-delegation',
+    'myjarbis-subagent-delegation', 'myjarbis-workflow-driven',
   ].sort();
   if (JSON.stringify(dir) !== JSON.stringify(expectedFolders)) {
     console.error('✗ mismatch. expected:', expectedFolders);
@@ -130,7 +130,7 @@ node --input-type=module -e "
   import { readFileSync } from 'fs';
   const m = JSON.parse(readFileSync('$WORK/mat2.json', 'utf-8'));
   if (m.written.length !== 0) { console.error('✗ written should be empty:', m.written); process.exit(1); }
-  if (m.unchanged.length !== 11) { console.error('✗ unchanged should be 11 (10 baselines + checkout-conventions):', m.unchanged); process.exit(1); }
+  if (m.unchanged.length !== 12) { console.error('✗ unchanged should be 12 (11 baselines + checkout-conventions):', m.unchanged); process.exit(1); }
   if (m.removed.length !== 0) { console.error('✗ removed should be empty:', m.removed); process.exit(1); }
 "
 

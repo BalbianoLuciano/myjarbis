@@ -63,11 +63,40 @@ este comando vem evitar.
   verificar vai aqui; omitir é o que faz a próxima sessão acreditar que
   estava pronto. ≤ 10 linhas.
 
+### 3.5 Se este projeto está em uma org: ofereça o que o time deveria ter
+
+`end_session` retorna com `promotionProposals` quando o projeto pertence a
+uma org e esta sessão produziu algo que vale compartilhar. Quando isso
+acontece:
+
+1. Imprima o `display` **literalmente**. Vem renderizado do servidor: já
+   nomeia a org, marca o que precisa de reescrita e diz o que nunca
+   viaja. Reconstruí-lo gasta tokens para produzir algo menos uniforme.
+2. Pergunte quais promover. **Nunca promova sem perguntar**, e nunca
+   promova tudo porque tudo foi oferecido — cerca de metade do que se
+   oferece a uma memória compartilhada já está lá, e esse é o filtro
+   funcionando.
+3. Para cada confirmação, chame `promote_observation`. Forneça `caveats`
+   —QUANDO isso se aplica— porque é o campo sem origem mecânica e o de
+   maior valor: é o que impede que uma lição verdadeira aqui seja
+   aplicada em todo lugar. Adicione `working_example` quando houver.
+4. Se retornar `ORG_NOTE_UNSAFE`, a nota carrega algo que não pode sair
+   desta máquina: uma credencial, um caminho local, um host interno ou o
+   nome real de um projeto. **Mostre a linha exata e a reescrita
+   proposta, e pergunte.** Não contorne a recusa nem reescreva por conta
+   própria para promover em silêncio: o usuário é quem sabe se aquele
+   nome importa.
+5. Diga que promover escreve apenas no espelho local. `myjarbis org push`
+   escreve os arquivos que o time lê, e uma pessoa os commita.
+
+Se `promotionProposals` não vier, não há nada a fazer aqui. Não mencione
+a memória da org.
+
 ### 4. Recapitule curto
 
 Mostre: quais notas você salvou (títulos), o texto literal do
-`next_session`, e uma linha se oferecendo para reescrever qualquer um dos
-dois se não fizer sentido.
+`next_session`, o que foi promovido para a org se houve algo, e uma linha
+se oferecendo para reescrever qualquer um deles se não fizer sentido.
 
 ---
 
