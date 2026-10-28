@@ -274,7 +274,7 @@ pick_projects() {
                     ;;
                 all)
                     for d in "${P_DIRS[@]}"; do
-                        [ -d "$d/.myjarbis" ] && continue
+                        [ -d "$d/.myjarbis" ] && [ -z "$ASSUME_YES" ] && continue
                         is_picked "$d" || PICKED+=("$d")
                     done
                     ;;

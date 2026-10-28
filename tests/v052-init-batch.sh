@@ -9,9 +9,12 @@
 #   6. a batch initialises every directory named, skips the ones that are not
 #      repositories or are already initialised, reports the missing ones as a
 #      failure, and backs ~/.claude.json up once rather than once per project
+#   7. in the --list picker, `all` leaves the initialised projects out, and
+#      with --yes takes them in, as the confirmation screen says it does
 #
-# The picker behind --list needs a terminal and is not driven here; it only
-# fills the same list of directories that [6] passes by name.
+# The picker reads from a terminal, so [7] runs it inside a pseudo-terminal
+# from python3, which init already needs, rather than expect, which a CI
+# image may not have.
 #
 # Exits 0 on success, non-zero if any assertion fails.
 
@@ -120,6 +123,52 @@ read_asserts
 BACKUPS=$( (ls "$HOME"/.claude.json.bak-* 2>/dev/null || true) | wc -l | tr -d ' ')
 [ "$BACKUPS" -eq 1 ] && pass "one backup for the whole batch" \
                      || oops "$BACKUPS backups for one batch"
+
+# ─── [7] picker ───
+echo "→ [7] 'all' in the picker, with and without --yes"
+# Runs init under a pseudo-terminal and types $2.. one line each, then waits
+# for it to finish. The output goes to $1.
+pick() {
+  local out="$1"; shift
+  python3 - "$out" "$MJ" "$@" <<'PY'
+import os, pty, sys, time
+out, mj, root, flags, *lines = sys.argv[1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(mj, [mj, "init", "--list", root, *flags.split()])
+buf = b""
+for line in lines:
+    time.sleep(0.5)
+    os.write(fd, line.encode() + b"\n")
+while True:
+    try:
+        chunk = os.read(fd, 4096)
+    except OSError:
+        break
+    if not chunk:
+        break
+    buf += chunk
+os.waitpid(pid, 0)
+open(out, "wb").write(buf)
+PY
+}
+
+new_repo "$WORK/pick/fresh"
+new_repo "$WORK/pick/ready"
+mkdir -p "$WORK/pick/ready/.myjarbis"; echo keep > "$WORK/pick/ready/.myjarbis/marker"
+
+pick "$WORK/pick1.out" "$WORK/pick" "--skip-memory --language=ES" all "" y || true
+[ -d "$WORK/pick/fresh/.myjarbis" ] \
+  && pass "'all' picks the projects not initialised yet" \
+  || { oops "'all' did not pick a fresh project"; cat "$WORK/pick1.out"; }
+[ "$(ls "$WORK/pick/ready/.myjarbis")" = "marker" ] \
+  && pass "without --yes, 'all' leaves an initialised project alone" \
+  || oops "'all' reinitialised a project without --yes"
+
+pick "$WORK/pick2.out" "$WORK/pick" "--skip-memory --language=ES --yes" all "" y || true
+[ -d "$WORK/pick/ready/.myjarbis/config" ] \
+  && pass "with --yes, 'all' reinitialises the initialised project too" \
+  || { oops "with --yes, 'all' still skipped an initialised project"; cat "$WORK/pick2.out"; }
 
 echo
 if [ "$FAILED" -eq 0 ]; then
