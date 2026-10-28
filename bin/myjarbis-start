@@ -113,15 +113,22 @@ fi
 # ── selection → SEL_IDX[] (0-based indices into the arrays) ────────────
 SEL_IDX=()
 
+# Lowercase, with tr rather than ${x,,}: that is bash 4, and the #!/bin/bash
+# this script runs under is still 3.2 on macOS, where it is "bad
+# substitution" — every pick by name failed there while picks by number
+# worked.
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
 # resolve a name/substring token. Always returns 0; the outcome is
 # encoded on stdout: the index, "NONE", or "AMBIGUOUS:<i j k>". (Keeps
 # callers safe under `set -e`, where a non-zero command substitution
 # would abort the script.)
 resolve_token() {
-    local tok="$1" i exact=-1 matches=()
+    local tok="$1" i exact=-1 matches=() ltok
+    ltok="$(lower "$tok")"
     for i in "${!NAMES[@]}"; do
         [ "${NAMES[$i]}" = "$tok" ] && exact=$i
-        case "${NAMES[$i],,}" in *"${tok,,}"*) matches+=("$i") ;; esac
+        case "$(lower "${NAMES[$i]}")" in *"$ltok"*) matches+=("$i") ;; esac
     done
     if [ "$exact" -ge 0 ]; then echo "$exact"; return 0; fi
     if [ "${#matches[@]}" -eq 1 ]; then echo "${matches[0]}"; return 0; fi

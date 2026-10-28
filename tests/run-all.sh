@@ -77,6 +77,7 @@ SUITES=(
   v050-update-dryrun
   v051-update-live-session
   v051-propagation-failures
+  v052-start-by-name
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
