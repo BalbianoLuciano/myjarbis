@@ -15,6 +15,15 @@
   instead of aborting init, and the new content is swapped in by rename so a
   Claude Code process reading it never sees half a file.
   `tests/v052-init-mcp-merge.sh`.
+- **`myjarbis start <name>` works on macOS.** `resolve_token` lowercased with
+  `${x,,}`, which is bash 4; the `#!/bin/bash` the script runs under is still
+  3.2 on macOS, even with a newer bash from Homebrew on the PATH. Every pick
+  by name — as an argument or typed at the picker — died with "bad
+  substitution", while picks by number worked, which is why it read as a
+  quirk rather than a bug. Lowercasing now goes through `tr`.
+  `tests/v052-start-by-name.sh` runs the script through its own shebang and
+  also fails on any bash 4-only syntax in the scripts the user's shell runs,
+  so a Linux CI, whose bash never showed the failure, still catches it.
 
 ## v0.5.1 — the update stops breaking the session that runs it
 

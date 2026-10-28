@@ -78,6 +78,7 @@ SUITES=(
   v051-update-live-session
   v051-propagation-failures
   v052-init-mcp-merge
+  v052-start-by-name
 )
 
 # ─── what to print when a suite fails ─────────────────────────────
