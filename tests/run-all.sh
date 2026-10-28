@@ -77,6 +77,7 @@ SUITES=(
   v050-update-dryrun
   v051-update-live-session
   v051-propagation-failures
+  v052-init-mcp-merge
 )
 
 # ─── what to print when a suite fails ─────────────────────────────

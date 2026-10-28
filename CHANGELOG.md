@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`myjarbis init` no longer unregisters the project's other MCP servers.**
+  Step 9 assigned the whole `projects[<path>].mcpServers` object in
+  `~/.claude.json`, so any server the project already had — a tracker, the
+  project's own server — was silently dropped the moment MyJarbis registered
+  itself. Nothing reported it; the server just stopped being offered in the
+  next Claude session. `myjarbis` is now added next to whatever is there.
+  The file is backed up first (`~/.claude.json.bak-<ms>`, the naming `gc`
+  already uses), a file that does not parse is left untouched with a warning
+  instead of aborting init, and the new content is swapped in by rename so a
+  Claude Code process reading it never sees half a file.
+  `tests/v052-init-mcp-merge.sh`.
+
 ## v0.5.1 — the update stops breaking the session that runs it
 
 ### Fixed
