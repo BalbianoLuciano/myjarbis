@@ -467,40 +467,58 @@ else
 EOF
 fi
 
-# Configure Claude Code MCP locally for this project
-python3 << 'PYTHON_EOF' >/dev/null
+# Configure Claude Code MCP locally for this project.
+#
+# ~/.claude.json belongs to Claude Code and holds far more than our entry —
+# including the other MCP servers this project already uses. This step used
+# to assign the whole `mcpServers` object, which silently unregistered every
+# one of them. It now adds `myjarbis` next to whatever is there, backs the
+# file up first (same `.bak-<ms>` naming as `gc`), refuses to touch a file it
+# cannot parse, and swaps the new content in atomically so a Claude Code
+# process reading it never sees half a file.
+if python3 << 'PYTHON_EOF' >/dev/null
 import json
 import os
+import shutil
+import sys
+import tempfile
+import time
 
 claude_config = os.path.expanduser('~/.claude.json')
+data = {}
 
 if os.path.exists(claude_config):
-    with open(claude_config, 'r') as f:
-        data = json.load(f)
-else:
-    data = {'projects': {}}
+    try:
+        with open(claude_config, 'r') as f:
+            data = json.load(f)
+    except ValueError as e:
+        print(f'~/.claude.json is not valid JSON ({e}), left untouched', file=sys.stderr)
+        sys.exit(1)
+    shutil.copy2(claude_config, f'{claude_config}.bak-{int(time.time() * 1000)}')
 
-if 'projects' not in data:
-    data['projects'] = {}
-
-project_path = os.getcwd()
-if project_path not in data['projects']:
-    data['projects'][project_path] = {}
-
-mcp_server_path = os.path.expanduser('~/.myjarbis-global/mcp-server/build/index.js')
-data['projects'][project_path]['mcpServers'] = {
-    'myjarbis': {
-        'type': 'stdio',
-        'command': 'node',
-        'args': [mcp_server_path],
-        'env': {}
-    }
+entry = data.setdefault('projects', {}).setdefault(os.getcwd(), {})
+servers = entry.get('mcpServers') or {}
+servers['myjarbis'] = {
+    'type': 'stdio',
+    'command': 'node',
+    'args': [os.path.expanduser('~/.myjarbis-global/mcp-server/build/index.js')],
+    'env': {}
 }
+entry['mcpServers'] = servers
 
-with open(claude_config, 'w') as f:
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(claude_config), prefix='.claude.json.')
+with os.fdopen(fd, 'w') as f:
     json.dump(data, f, indent=2)
+if os.path.exists(claude_config):
+    shutil.copymode(claude_config, tmp)
+os.replace(tmp, claude_config)
 PYTHON_EOF
-ok
+then
+    ok
+else
+    warn "could not register the MCP server in ~/.claude.json"
+    note "add it by hand: claude mcp add myjarbis node ~/.myjarbis-global/mcp-server/build/index.js"
+fi
 
 # ─── done ─────────────────────────────────────────────────────────
 section "Setup complete"

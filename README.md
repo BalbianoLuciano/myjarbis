@@ -551,6 +551,10 @@ Skip the prompts for CI / scripts:
 MYJARBIS_LANGUAGE=ES MYJARBIS_PERSONA=concise myjarbis init
 ```
 
+`init` registers the MCP server in `~/.claude.json` **next to** the servers
+the project already has — it never replaces them — and backs the file up
+first (`~/.claude.json.bak-<ms>`).
+
 Create your verticals and import the `.md` files you already keep on disk:
 
 ```bash
